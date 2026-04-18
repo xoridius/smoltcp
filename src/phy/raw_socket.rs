@@ -89,7 +89,10 @@ impl Device for RawSocket {
                 Some((rx, tx))
             }
             Err(err) if err.kind() == io::ErrorKind::WouldBlock => None,
-            Err(err) => panic!("{}", err),
+            Err(err) => {
+                net_debug!("phy: rx failed: {}", err);
+                None
+            }
         }
     }
 
@@ -132,7 +135,7 @@ impl phy::TxToken for TxToken {
             Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
                 net_debug!("phy: tx failed due to WouldBlock")
             }
-            Err(err) => panic!("{}", err),
+            Err(err) => net_debug!("phy: tx failed: {}", err),
         }
         result
     }
