@@ -246,13 +246,18 @@ impl Repr {
         if packet.dst_port() == 0 {
             return Err(Error);
         }
-        // Valid checksum is expected...
-        if checksum_caps.udp.rx() && !packet.verify_checksum(src_addr, dst_addr) {
-            match (src_addr, dst_addr) {
-                // ... except on UDP-over-IPv4, where it can be omitted.
-                #[cfg(feature = "proto-ipv4")]
-                (&IpAddress::Ipv4(_), &IpAddress::Ipv4(_)) if packet.checksum() == 0 => (),
-                _ => return Err(Error),
+        // RFC 768 permits an omitted (zero) UDP checksum over IPv4.
+        // RFC 8200 §8.1 forbids it over IPv6 (the only exception, UDP tunnels with
+        // RFC 6935, is negotiated out-of-band and not relevant to the host stack).
+        if checksum_caps.udp.rx() {
+            if packet.checksum() == 0 {
+                match (src_addr, dst_addr) {
+                    #[cfg(feature = "proto-ipv4")]
+                    (&IpAddress::Ipv4(_), &IpAddress::Ipv4(_)) => (),
+                    _ => return Err(Error),
+                }
+            } else if !packet.verify_checksum(src_addr, dst_addr) {
+                return Err(Error);
             }
         }
 
@@ -497,5 +502,30 @@ mod test {
         )
         .unwrap();
         assert_eq!(repr, packet_repr());
+    }
+
+    // RFC 8200 §8.1: UDP over IPv6 must not omit the checksum.
+    #[test]
+    #[cfg(feature = "proto-ipv6")]
+    fn test_reject_zero_checksum_over_ipv6() {
+        use crate::wire::Ipv6Address;
+        let src: Ipv6Address = Ipv6Address::new(0xfe80, 0, 0, 0, 0, 0, 0, 1);
+        let dst: Ipv6Address = Ipv6Address::new(0xfe80, 0, 0, 0, 0, 0, 0, 2);
+        let mut bytes = vec![0; 8];
+        let mut packet = Packet::new_unchecked(&mut bytes[..]);
+        packet.set_src_port(1);
+        packet.set_dst_port(31881);
+        packet.set_len(8);
+        packet.set_checksum(0);
+        let packet = Packet::new_unchecked(&bytes[..]);
+        assert_eq!(
+            Repr::parse(
+                &packet,
+                &src.into(),
+                &dst.into(),
+                &ChecksumCapabilities::default(),
+            ),
+            Err(Error),
+        );
     }
 }
