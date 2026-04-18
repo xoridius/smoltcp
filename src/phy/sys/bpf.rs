@@ -152,14 +152,19 @@ impl BpfDevice {
             }
 
             let len = len as usize;
+            let payload_len = len - BPF_HDRLEN;
 
+            // BPF prepends a bpf_hdr to each packet; strip it so the caller sees
+            // only the link-layer frame. NOTE: BPF may pack multiple packets into
+            // one read (each aligned to BPF_WORDALIGN); only the first is returned
+            // here. Multi-packet iteration is a larger change tracked separately.
             libc::memmove(
                 buffer.as_mut_ptr() as *mut libc::c_void,
                 &buffer[BPF_HDRLEN] as *const u8 as *const libc::c_void,
-                len - BPF_HDRLEN,
+                payload_len,
             );
 
-            Ok(len)
+            Ok(payload_len)
         }
     }
 
@@ -172,7 +177,7 @@ impl BpfDevice {
             );
 
             if len == -1 {
-                panic!("{:?}", io::Error::last_os_error())
+                return Err(io::Error::last_os_error());
             }
 
             Ok(len as usize)
