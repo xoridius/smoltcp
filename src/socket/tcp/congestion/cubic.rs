@@ -55,11 +55,10 @@ impl Controller for Cubic {
     }
 
     fn set_remote_window(&mut self, remote_window: usize) {
-        // RFC 1323 caps the effective window at 2^30, well inside u32.
-        let remote_window = remote_window.min(u32::MAX as usize) as u32;
-        if self.rwnd < remote_window {
-            self.rwnd = remote_window;
-        }
+        // Track the peer's currently advertised window, including shrinks
+        // (RFC 793 allows the receiver to reduce its window). Clamp to u32
+        // since RFC 1323 caps the effective window at 2^30 anyway.
+        self.rwnd = remote_window.min(u32::MAX as usize) as u32;
     }
 
     fn on_ack(&mut self, _now: Instant, len: usize, _rtt: &crate::socket::tcp::RttEstimator) {
@@ -119,7 +118,16 @@ impl Controller for Cubic {
     }
 
     fn set_mss(&mut self, mss: usize) {
-        self.min_cwnd = mss.min(u32::MAX as usize) as u32;
+        let mss_u32 = mss.min(u32::MAX as usize) as u32;
+        self.min_cwnd = mss_u32;
+        // RFC 6928 IW: min(10*MSS, max(2*MSS, 14600)). set_mss is called when
+        // the peer's MSS is learned (on SYN), before any data segments are
+        // sent, so raise the initial window then. mss is bounded by 16-bit
+        // wire field so 10*mss never overflows u32.
+        let iw = (10 * mss_u32).min((2 * mss_u32).max(14_600));
+        if self.cwnd < iw {
+            self.cwnd = iw;
+        }
     }
 }
 
@@ -318,5 +326,29 @@ mod test {
     #[should_panic]
     fn cube_root_zero() {
         cube_root(0.0).unwrap();
+    }
+
+    // RFC 6928: IW = min(10*MSS, max(2*MSS, 14600)).
+    #[test]
+    fn cubic_iw10_on_set_mss() {
+        let mut cubic = Cubic::new();
+        cubic.set_remote_window(64 * 1024);
+        cubic.set_mss(1460);
+        assert_eq!(cubic.window(), 14_600);
+    }
+
+    // set_remote_window must track the current advertised window, including shrinks.
+    #[test]
+    fn cubic_rwnd_can_shrink() {
+        let mut cubic = Cubic::new();
+        cubic.set_remote_window(64 * 1024);
+        cubic.set_remote_window(4 * 1024);
+        cubic.set_mss(1460);
+        cubic.on_ack(
+            Instant::from_millis(0),
+            100_000,
+            &RttEstimator::default(),
+        );
+        assert!(cubic.window() <= 4 * 1024);
     }
 }

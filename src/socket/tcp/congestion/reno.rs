@@ -55,14 +55,22 @@ impl Controller for Reno {
     }
 
     fn set_mss(&mut self, mss: usize) {
-        self.min_cwnd = mss.min(u32::MAX as usize) as u32;
+        let mss_u32 = mss.min(u32::MAX as usize) as u32;
+        self.min_cwnd = mss_u32;
+        // RFC 6928 IW: min(10*MSS, max(2*MSS, 14600)). set_mss is called when
+        // the peer's MSS is learned (on SYN), before any data segments are
+        // sent, so raise the initial window then. mss is bounded by 16-bit
+        // wire field so 10*mss never overflows u32.
+        let iw = (10 * mss_u32).min((2 * mss_u32).max(14_600));
+        if self.cwnd < iw {
+            self.cwnd = iw;
+        }
     }
 
     fn set_remote_window(&mut self, remote_window: usize) {
-        let remote_window = remote_window.min(u32::MAX as usize) as u32;
-        if self.rwnd < remote_window {
-            self.rwnd = remote_window;
-        }
+        // Track the peer's currently advertised window, including shrinks
+        // (RFC 793 allows the receiver to reduce its window).
+        self.rwnd = remote_window.min(u32::MAX as usize) as u32;
     }
 }
 
@@ -130,5 +138,35 @@ mod test {
         reno.set_remote_window(64 * 1024 * 1024);
 
         println!("{reno:?}");
+    }
+
+    // RFC 6928: IW = min(10*MSS, max(2*MSS, 14600)).
+    #[test]
+    fn reno_iw10_on_set_mss() {
+        let mut reno = Reno::new();
+        reno.set_remote_window(64 * 1024);
+        reno.set_mss(1460);
+        assert_eq!(reno.window(), 14_600);
+
+        let mut reno = Reno::new();
+        reno.set_remote_window(64 * 1024);
+        reno.set_mss(536);
+        assert_eq!(reno.window(), 5_360);
+
+        let mut reno = Reno::new();
+        reno.set_remote_window(128 * 1024);
+        reno.set_mss(8960);
+        assert_eq!(reno.window(), 17_920);
+    }
+
+    // set_remote_window must track the current advertised window, including shrinks.
+    #[test]
+    fn reno_rwnd_can_shrink() {
+        let mut reno = Reno::new();
+        reno.set_remote_window(64 * 1024);
+        reno.set_remote_window(4 * 1024);
+        reno.set_mss(1460);
+        reno.on_ack(Instant::from_millis(0), 100_000, &RttEstimator::default());
+        assert!(reno.window() <= 4 * 1024);
     }
 }
