@@ -769,36 +769,87 @@ pub mod checksum {
         ((sum >> 16) as u16) + (sum as u16)
     }
 
+    /// Add `chunk` into `accum`, folding the carry back in (one's complement add).
+    #[inline(always)]
+    fn add_carry_u64(accum: u64, chunk: u64) -> u64 {
+        let (sum, carry) = accum.overflowing_add(chunk);
+        sum.wrapping_add(carry as u64)
+    }
+
+    /// Fold a 64-bit one's complement accumulator down to a 16-bit value
+    /// (native byte order).
+    #[inline(always)]
+    fn fold_u64(mut accum: u64) -> u16 {
+        // Two 32-bit halves -> at most 33 bits.
+        accum = (accum >> 32) + (accum & 0xffff_ffff);
+        // Two 16-bit halves -> at most 17 bits.
+        accum = (accum >> 16) + (accum & 0xffff);
+        // One more fold to absorb the final carry.
+        accum = (accum >> 16) + (accum & 0xffff);
+        accum as u16
+    }
+
     /// Compute an RFC 1071 compliant checksum (without the final complement).
-    pub fn data(mut data: &[u8]) -> u16 {
-        let mut accum = 0;
+    ///
+    /// Accumulates the data 8 bytes at a time in native byte order, deferring
+    /// the byte-swap to the final fold. This is the canonical wide-word
+    /// approach used by the Linux kernel's `do_csum`: a one's complement sum
+    /// of native-endian u16 words equals the byte-swap of the same sum done in
+    /// network byte order, so we recover the network-order checksum with a
+    /// single `swap_bytes` at the end.
+    pub fn data(data: &[u8]) -> u16 {
+        let mut accum: u64 = 0;
+        let mut tail = data;
 
-        // For each 32-byte chunk...
-        const CHUNK_SIZE: usize = 32;
-        while data.len() >= CHUNK_SIZE {
-            let mut d = &data[..CHUNK_SIZE];
-            // ... take by 2 bytes and sum them.
-            while d.len() >= 2 {
-                accum += NetworkEndian::read_u16(d) as u32;
-                d = &d[2..];
+        // Two-chain unroll on 64-byte iterations to break the data-dependency
+        // between successive `adc` instructions and let the CPU pipeline two
+        // adders in parallel.
+        while tail.len() >= 64 {
+            let (chunk, rest) = tail.split_at(64);
+            let mut a: u64 = 0;
+            let mut b: u64 = 0;
+            for i in 0..4 {
+                let lo = u64::from_ne_bytes(chunk[i * 16..i * 16 + 8].try_into().unwrap());
+                let hi = u64::from_ne_bytes(chunk[i * 16 + 8..i * 16 + 16].try_into().unwrap());
+                a = add_carry_u64(a, lo);
+                b = add_carry_u64(b, hi);
             }
-
-            data = &data[CHUNK_SIZE..];
+            accum = add_carry_u64(accum, add_carry_u64(a, b));
+            tail = rest;
         }
 
-        // Sum the rest that does not fit the last 32-byte chunk,
-        // taking by 2 bytes.
-        while data.len() >= 2 {
-            accum += NetworkEndian::read_u16(data) as u32;
-            data = &data[2..];
+        // Tail in 8-byte chunks.
+        while tail.len() >= 8 {
+            let (chunk, rest) = tail.split_at(8);
+            let word = u64::from_ne_bytes(chunk.try_into().unwrap());
+            accum = add_carry_u64(accum, word);
+            tail = rest;
         }
 
-        // Add the last remaining odd byte, if any.
-        if let Some(&value) = data.first() {
-            accum += (value as u32) << 8;
+        // Remaining 4 / 2 / 1 bytes. `accum` can already be near `u64::MAX` from
+        // the wide loops, so each add must fold the carry just like the loop body.
+        if tail.len() >= 4 {
+            let word = u32::from_ne_bytes(tail[..4].try_into().unwrap()) as u64;
+            accum = add_carry_u64(accum, word);
+            tail = &tail[4..];
+        }
+        if tail.len() >= 2 {
+            let word = u16::from_ne_bytes(tail[..2].try_into().unwrap()) as u64;
+            accum = add_carry_u64(accum, word);
+            tail = &tail[2..];
+        }
+        if let Some(&byte) = tail.first() {
+            // RFC 1071: an odd trailing byte is the high byte of a 16-bit network-order
+            // word (low byte zero). Re-express that as a native-endian u16 so it lands
+            // in the same lane as the rest of our native-order sum.
+            let word = u16::from_ne_bytes([byte, 0]) as u64;
+            accum = add_carry_u64(accum, word);
         }
 
-        propagate_carries(accum)
+        // Fold to 16 bits (still native byte order), then byte-swap so the result
+        // is the network-order one's complement sum expressed as a host `u16` —
+        // matching the original `propagate_carries`-based implementation.
+        fold_u64(accum).swap_bytes()
     }
 
     /// Combine several RFC 1071 compliant checksums.
@@ -863,6 +914,77 @@ pub mod checksum {
             }
             #[allow(unreachable_patterns)]
             _ => unreachable!(),
+        }
+    }
+
+    /// Reference RFC 1071 checksum: u16 big-endian, u32 accumulator. Slow but
+    /// obvious. Kept for cross-validation in tests.
+    #[cfg(test)]
+    fn data_reference(mut data: &[u8]) -> u16 {
+        let mut accum: u32 = 0;
+        while data.len() >= 2 {
+            accum += NetworkEndian::read_u16(data) as u32;
+            data = &data[2..];
+        }
+        if let Some(&value) = data.first() {
+            accum += (value as u32) << 8;
+        }
+        propagate_carries(accum)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        /// Cross-check the wide-word implementation against the reference across
+        /// a spread of lengths, alignments, and content patterns.
+        #[test]
+        fn checksum_matches_reference() {
+            // Sizes chosen to exercise every code path in `data`:
+            // 0 (empty), <8 (tail only), exactly-8, 8..32 (8B loop), 32..64 (8B loop),
+            // 64+ (64B loop), and odd-byte handling at every step.
+            let sizes = [
+                0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 15, 16, 17, 31, 32, 33, 63, 64, 65, 127, 128, 129,
+                255, 256, 511, 512, 576, 1023, 1024, 1500, 1501, 4096, 4097, 9000, 65535,
+            ];
+            let patterns: [&dyn Fn(usize) -> u8; 4] = [
+                &|_| 0,
+                &|_| 0xff,
+                &|i| (i & 0xff) as u8,
+                &|i| ((i * 31 + 7) & 0xff) as u8,
+            ];
+            for &size in &sizes {
+                for pat in patterns.iter() {
+                    let buf: alloc::vec::Vec<u8> = (0..size).map(|i| pat(i)).collect();
+                    assert_eq!(
+                        data(&buf),
+                        data_reference(&buf),
+                        "mismatch at size={size}"
+                    );
+                }
+            }
+        }
+
+        /// One's complement sum + complement of any valid packet must be zero —
+        /// the standard RFC 1071 "checksum verification" identity.
+        #[test]
+        fn checksum_self_inverse() {
+            // Build a "packet" of arbitrary bytes, append its checksum (complemented)
+            // and confirm `data` over the whole thing returns `!0`.
+            let payload: alloc::vec::Vec<u8> = (0..1500).map(|i| (i as u8) ^ 0xa5).collect();
+            let csum = !data(&payload);
+            let mut packet = payload;
+            packet.extend_from_slice(&csum.to_be_bytes());
+            assert_eq!(data(&packet), !0);
+        }
+
+        /// An odd trailing byte must be treated as the high byte of a 16-bit word
+        /// (RFC 1071): `[b]` and `[b, 0]` produce identical checksums.
+        #[test]
+        fn checksum_odd_byte_is_padded_zero() {
+            for b in 0u8..=255 {
+                assert_eq!(data(&[b]), data(&[b, 0]));
+            }
         }
     }
 

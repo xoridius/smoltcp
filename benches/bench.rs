@@ -111,4 +111,87 @@ mod wire {
             repr.emit(&mut packet);
         });
     }
+
+    // --- RFC 1071 checksum sweep across realistic packet sizes ---
+    // 64: small TCP ACKs. 576: legacy IPv4 minimum MTU. 1500: standard Ethernet MTU.
+    // 9000: jumbo. 65535: maximum IP packet (worst case for tunnel reassembly).
+
+    fn bench_checksum_size(b: &mut test::Bencher, size: usize) {
+        let buf = vec![0xa5u8; size];
+        b.bytes = size as u64;
+        b.iter(|| test::black_box(smoltcp::wire::checksum::data(test::black_box(&buf))));
+    }
+
+    #[bench]
+    fn bench_checksum_64(b: &mut test::Bencher) {
+        bench_checksum_size(b, 64);
+    }
+
+    #[bench]
+    fn bench_checksum_576(b: &mut test::Bencher) {
+        bench_checksum_size(b, 576);
+    }
+
+    #[bench]
+    fn bench_checksum_1500(b: &mut test::Bencher) {
+        bench_checksum_size(b, 1500);
+    }
+
+    #[bench]
+    fn bench_checksum_9000(b: &mut test::Bencher) {
+        bench_checksum_size(b, 9000);
+    }
+
+    #[bench]
+    fn bench_checksum_65535(b: &mut test::Bencher) {
+        bench_checksum_size(b, 65535);
+    }
+
+    // Odd lengths exercise the trailing-byte path.
+    #[bench]
+    fn bench_checksum_1501(b: &mut test::Bencher) {
+        bench_checksum_size(b, 1501);
+    }
+
+    // --- TCP RX hot path: parse + verify checksum on a 1460-byte segment ---
+    #[bench]
+    #[cfg(feature = "proto-ipv4")]
+    fn bench_parse_verify_tcp(b: &mut test::Bencher) {
+        const PAYLOAD_LEN: usize = 1460;
+        let src = IpAddress::Ipv4(Ipv4Address::new(192, 168, 1, 1));
+        let dst = IpAddress::Ipv4(Ipv4Address::new(192, 168, 1, 2));
+
+        let repr = TcpRepr {
+            src_port: 48896,
+            dst_port: 80,
+            control: TcpControl::None,
+            seq_number: TcpSeqNumber(0x01234567),
+            ack_number: Some(TcpSeqNumber(0x12abcdef)),
+            window_len: 0x4000,
+            window_scale: None,
+            max_seg_size: None,
+            sack_permitted: false,
+            sack_ranges: [None, None, None],
+            payload: &[0x2a; PAYLOAD_LEN],
+            timestamp: None,
+        };
+        let mut bytes = vec![0u8; repr.buffer_len()];
+        {
+            let mut packet = TcpPacket::new_unchecked(&mut bytes);
+            repr.emit(&mut packet, &src, &dst, &ChecksumCapabilities::default());
+        }
+
+        b.bytes = bytes.len() as u64;
+        b.iter(|| {
+            let packet = TcpPacket::new_unchecked(test::black_box(&bytes[..]));
+            let repr = TcpRepr::parse(
+                &packet,
+                test::black_box(&src),
+                test::black_box(&dst),
+                &ChecksumCapabilities::default(),
+            )
+            .unwrap();
+            test::black_box(repr);
+        });
+    }
 }
