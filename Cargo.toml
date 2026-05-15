@@ -297,6 +297,10 @@ path = "utils/packet2pcap.rs"
 required-features = ["std"]
 
 [[example]]
+name = "profile_loopback"
+required-features = ["std", "medium-ip", "proto-ipv4", "socket-tcp", "socket-udp"]
+
+[[example]]
 name = "tcpdump"
 required-features = ["std", "phy-raw_socket", "proto-ipv4"]
 
