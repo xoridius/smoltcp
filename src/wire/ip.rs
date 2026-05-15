@@ -868,15 +868,13 @@ pub mod checksum {
         next_header: Protocol,
         length: u32,
     ) -> u16 {
-        let mut proto_len = [0u8; 4];
-        proto_len[1] = next_header.into();
-        NetworkEndian::write_u16(&mut proto_len[2..4], length as u16);
-
-        combine(&[
-            data(&src_addr.octets()),
-            data(&dst_addr.octets()),
-            data(&proto_len[..]),
-        ])
+        // RFC 793 §3.1: TCP/UDP pseudo-header is src(4) | dst(4) | 0 | proto | len(u16).
+        let mut buf = [0u8; 12];
+        buf[0..4].copy_from_slice(&src_addr.octets());
+        buf[4..8].copy_from_slice(&dst_addr.octets());
+        buf[9] = next_header.into();
+        NetworkEndian::write_u16(&mut buf[10..12], length as u16);
+        data(&buf)
     }
 
     #[cfg(feature = "proto-ipv6")]
@@ -886,15 +884,14 @@ pub mod checksum {
         next_header: Protocol,
         length: u32,
     ) -> u16 {
-        let mut proto_len = [0u8; 4];
-        proto_len[1] = next_header.into();
-        NetworkEndian::write_u16(&mut proto_len[2..4], length as u16);
-
-        combine(&[
-            data(&src_addr.octets()),
-            data(&dst_addr.octets()),
-            data(&proto_len[..]),
-        ])
+        // RFC 2460 §8.1: IPv6 pseudo-header is src(16) | dst(16) | upper-layer-len(u32-BE)
+        // | 0(3) | next-header(1). Lay out into a single buffer so the inner loop runs once.
+        let mut buf = [0u8; 40];
+        buf[0..16].copy_from_slice(&src_addr.octets());
+        buf[16..32].copy_from_slice(&dst_addr.octets());
+        NetworkEndian::write_u32(&mut buf[32..36], length);
+        buf[39] = next_header.into();
+        data(&buf)
     }
 
     pub fn pseudo_header(
