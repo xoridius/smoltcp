@@ -107,27 +107,21 @@ impl Controller for Cubic {
 
         self.last_update = now;
 
-        let cwnd = if cwnd < 0.0 {
-            0
-        } else if cwnd > u32::MAX as f64 {
-            u32::MAX
-        } else {
-            cwnd as u32
-        };
+        // `f64 as u32` is saturating since Rust 1.45 (NaN -> 0, negative -> 0,
+        // overflow -> u32::MAX); the explicit clamp documents the bounds.
+        let cwnd = cwnd.clamp(0.0, u32::MAX as f64) as u32;
         self.cwnd = cwnd.max(self.min_cwnd).min(self.rwnd);
     }
 
     fn set_mss(&mut self, mss: usize) {
-        let mss_u32 = mss.min(u32::MAX as usize) as u32;
-        self.min_cwnd = mss_u32;
-        // RFC 6928 IW: min(10*MSS, max(2*MSS, 14600)). set_mss is called when
-        // the peer's MSS is learned (on SYN), before any data segments are
-        // sent, so raise the initial window then. mss is bounded by 16-bit
-        // wire field so 10*mss never overflows u32.
-        let iw = (10 * mss_u32).min((2 * mss_u32).max(14_600));
-        if self.cwnd < iw {
-            self.cwnd = iw;
-        }
+        let mss = mss.min(u32::MAX as usize) as u32;
+        self.min_cwnd = mss;
+        // RFC 6928 IW = min(10*MSS, max(2*MSS, 14600)). Called when the peer's
+        // MSS is learned (on SYN) so we open at this size before any data
+        // segments. mss fits in 16 bits so 10*mss never overflows u32.
+        self.cwnd = self
+            .cwnd
+            .max((10 * mss).min((2 * mss).max(14_600)));
     }
 }
 

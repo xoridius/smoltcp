@@ -1682,20 +1682,19 @@ impl<'a> Socket<'a> {
         // RFC 7323 §5.3 R1 (PAWS): if the segment carries a Timestamps option,
         // it's not a RST, and our TS.Recent is valid (non-zero), drop the
         // segment when SEG.TSval is older than TS.Recent under i32-wrap
-        // arithmetic. The peer's reply will see our current TS.Recent in our
-        // challenge ACK and re-synchronize.
-        if let Some(timestamp) = repr.timestamp {
-            if self.last_remote_tsval != 0
-                && repr.control != TcpControl::Rst
-                && (timestamp.tsval.wrapping_sub(self.last_remote_tsval) as i32) < 0
-            {
-                net_debug!(
-                    "PAWS reject: tsval={} < ts_recent={}",
-                    timestamp.tsval,
-                    self.last_remote_tsval
-                );
-                return self.challenge_ack_reply(cx, ip_repr, repr);
-            }
+        // arithmetic. The challenge ACK echoes our current TS.Recent so the
+        // peer can re-synchronize.
+        if let Some(timestamp) = repr.timestamp
+            && self.last_remote_tsval != 0
+            && repr.control != TcpControl::Rst
+            && (timestamp.tsval.wrapping_sub(self.last_remote_tsval) as i32) < 0
+        {
+            net_debug!(
+                "PAWS reject: tsval={} < ts_recent={}",
+                timestamp.tsval,
+                self.last_remote_tsval
+            );
+            return self.challenge_ack_reply(cx, ip_repr, repr);
         }
 
         let window_start = self.remote_seq_no + self.rx_buffer.len();

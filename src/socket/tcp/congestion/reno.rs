@@ -55,16 +55,14 @@ impl Controller for Reno {
     }
 
     fn set_mss(&mut self, mss: usize) {
-        let mss_u32 = mss.min(u32::MAX as usize) as u32;
-        self.min_cwnd = mss_u32;
-        // RFC 6928 IW: min(10*MSS, max(2*MSS, 14600)). set_mss is called when
-        // the peer's MSS is learned (on SYN), before any data segments are
-        // sent, so raise the initial window then. mss is bounded by 16-bit
-        // wire field so 10*mss never overflows u32.
-        let iw = (10 * mss_u32).min((2 * mss_u32).max(14_600));
-        if self.cwnd < iw {
-            self.cwnd = iw;
-        }
+        let mss = mss.min(u32::MAX as usize) as u32;
+        self.min_cwnd = mss;
+        // RFC 6928 IW = min(10*MSS, max(2*MSS, 14600)). Called when the peer's
+        // MSS is learned (on SYN) so we open at this size before any data
+        // segments. mss fits in 16 bits so 10*mss never overflows u32.
+        self.cwnd = self
+            .cwnd
+            .max((10 * mss).min((2 * mss).max(14_600)));
     }
 
     fn set_remote_window(&mut self, remote_window: usize) {
