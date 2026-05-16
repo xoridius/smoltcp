@@ -2386,12 +2386,19 @@ impl<'a> Socket<'a> {
         self.congestion_controller
             .pre_transmit(cx.now());
 
+        // `seq_to_transmit` is called twice in the original flow (once for the
+        // retransmit check, once for the send decision below); both look at the
+        // same MSS/window/cwnd state. Cache it. If the retransmit branch fires
+        // it rewinds `remote_last_seq` so the cached value is stale — refresh
+        // it there.
+        let mut want_send = self.seq_to_transmit(cx);
+
         // Check if any state needs to be changed because of a timer.
         if self.timed_out(cx.now()) {
             // If a timeout expires, we should abort the connection.
             net_debug!("timeout exceeded");
             self.set_state(State::Closed);
-        } else if !self.seq_to_transmit(cx) && self.timer.should_retransmit(cx.now()) {
+        } else if !want_send && self.timer.should_retransmit(cx.now()) {
             // If a retransmit timer expired, we should resend data starting at the last ACK.
             net_debug!("retransmitting");
 
@@ -2412,6 +2419,9 @@ impl<'a> Socket<'a> {
             // Inform the congestion controller that we're retransmitting.
             self.congestion_controller
             .on_retransmit(cx.now());
+
+            // The rewind above may have changed whether we have anything to send.
+            want_send = self.seq_to_transmit(cx);
         }
 
         #[cfg(feature = "socket-tcp-pause-synack")]
@@ -2420,7 +2430,7 @@ impl<'a> Socket<'a> {
         }
 
         // Decide whether we're sending a packet.
-        if self.seq_to_transmit(cx) {
+        if want_send {
             // If we have data to transmit and it fits into partner's window, do it.
             tcp_trace!("outgoing segment will send data or flags");
         } else if self.ack_to_transmit() && self.delayed_ack_expired(cx.now()) {
