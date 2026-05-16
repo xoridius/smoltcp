@@ -2,13 +2,16 @@ use crate::{socket::tcp::RttEstimator, time::Instant};
 
 use super::Controller;
 
+/// RFC 5681 Reno congestion controller. Window-sized fields use u32 (RFC 1323
+/// caps the effective window at 2^30), halving the struct footprint on 64-bit
+/// targets vs usize-typed fields.
 #[derive(Debug)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct Reno {
-    cwnd: usize,
-    min_cwnd: usize,
-    ssthresh: usize,
-    rwnd: usize,
+    cwnd: u32,
+    min_cwnd: u32,
+    ssthresh: u32,
+    rwnd: u32,
 }
 
 impl Reno {
@@ -16,7 +19,7 @@ impl Reno {
         Reno {
             cwnd: 1024 * 2,
             min_cwnd: 1024 * 2,
-            ssthresh: usize::MAX,
+            ssthresh: u32::MAX,
             rwnd: 64 * 1024,
         }
     }
@@ -24,13 +27,13 @@ impl Reno {
 
 impl Controller for Reno {
     fn window(&self) -> usize {
-        self.cwnd
+        self.cwnd as usize
     }
 
     fn on_ack(&mut self, _now: Instant, len: usize, _rtt: &RttEstimator) {
         let len = if self.cwnd < self.ssthresh {
             // Slow start.
-            len
+            len.min(u32::MAX as usize) as u32
         } else {
             self.ssthresh = self.cwnd;
             self.min_cwnd
@@ -52,10 +55,11 @@ impl Controller for Reno {
     }
 
     fn set_mss(&mut self, mss: usize) {
-        self.min_cwnd = mss;
+        self.min_cwnd = mss.min(u32::MAX as usize) as u32;
     }
 
     fn set_remote_window(&mut self, remote_window: usize) {
+        let remote_window = remote_window.min(u32::MAX as usize) as u32;
         if self.rwnd < remote_window {
             self.rwnd = remote_window;
         }
@@ -100,7 +104,7 @@ mod test {
                 let cwnd = reno.window();
                 println!("Reno: elapsed = {}, cwnd = {}", elapsed, cwnd);
 
-                assert!(cwnd >= reno.min_cwnd);
+                assert!(cwnd >= (reno.min_cwnd as usize));
                 assert!(reno.window() <= remote_window);
             }
         }
@@ -116,7 +120,7 @@ mod test {
 
         for _ in 0..100 {
             reno.on_retransmit(now);
-            assert!(reno.window() >= reno.min_cwnd);
+            assert!(reno.window() >= (reno.min_cwnd as usize));
         }
     }
 

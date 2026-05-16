@@ -7,16 +7,20 @@ use super::Controller;
 const BETA_CUBIC: f64 = 0.7;
 const C: f64 = 0.4;
 
+/// RFC 8312 Cubic congestion controller.
+///
+/// All window-size fields are u32 (1 GiB cap from RFC 1323 / window scale 14),
+/// halving the struct footprint on 64-bit targets vs usize-typed fields.
 #[derive(Debug)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct Cubic {
-    cwnd: usize,     // Congestion window
-    min_cwnd: usize, // The minimum size of congestion window
-    w_max: usize,    // Window size just before congestion
+    cwnd: u32,     // Congestion window
+    min_cwnd: u32, // The minimum size of congestion window
+    w_max: u32,    // Window size just before congestion
+    rwnd: u32,     // Remote window
+    ssthresh: u32,
     recovery_start: Option<Instant>,
-    rwnd: usize, // Remote window
     last_update: Instant,
-    ssthresh: usize,
 }
 
 impl Cubic {
@@ -28,14 +32,14 @@ impl Cubic {
             recovery_start: None,
             rwnd: 64 * 1024,
             last_update: Instant::from_millis(0),
-            ssthresh: usize::MAX,
+            ssthresh: u32::MAX,
         }
     }
 }
 
 impl Controller for Cubic {
     fn window(&self) -> usize {
-        self.cwnd
+        self.cwnd as usize
     }
 
     fn on_retransmit(&mut self, now: Instant) {
@@ -51,6 +55,8 @@ impl Controller for Cubic {
     }
 
     fn set_remote_window(&mut self, remote_window: usize) {
+        // RFC 1323 caps the effective window at 2^30, well inside u32.
+        let remote_window = remote_window.min(u32::MAX as usize) as u32;
         if self.rwnd < remote_window {
             self.rwnd = remote_window;
         }
@@ -59,6 +65,7 @@ impl Controller for Cubic {
     fn on_ack(&mut self, _now: Instant, len: usize, _rtt: &crate::socket::tcp::RttEstimator) {
         // Slow start.
         if self.cwnd < self.ssthresh {
+            let len = len.min(u32::MAX as usize) as u32;
             self.cwnd = self
                 .cwnd
                 .saturating_add(len)
@@ -101,11 +108,18 @@ impl Controller for Cubic {
 
         self.last_update = now;
 
-        self.cwnd = (cwnd as usize).max(self.min_cwnd).min(self.rwnd);
+        let cwnd = if cwnd < 0.0 {
+            0
+        } else if cwnd > u32::MAX as f64 {
+            u32::MAX
+        } else {
+            cwnd as u32
+        };
+        self.cwnd = cwnd.max(self.min_cwnd).min(self.rwnd);
     }
 
     fn set_mss(&mut self, mss: usize) {
-        self.min_cwnd = mss;
+        self.min_cwnd = mss.min(u32::MAX as usize) as u32;
     }
 }
 
@@ -189,7 +203,7 @@ mod test {
                 let cwnd = cubic.window();
                 println!("Cubic: elapsed = {}, cwnd = {}", elapsed, cwnd);
 
-                assert!(cwnd >= cubic.min_cwnd);
+                assert!(cwnd >= (cubic.min_cwnd as usize));
                 assert!(cubic.window() <= remote_window);
             }
         }
@@ -208,8 +222,8 @@ mod test {
         let cwnd = cubic.window();
         println!("Cubic:time_inversion: cwnd: {}, cubic: {cubic:?}", cwnd);
 
-        assert!(cwnd >= cubic.min_cwnd);
-        assert!(cwnd <= cubic.rwnd);
+        assert!(cwnd >= (cubic.min_cwnd as usize));
+        assert!(cwnd <= (cubic.rwnd as usize));
     }
 
     #[test]
@@ -225,8 +239,8 @@ mod test {
         let cwnd = cubic.window();
         println!("Cubic:long_elapsed_time: cwnd: {}", cwnd);
 
-        assert!(cwnd >= cubic.min_cwnd);
-        assert!(cwnd <= cubic.rwnd);
+        assert!(cwnd >= (cubic.min_cwnd as usize));
+        assert!(cwnd <= (cubic.rwnd as usize));
     }
 
     #[test]
@@ -274,14 +288,14 @@ mod test {
         for i in 1..1000 {
             let t2 = Instant::from_micros(i);
             cubic.on_ack(t2, ack_len * 100, &RttEstimator::default());
-            assert!(cubic.window() <= cubic.rwnd);
+            assert!(cubic.window() <= (cubic.rwnd as usize));
         }
 
         let t3 = Instant::from_micros(2000);
 
         let cwnd = cubic.window();
         cubic.on_retransmit(t3);
-        assert_eq!(cwnd >> 1, cubic.ssthresh);
+        assert_eq!(cwnd >> 1, (cubic.ssthresh as usize));
     }
 
     #[test]

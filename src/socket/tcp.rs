@@ -499,15 +499,19 @@ pub struct Socket<'a> {
     /// The sending window scaling factor advertised to remotes which support RFC 1323.
     /// It is zero if the window <= 64KiB and/or the remote does not support it.
     remote_win_shift: u8,
-    /// The remote window size, relative to local_seq_no
-    /// I.e. we're allowed to send octets until local_seq_no+remote_win_len
-    remote_win_len: usize,
+    /// The remote window size, relative to local_seq_no.
+    /// I.e. we're allowed to send octets until local_seq_no+remote_win_len.
+    /// Bounded by the RFC 1323 window-scale cap of 2^30, so `u32` is sufficient
+    /// and saves 4 bytes per socket on 64-bit targets.
+    remote_win_len: u32,
     /// The receive window scaling factor for remotes which support RFC 1323, None if unsupported.
     remote_win_scale: Option<u8>,
     /// Whether or not the remote supports selective ACK as described in RFC 2018.
     remote_has_sack: bool,
     /// The maximum number of data octets that the remote side may receive.
-    remote_mss: usize,
+    /// MSS is a 16-bit TCP option (RFC 879); `u32` is more than enough and
+    /// saves 4 bytes per socket on 64-bit targets.
+    remote_mss: u32,
     /// The timestamp of the last packet received.
     remote_last_ts: Option<Instant>,
     /// The sequence number of the last packet received, used for sACK
@@ -593,7 +597,7 @@ impl<'a> Socket<'a> {
             remote_win_shift: rx_cap_log2.saturating_sub(16) as u8,
             remote_win_scale: None,
             remote_has_sack: false,
-            remote_mss: DEFAULT_MSS,
+            remote_mss: DEFAULT_MSS as u32,
             remote_last_ts: None,
             local_rx_last_ack: None,
             local_rx_last_seq: None,
@@ -906,7 +910,7 @@ impl<'a> Socket<'a> {
         self.remote_win_len = 0;
         self.remote_win_scale = None;
         self.remote_win_shift = rx_cap_log2.saturating_sub(16) as u8;
-        self.remote_mss = DEFAULT_MSS;
+        self.remote_mss = DEFAULT_MSS as u32;
         self.remote_last_ts = None;
         self.ack_delay_timer = AckDelayTimer::Idle;
         self.challenge_ack_timer = Instant::from_secs(0);
@@ -1795,8 +1799,7 @@ impl<'a> Socket<'a> {
 
             self.rtte.on_ack(cx.now(), ack_number);
             self.congestion_controller
-                .inner_mut()
-                .on_ack(cx.now(), ack_len, &self.rtte);
+            .on_ack(cx.now(), ack_len, &self.rtte);
         }
 
         // Disregard control flags we don't care about or shouldn't act on yet.
@@ -1847,9 +1850,8 @@ impl<'a> Socket<'a> {
                         return None;
                     }
                     self.congestion_controller
-                        .inner_mut()
-                        .set_mss(max_seg_size as usize);
-                    self.remote_mss = max_seg_size as usize
+            .set_mss(max_seg_size as usize);
+                    self.remote_mss = max_seg_size as u32
                 }
 
                 self.tuple = Some(Tuple {
@@ -1900,10 +1902,9 @@ impl<'a> Socket<'a> {
                         tcp_trace!("received SYNACK with zero MSS, ignoring");
                         return None;
                     }
-                    self.remote_mss = max_seg_size as usize;
+                    self.remote_mss = max_seg_size as u32;
                     self.congestion_controller
-                        .inner_mut()
-                        .set_mss(self.remote_mss);
+            .set_mss(self.remote_mss as usize);
                 }
 
                 self.remote_seq_no = repr.seq_number + 1;
@@ -2006,13 +2007,14 @@ impl<'a> Socket<'a> {
             TcpControl::Syn => 0,
             _ => self.remote_win_scale.unwrap_or(0),
         };
-        let new_remote_win_len = (repr.window_len as usize) << (scale as usize);
+        // RFC 1323 caps the effective window at 2^30, so the shifted value
+        // fits in u32 (max 0xffff << 14 = 0x3fff_c000).
+        let new_remote_win_len = (repr.window_len as u32) << (scale as u32);
         let is_window_update = new_remote_win_len != self.remote_win_len;
         self.remote_win_len = new_remote_win_len;
 
         self.congestion_controller
-            .inner_mut()
-            .set_remote_window(new_remote_win_len);
+            .set_remote_window(new_remote_win_len as usize);
 
         if ack_len > 0 {
             // Dequeue acknowledged octets.
@@ -2052,8 +2054,7 @@ impl<'a> Socket<'a> {
 
                     // Inform congestion controller of duplicate ACK
                     self.congestion_controller
-                        .inner_mut()
-                        .on_duplicate_ack(cx.now());
+            .on_duplicate_ack(cx.now());
 
                     net_debug!(
                         "received duplicate ACK for seq {} (duplicate nr {}{})",
@@ -2236,7 +2237,7 @@ impl<'a> Socket<'a> {
         let local_mss = cx.ip_mtu() - ip_header_len - TCP_HEADER_LEN;
 
         // The effective max segment size, taking into account our and remote's limits.
-        let effective_mss = local_mss.min(self.remote_mss);
+        let effective_mss = local_mss.min(self.remote_mss as usize);
 
         // Have we sent data that hasn't been ACKed yet?
         let data_in_flight = self.remote_last_seq != self.local_seq_no;
@@ -2247,8 +2248,8 @@ impl<'a> Socket<'a> {
         }
 
         // max sequence number we can send.
-        let max_send_seq =
-            self.local_seq_no + core::cmp::min(self.remote_win_len, self.tx_buffer.len());
+        let max_send_seq = self.local_seq_no
+            + core::cmp::min(self.remote_win_len as usize, self.tx_buffer.len());
 
         // Max amount of octets we can send.
         let max_send = if max_send_seq >= self.remote_last_seq {
@@ -2258,7 +2259,7 @@ impl<'a> Socket<'a> {
         };
 
         // Compare max_send with the congestion window.
-        let max_send = max_send.min(self.congestion_controller.inner().window());
+        let max_send = max_send.min(self.congestion_controller.window());
 
         // Can we send at least 1 octet?
         let mut can_send = max_send != 0;
@@ -2319,7 +2320,8 @@ impl<'a> Socket<'a> {
     /// <https://elixir.bootlin.com/linux/v6.11.4/source/net/ipv4/tcp_input.c#L5747>.
     fn immediate_ack_to_transmit(&self) -> bool {
         if let Some(remote_last_ack) = self.remote_last_ack {
-            remote_last_ack + self.remote_mss < self.remote_seq_no + self.rx_buffer.len()
+            remote_last_ack + (self.remote_mss as usize)
+                < self.remote_seq_no + self.rx_buffer.len()
         } else {
             false
         }
@@ -2382,7 +2384,6 @@ impl<'a> Socket<'a> {
         }
 
         self.congestion_controller
-            .inner_mut()
             .pre_transmit(cx.now());
 
         // Check if any state needs to be changed because of a timer.
@@ -2410,8 +2411,7 @@ impl<'a> Socket<'a> {
 
             // Inform the congestion controller that we're retransmitting.
             self.congestion_controller
-                .inner_mut()
-                .on_retransmit(cx.now());
+            .on_retransmit(cx.now());
         }
 
         #[cfg(feature = "socket-tcp-pause-synack")]
@@ -2516,7 +2516,7 @@ impl<'a> Socket<'a> {
                 // from the transmit buffer.
 
                 // Right edge of window, ie the max sequence number we're allowed to send.
-                let win_right_edge = self.local_seq_no + self.remote_win_len;
+                let win_right_edge = self.local_seq_no + self.remote_win_len as usize;
 
                 // Max amount of octets we're allowed to send according to the remote window.
                 let mut win_limit = if win_right_edge >= self.remote_last_seq {
@@ -2541,7 +2541,7 @@ impl<'a> Socket<'a> {
                 // 2. MSS the remote is willing to accept, probably determined by their MTU
                 // 3. MSS we can send, determined by our MTU.
                 let size = win_limit
-                    .min(self.remote_mss)
+                    .min(self.remote_mss as usize)
                     .min(cx.ip_mtu() - ip_repr.header_len() - TCP_HEADER_LEN);
 
                 let offset = self.remote_last_seq - self.local_seq_no;
@@ -2655,8 +2655,7 @@ impl<'a> Socket<'a> {
             self.rtte
                 .on_send(cx.now(), repr.seq_number + repr.segment_len());
             self.congestion_controller
-                .inner_mut()
-                .post_transmit(cx.now(), repr.segment_len());
+            .post_transmit(cx.now(), repr.segment_len());
         }
 
         if repr.segment_len() > 0 && !self.timer.is_retransmit() {

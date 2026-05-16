@@ -10,7 +10,7 @@ pub(super) mod cubic;
 #[cfg(feature = "socket-tcp-reno")]
 pub(super) mod reno;
 
-#[allow(unused_variables)]
+#[allow(unused_variables, dead_code)]
 pub(super) trait Controller {
     /// Returns the number of bytes that can be sent.
     fn window(&self) -> usize;
@@ -73,29 +73,107 @@ impl AnyController {
         AnyController::None(no_control::NoControl)
     }
 
+    // Static-dispatch wrappers for the hot-path Controller methods.
+    //
+    // The previous design exposed `&dyn Controller` getters, forcing every
+    // call (e.g. `window()` inside `seq_to_transmit`, which runs per packet)
+    // to indirect through a v-table. With direct matches the optimizer
+    // monomorphizes the call (and, in the common single-variant builds,
+    // eliminates the match outright). Args may go unused in the `None` arm
+    // when no real controller is compiled in.
+    #[allow(unused_variables)]
     #[inline]
-    pub fn inner_mut(&mut self) -> &mut dyn Controller {
+    pub fn window(&self) -> usize {
         match self {
-            AnyController::None(n) => n,
-
+            AnyController::None(_) => usize::MAX,
             #[cfg(feature = "socket-tcp-reno")]
-            AnyController::Reno(r) => r,
-
+            AnyController::Reno(r) => r.window(),
             #[cfg(feature = "socket-tcp-cubic")]
-            AnyController::Cubic(c) => c,
+            AnyController::Cubic(c) => c.window(),
         }
     }
 
+    #[allow(unused_variables)]
     #[inline]
-    pub fn inner(&self) -> &dyn Controller {
+    pub fn set_remote_window(&mut self, remote_window: usize) {
         match self {
-            AnyController::None(n) => n,
-
+            AnyController::None(_) => {}
             #[cfg(feature = "socket-tcp-reno")]
-            AnyController::Reno(r) => r,
-
+            AnyController::Reno(r) => r.set_remote_window(remote_window),
             #[cfg(feature = "socket-tcp-cubic")]
-            AnyController::Cubic(c) => c,
+            AnyController::Cubic(c) => c.set_remote_window(remote_window),
+        }
+    }
+
+    #[allow(unused_variables)]
+    #[inline]
+    pub fn on_ack(&mut self, now: Instant, len: usize, rtt: &RttEstimator) {
+        match self {
+            AnyController::None(_) => {}
+            #[cfg(feature = "socket-tcp-reno")]
+            AnyController::Reno(r) => r.on_ack(now, len, rtt),
+            #[cfg(feature = "socket-tcp-cubic")]
+            AnyController::Cubic(c) => c.on_ack(now, len, rtt),
+        }
+    }
+
+    #[allow(unused_variables)]
+    #[inline]
+    pub fn on_retransmit(&mut self, now: Instant) {
+        match self {
+            AnyController::None(_) => {}
+            #[cfg(feature = "socket-tcp-reno")]
+            AnyController::Reno(r) => r.on_retransmit(now),
+            #[cfg(feature = "socket-tcp-cubic")]
+            AnyController::Cubic(c) => c.on_retransmit(now),
+        }
+    }
+
+    #[allow(unused_variables)]
+    #[inline]
+    pub fn on_duplicate_ack(&mut self, now: Instant) {
+        match self {
+            AnyController::None(_) => {}
+            #[cfg(feature = "socket-tcp-reno")]
+            AnyController::Reno(r) => r.on_duplicate_ack(now),
+            #[cfg(feature = "socket-tcp-cubic")]
+            AnyController::Cubic(c) => c.on_duplicate_ack(now),
+        }
+    }
+
+    #[allow(unused_variables)]
+    #[inline]
+    pub fn pre_transmit(&mut self, now: Instant) {
+        match self {
+            AnyController::None(_) => {}
+            #[cfg(feature = "socket-tcp-reno")]
+            AnyController::Reno(r) => r.pre_transmit(now),
+            #[cfg(feature = "socket-tcp-cubic")]
+            AnyController::Cubic(c) => c.pre_transmit(now),
+        }
+    }
+
+    #[allow(unused_variables)]
+    #[inline]
+    pub fn post_transmit(&mut self, now: Instant, len: usize) {
+        match self {
+            AnyController::None(_) => {}
+            #[cfg(feature = "socket-tcp-reno")]
+            AnyController::Reno(r) => r.post_transmit(now, len),
+            #[cfg(feature = "socket-tcp-cubic")]
+            AnyController::Cubic(c) => c.post_transmit(now, len),
+        }
+    }
+
+    #[allow(unused_variables)]
+    #[inline]
+    pub fn set_mss(&mut self, mss: usize) {
+        match self {
+            AnyController::None(_) => {}
+            #[cfg(feature = "socket-tcp-reno")]
+            AnyController::Reno(r) => r.set_mss(mss),
+            #[cfg(feature = "socket-tcp-cubic")]
+            AnyController::Cubic(c) => c.set_mss(mss),
         }
     }
 }
