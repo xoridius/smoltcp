@@ -791,27 +791,28 @@ pub mod checksum {
 
     /// Compute an RFC 1071 compliant checksum (without the final complement).
     ///
-    /// Accumulates the data 8 bytes at a time in native byte order, deferring
-    /// the byte-swap to the final fold. This is the canonical wide-word
+    /// Accumulates the data in 64-byte chunks across two independent adder
+    /// chains, then drains 8/4/2/1-byte tails. This is the canonical wide-word
     /// approach used by the Linux kernel's `do_csum`: a one's complement sum
     /// of native-endian u16 words equals the byte-swap of the same sum done in
     /// network byte order, so on little-endian targets the final fold needs a
     /// `swap_bytes` to recover the network-order checksum; on big-endian the
-    /// native sum already is the network-order sum so no swap is needed.
+    /// native sum already is the network-order sum.
     pub fn data(data: &[u8]) -> u16 {
         let mut accum: u64 = 0;
         let mut tail = data;
 
-        // Two-chain unroll on 64-byte iterations to break the data-dependency
-        // between successive `adc` instructions and let the CPU pipeline two
-        // adders in parallel.
+        // Two-chain unroll on 64-byte iterations: each 16-byte stripe feeds one
+        // u64 into adder chain `a` and one into chain `b`. Keeping the chains
+        // independent breaks the data-dependency between successive `adc`
+        // instructions and lets the CPU pipeline two adders in parallel.
         while tail.len() >= 64 {
             let (chunk, rest) = tail.split_at(64);
             let mut a: u64 = 0;
             let mut b: u64 = 0;
-            for i in 0..4 {
-                let lo = u64::from_ne_bytes(chunk[i * 16..i * 16 + 8].try_into().unwrap());
-                let hi = u64::from_ne_bytes(chunk[i * 16 + 8..i * 16 + 16].try_into().unwrap());
+            for stripe in chunk.chunks_exact(16) {
+                let lo = u64::from_ne_bytes(stripe[..8].try_into().unwrap());
+                let hi = u64::from_ne_bytes(stripe[8..].try_into().unwrap());
                 a = add_carry_u64(a, lo);
                 b = add_carry_u64(b, hi);
             }
@@ -938,6 +939,23 @@ pub mod checksum {
         propagate_carries(accum)
     }
 
+    // We use this in pretty printer implementations.
+    pub(crate) fn format_checksum(
+        f: &mut fmt::Formatter,
+        correct: bool,
+        partially_correct: bool,
+    ) -> fmt::Result {
+        if !correct {
+            if partially_correct {
+                write!(f, " (partial checksum correct)")
+            } else {
+                write!(f, " (checksum incorrect)")
+            }
+        } else {
+            Ok(())
+        }
+    }
+
     #[cfg(test)]
     mod tests {
         use super::*;
@@ -947,8 +965,8 @@ pub mod checksum {
         #[test]
         fn checksum_matches_reference() {
             // Sizes chosen to exercise every code path in `data`:
-            // 0 (empty), <8 (tail only), exactly-8, 8..32 (8B loop), 32..64 (8B loop),
-            // 64+ (64B loop), and odd-byte handling at every step.
+            // 0 (empty), <8 (tail only), exactly-8, 8..64 (8B loop only),
+            // 64+ (wide loop entered), and odd-byte handling at every step.
             let sizes = [
                 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 15, 16, 17, 31, 32, 33, 63, 64, 65, 127, 128, 129,
                 255, 256, 511, 512, 576, 1023, 1024, 1500, 1501, 4096, 4097, 9000, 65535,
@@ -960,8 +978,8 @@ pub mod checksum {
                 &|i| ((i * 31 + 7) & 0xff) as u8,
             ];
             for &size in &sizes {
-                for pat in patterns.iter() {
-                    let buf: alloc::vec::Vec<u8> = (0..size).map(|i| pat(i)).collect();
+                for pat in &patterns {
+                    let buf: alloc::vec::Vec<u8> = (0..size).map(pat).collect();
                     assert_eq!(
                         data(&buf),
                         data_reference(&buf),
@@ -1007,23 +1025,6 @@ pub mod checksum {
             assert_eq!(data(&[0xff, 0xff, 0xff, 0xff]), 0xffff);
             // 0xff00 + 0x0100 = 0x1_0000; fold gives 0x0001.
             assert_eq!(data(&[0xff, 0x00, 0x01, 0x00]), 0x0001);
-        }
-    }
-
-    // We use this in pretty printer implementations.
-    pub(crate) fn format_checksum(
-        f: &mut fmt::Formatter,
-        correct: bool,
-        partially_correct: bool,
-    ) -> fmt::Result {
-        if !correct {
-            if partially_correct {
-                write!(f, " (partial checksum correct)")
-            } else {
-                write!(f, " (checksum incorrect)")
-            }
-        } else {
-            Ok(())
         }
     }
 }

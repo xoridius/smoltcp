@@ -73,7 +73,6 @@ fn rss_bytes() -> u64 {
     for line in s.lines() {
         if let Some(rest) = line.strip_prefix("VmRSS:") {
             let kib: u64 = rest
-                .trim()
                 .split_whitespace()
                 .next()
                 .and_then(|n| n.parse().ok())
@@ -774,18 +773,6 @@ impl<'a> Report<'a> {
     }
 }
 
-/// Drive both endpoints until both sides indicate no more state changes,
-/// advancing the virtual clock in 1ms steps when idle.
-fn run_for(server: &mut Endpoint<'static>, client: &mut Endpoint<'static>, until: StdInstant) {
-    let mut t_ms: i64 = 0;
-    while StdInstant::now() < until {
-        let now = Instant::from_millis(t_ms);
-        let _ = server.iface.poll(now, &mut server.device, &mut server.sockets);
-        let _ = client.iface.poll(now, &mut client.device, &mut client.sockets);
-        t_ms = t_ms.wrapping_add(1);
-    }
-}
-
 fn shape_firehose(seconds: u64, offload: bool) {
     const BUF: usize = 256 * 1024;
     let lane_a: LaneRc = Rc::new(RefCell::new(Lane::new(1500, 256)));
@@ -929,7 +916,6 @@ fn shape_firehose(seconds: u64, offload: bool) {
         unit_label: "idle-spins",
     }
     .print();
-    let _ = run_for; // suppress dead_code on this helper, kept for future shapes
 }
 
 fn shape_small(seconds: u64, offload: bool) {
@@ -979,13 +965,11 @@ fn shape_small(seconds: u64, offload: bool) {
         let n = Instant::from_millis(t_ms);
 
         let cs = client.sockets.get_mut::<tcp::Socket>(cli_h);
-        if cs.can_send() {
-            if let Ok(w) = cs.send_slice(&payload) {
-                if w > 0 {
+        if cs.can_send()
+            && let Ok(w) = cs.send_slice(&payload)
+                && w > 0 {
                     sent += w as u64;
                 }
-            }
-        }
         poll_lat.measure(|| {
             client.iface.poll(n, &mut client.device, &mut client.sockets);
             server.iface.poll(n, &mut server.device, &mut server.sockets);
@@ -1075,13 +1059,11 @@ fn shape_pingpong(seconds: u64, offload: bool) {
         // Server echoes.
         let ss = server.sockets.get_mut::<tcp::Socket>(srv_h);
         let mut sink = [0u8; 128];
-        if ss.can_recv() {
-            if let Ok(r) = ss.recv_slice(&mut sink) {
-                if r > 0 && ss.can_send() {
+        if ss.can_recv()
+            && let Ok(r) = ss.recv_slice(&mut sink)
+                && r > 0 && ss.can_send() {
                     let _ = ss.send_slice(&sink[..r]);
                 }
-            }
-        }
         poll_lat.measure(|| {
             server.iface.poll(n, &mut server.device, &mut server.sockets);
             client.iface.poll(n, &mut client.device, &mut client.sockets);
@@ -1089,13 +1071,11 @@ fn shape_pingpong(seconds: u64, offload: bool) {
 
         // Client receives echo.
         let cs = client.sockets.get_mut::<tcp::Socket>(cli_h);
-        if cs.can_recv() {
-            if let Ok(r) = cs.recv_slice(&mut sink) {
-                if r > 0 {
+        if cs.can_recv()
+            && let Ok(r) = cs.recv_slice(&mut sink)
+                && r > 0 {
                     roundtrips += 1;
                 }
-            }
-        }
         t_ms += 1;
     }
     let alloc_after = AllocSnap::now();
@@ -1222,7 +1202,7 @@ fn shape_many_tcp(seconds: u64, n: usize, offload: bool) {
     // that a full round of egress packets never spills, otherwise
     // socket_egress short-circuits mid-walk and the late sockets in the
     // iteration order get systematically starved.
-    let qd = (n * 16).max(1024).min(16384);
+    let qd = (n * 16).clamp(1024, 16384);
 
     let lane_a: LaneRc = Rc::new(RefCell::new(Lane::new(1500, qd)));
     let lane_b: LaneRc = Rc::new(RefCell::new(Lane::new(1500, qd)));
@@ -1338,11 +1318,10 @@ fn shape_many_tcp(seconds: u64, n: usize, offload: bool) {
         // Client: try to push one chunk on every flow this iteration.
         for (i, &h) in cli_handles.iter().enumerate() {
             let cs = client.sockets.get_mut::<tcp::Socket>(h);
-            if cs.can_send() {
-                if let Ok(w) = cs.send_slice(&payload) {
+            if cs.can_send()
+                && let Ok(w) = cs.send_slice(&payload) {
                     sent[i] += w as u64;
                 }
-            }
         }
 
         poll_lat.measure(|| {
@@ -1477,7 +1456,7 @@ fn shape_many_udp(seconds: u64, n: usize, offload: bool) {
     // Per-flow UDP socket buffer: a small ring with ~32 metadata slots is
     // enough to keep the pipe full without ballooning memory.
     const META_SLOTS: usize = 32;
-    let qd = (n * 4).max(256).min(8192);
+    let qd = (n * 4).clamp(256, 8192);
 
     let lane_a: LaneRc = Rc::new(RefCell::new(Lane::new(1500, qd)));
     let lane_b: LaneRc = Rc::new(RefCell::new(Lane::new(1500, qd)));
@@ -1654,47 +1633,52 @@ fn main() {
     let shape = args.get(1).map(String::as_str).unwrap_or("all");
     let seconds: u64 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(3);
 
-    // The shape argument decides whether `args[3]` is a flow count or the
-    // offload flag, so parse it inside the match arm.
     let is_offload = |s: Option<&str>| matches!(s, Some("offload") | Some("1") | Some("true"));
-    let offload_simple = is_offload(args.get(3).map(String::as_str));
 
-    let cfg_line = if shape.starts_with("many_") {
-        match args.get(3).and_then(|s| s.parse::<usize>().ok()) {
-            Some(_) => "config: many-flow run",
-            None => "config: many-flow run (default n=100)",
-        }
-    } else if offload_simple {
-        "config: checksum offload ENABLED (device-verified, like a NIC or NEPacketTunnelFlow)"
+    // Many-flow shapes interpret args[3] as the flow count and args[4] as the
+    // offload flag; single-flow shapes interpret args[3] directly as offload.
+    let (n_flows, offload) = if shape.starts_with("many_") {
+        let n: usize = args
+            .get(3)
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(100)
+            .max(1);
+        (Some(n), is_offload(args.get(4).map(String::as_str)))
     } else {
-        "config: full software checksums on both peers (worst case)"
+        (None, is_offload(args.get(3).map(String::as_str)))
     };
-    println!("{cfg_line}");
+
+    println!(
+        "config: {} checksums ({}{})",
+        if offload {
+            "device-offloaded"
+        } else {
+            "full software"
+        },
+        if offload {
+            "mimics a NIC or iOS NEPacketTunnelFlow"
+        } else {
+            "worst case"
+        },
+        match n_flows {
+            Some(n) => format!(", {n} flows"),
+            None => String::new(),
+        }
+    );
     print_socket_sizes();
 
     match shape {
-        "firehose" => shape_firehose(seconds, offload_simple),
-        "pingpong" => shape_pingpong(seconds, offload_simple),
-        "small" => shape_small(seconds, offload_simple),
-        "udp" => shape_udp_firehose(seconds, offload_simple),
+        "firehose" => shape_firehose(seconds, offload),
+        "pingpong" => shape_pingpong(seconds, offload),
+        "small" => shape_small(seconds, offload),
+        "udp" => shape_udp_firehose(seconds, offload),
         "all" => {
-            shape_udp_firehose(seconds, offload_simple);
-            shape_small(seconds, offload_simple);
-            shape_pingpong(seconds, offload_simple);
+            shape_udp_firehose(seconds, offload);
+            shape_small(seconds, offload);
+            shape_pingpong(seconds, offload);
         }
-        "many_tcp" | "many_udp" => {
-            let n: usize = args
-                .get(3)
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(100)
-                .max(1);
-            let offload_many = is_offload(args.get(4).map(String::as_str));
-            if shape == "many_tcp" {
-                shape_many_tcp(seconds, n, offload_many);
-            } else {
-                shape_many_udp(seconds, n, offload_many);
-            }
-        }
+        "many_tcp" => shape_many_tcp(seconds, n_flows.unwrap(), offload),
+        "many_udp" => shape_many_udp(seconds, n_flows.unwrap(), offload),
         _ => {
             eprintln!(
                 "unknown shape '{shape}'. expected udp|small|pingpong|firehose|all|many_tcp|many_udp"

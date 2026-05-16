@@ -44,6 +44,9 @@ pub(super) enum AnyController {
     Cubic(cubic::Cubic),
 }
 
+// Unused parameters in the `None` arm of every wrapper below — the
+// real controllers behind cfg-gated arms do use them.
+#[allow(unused_variables)]
 impl AnyController {
     /// Create a new congestion controller.
     /// `AnyController::new()` selects the best congestion controller based on the features.
@@ -73,15 +76,16 @@ impl AnyController {
         AnyController::None(no_control::NoControl)
     }
 
-    // Static-dispatch wrappers for the hot-path Controller methods.
+    // Static-dispatch wrappers for the hot-path `Controller` methods.
     //
-    // The previous design exposed `&dyn Controller` getters, forcing every
-    // call (e.g. `window()` inside `seq_to_transmit`, which runs per packet)
-    // to indirect through a v-table. With direct matches the optimizer
-    // monomorphizes the call (and, in the common single-variant builds,
-    // eliminates the match outright). Args may go unused in the `None` arm
-    // when no real controller is compiled in.
-    #[allow(unused_variables)]
+    // Routing through `&dyn Controller` forced every call (e.g. `window()`
+    // inside `seq_to_transmit`, which runs per packet) to indirect through a
+    // v-table. With direct match-on-self the optimizer monomorphizes the call
+    // and, in the common single-variant builds, eliminates the match outright.
+    //
+    // Parameters are unused in the `None` arm when no real controller is
+    // compiled in, hence the impl-level `unused_variables` allow.
+
     #[inline]
     pub fn window(&self) -> usize {
         match self {
@@ -93,7 +97,6 @@ impl AnyController {
         }
     }
 
-    #[allow(unused_variables)]
     #[inline]
     pub fn set_remote_window(&mut self, remote_window: usize) {
         match self {
@@ -105,7 +108,6 @@ impl AnyController {
         }
     }
 
-    #[allow(unused_variables)]
     #[inline]
     pub fn on_ack(&mut self, now: Instant, len: usize, rtt: &RttEstimator) {
         match self {
@@ -117,7 +119,6 @@ impl AnyController {
         }
     }
 
-    #[allow(unused_variables)]
     #[inline]
     pub fn on_retransmit(&mut self, now: Instant) {
         match self {
@@ -129,7 +130,6 @@ impl AnyController {
         }
     }
 
-    #[allow(unused_variables)]
     #[inline]
     pub fn on_duplicate_ack(&mut self, now: Instant) {
         match self {
@@ -141,7 +141,6 @@ impl AnyController {
         }
     }
 
-    #[allow(unused_variables)]
     #[inline]
     pub fn pre_transmit(&mut self, now: Instant) {
         match self {
@@ -153,7 +152,6 @@ impl AnyController {
         }
     }
 
-    #[allow(unused_variables)]
     #[inline]
     pub fn post_transmit(&mut self, now: Instant, len: usize) {
         match self {
@@ -165,7 +163,6 @@ impl AnyController {
         }
     }
 
-    #[allow(unused_variables)]
     #[inline]
     pub fn set_mss(&mut self, mss: usize) {
         match self {

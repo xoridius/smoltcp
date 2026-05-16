@@ -1798,8 +1798,7 @@ impl<'a> Socket<'a> {
             }
 
             self.rtte.on_ack(cx.now(), ack_number);
-            self.congestion_controller
-            .on_ack(cx.now(), ack_len, &self.rtte);
+            self.congestion_controller.on_ack(cx.now(), ack_len, &self.rtte);
         }
 
         // Disregard control flags we don't care about or shouldn't act on yet.
@@ -1849,8 +1848,7 @@ impl<'a> Socket<'a> {
                         tcp_trace!("received SYNACK with zero MSS, ignoring");
                         return None;
                     }
-                    self.congestion_controller
-            .set_mss(max_seg_size as usize);
+                    self.congestion_controller.set_mss(max_seg_size as usize);
                     self.remote_mss = max_seg_size as u32
                 }
 
@@ -1903,8 +1901,7 @@ impl<'a> Socket<'a> {
                         return None;
                     }
                     self.remote_mss = max_seg_size as u32;
-                    self.congestion_controller
-            .set_mss(self.remote_mss as usize);
+                    self.congestion_controller.set_mss(self.remote_mss as usize);
                 }
 
                 self.remote_seq_no = repr.seq_number + 1;
@@ -2013,8 +2010,7 @@ impl<'a> Socket<'a> {
         let is_window_update = new_remote_win_len != self.remote_win_len;
         self.remote_win_len = new_remote_win_len;
 
-        self.congestion_controller
-            .set_remote_window(new_remote_win_len as usize);
+        self.congestion_controller.set_remote_window(new_remote_win_len as usize);
 
         if ack_len > 0 {
             // Dequeue acknowledged octets.
@@ -2053,8 +2049,7 @@ impl<'a> Socket<'a> {
                     self.local_rx_dup_acks = self.local_rx_dup_acks.saturating_add(1);
 
                     // Inform congestion controller of duplicate ACK
-                    self.congestion_controller
-            .on_duplicate_ack(cx.now());
+                    self.congestion_controller.on_duplicate_ack(cx.now());
 
                     net_debug!(
                         "received duplicate ACK for seq {} (duplicate nr {}{})",
@@ -2383,8 +2378,7 @@ impl<'a> Socket<'a> {
             self.remote_last_ts = Some(cx.now());
         }
 
-        self.congestion_controller
-            .pre_transmit(cx.now());
+        self.congestion_controller.pre_transmit(cx.now());
 
         // `seq_to_transmit` is called twice in the original flow (once for the
         // retransmit check, once for the send decision below); both look at the
@@ -2417,8 +2411,7 @@ impl<'a> Socket<'a> {
             self.rtte.on_retransmit();
 
             // Inform the congestion controller that we're retransmitting.
-            self.congestion_controller
-            .on_retransmit(cx.now());
+            self.congestion_controller.on_retransmit(cx.now());
 
             // The rewind above may have changed whether we have anything to send.
             want_send = self.seq_to_transmit(cx);
@@ -2664,8 +2657,7 @@ impl<'a> Socket<'a> {
         if repr.segment_len() > 0 {
             self.rtte
                 .on_send(cx.now(), repr.seq_number + repr.segment_len());
-            self.congestion_controller
-            .post_transmit(cx.now(), repr.segment_len());
+            self.congestion_controller.post_transmit(cx.now(), repr.segment_len());
         }
 
         if repr.segment_len() > 0 && !self.timer.is_retransmit() {

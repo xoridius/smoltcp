@@ -511,7 +511,7 @@ mod test {
         use crate::wire::Ipv6Address;
         let src: Ipv6Address = Ipv6Address::new(0xfe80, 0, 0, 0, 0, 0, 0, 1);
         let dst: Ipv6Address = Ipv6Address::new(0xfe80, 0, 0, 0, 0, 0, 0, 2);
-        let mut bytes = vec![0; 8];
+        let mut bytes = [0u8; 8];
         let mut packet = Packet::new_unchecked(&mut bytes[..]);
         packet.set_src_port(1);
         packet.set_dst_port(31881);
