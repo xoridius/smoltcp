@@ -15,13 +15,19 @@
 //! `heaptrack` with no external setup.
 //!
 //! Usage:
-//!   cargo run --release --example profile_loopback -- [shape] [seconds]
+//!   cargo run --release --example profile_loopback -- [shape] [seconds] [opts...]
 //!
 //! Shapes:
-//!   udp        - 1400B UDP packet forwarding (default; closest tunnel analogue)
-//!   small      - many small TCP segments, measures per-packet overhead
-//!   pingpong   - request/response ping-pong of 128B messages, latency-bound
-//!   firehose   - one-way TCP bulk transfer (cwnd-limited by both peers being smoltcp)
+//!   udp           - 1400B UDP packet forwarding (default; tunnel analogue)
+//!   small         - many small TCP segments, measures per-packet overhead
+//!   pingpong      - 128B request/response, latency-bound
+//!   firehose      - one-way TCP bulk transfer (cwnd-limited)
+//!   many_tcp      - N concurrent TCP echo flows; verifies per-flow fairness +
+//!                   memory growth bounds. Usage:
+//!                     profile_loopback many_tcp 5 200 [offload]
+//!   many_udp      - N concurrent UDP flows; same fairness + memory metrics.
+//!                     profile_loopback many_udp 5 200 [offload]
+//!   all           - runs udp + small + pingpong back-to-back
 //!
 //! Recommended profiling recipes:
 //!   perf record -F 999 --call-graph dwarf -- \
@@ -186,6 +192,203 @@ impl Histo {
 /// Reference CPU frequency used to estimate cycles from elapsed wall time.
 /// Reasonable approximation for typical x86_64/aarch64 server CPUs in this era.
 const REF_CPU_GHZ: f64 = 2.4;
+
+/// Per-flow throughput statistics computed at the end of a many-flow run.
+///
+/// `jain` is Jain's fairness index (Jain, Chiu, Hawe, 1984), defined as
+/// `(Σ xᵢ)² / (n · Σ xᵢ²)`. 1.0 means every flow received exactly the same
+/// number of bytes; 1/n means one flow got everything. >0.95 is generally
+/// considered "fair" in network-research literature.
+struct Fairness {
+    n: usize,
+    total: u64,
+    min: u64,
+    max: u64,
+    /// Index of the flow with the smallest byte count (useful to check whether
+    /// starvation lands on the same handle across runs).
+    min_flow: usize,
+    /// Index of the flow with the largest byte count.
+    max_flow: usize,
+    mean: f64,
+    stddev: f64,
+    /// Coefficient of variation = stddev / mean.
+    cv: f64,
+    jain: f64,
+    /// Per-flow byte counts, sorted ascending — used to print percentiles and
+    /// to identify starved flows.
+    sorted: Vec<u64>,
+    /// Flows below 10% of the mean; nonzero values are a starvation flag.
+    starved: usize,
+    /// Flows that received zero bytes — a strong starvation signal.
+    zero_flows: usize,
+}
+
+impl Fairness {
+    fn from(per_flow: &[u64]) -> Self {
+        let n = per_flow.len();
+        let total: u64 = per_flow.iter().sum();
+        let (min_flow, &min) = per_flow
+            .iter()
+            .enumerate()
+            .min_by_key(|&(_, &v)| v)
+            .unwrap_or((0, &0));
+        let (max_flow, &max) = per_flow
+            .iter()
+            .enumerate()
+            .max_by_key(|&(_, &v)| v)
+            .unwrap_or((0, &0));
+        let mean = total as f64 / n.max(1) as f64;
+        let var = if n == 0 {
+            0.0
+        } else {
+            per_flow
+                .iter()
+                .map(|&x| (x as f64 - mean).powi(2))
+                .sum::<f64>()
+                / n as f64
+        };
+        let stddev = var.sqrt();
+        let cv = if mean > 0.0 { stddev / mean } else { 0.0 };
+        // Jain's fairness index.
+        let sum_sq: f64 = per_flow.iter().map(|&x| (x as f64).powi(2)).sum();
+        let jain = if sum_sq > 0.0 {
+            let s = total as f64;
+            (s * s) / (n as f64 * sum_sq)
+        } else {
+            0.0
+        };
+        let mut sorted = per_flow.to_vec();
+        sorted.sort_unstable();
+        let starved = per_flow
+            .iter()
+            .filter(|&&x| (x as f64) < 0.1 * mean)
+            .count();
+        let zero_flows = per_flow.iter().filter(|&&x| x == 0).count();
+        Self {
+            n,
+            total,
+            min,
+            max,
+            min_flow,
+            max_flow,
+            mean,
+            stddev,
+            cv,
+            jain,
+            sorted,
+            starved,
+            zero_flows,
+        }
+    }
+
+    fn at(&self, p: f64) -> u64 {
+        if self.sorted.is_empty() {
+            return 0;
+        }
+        let idx = ((self.sorted.len() as f64 * p) as usize).min(self.sorted.len() - 1);
+        self.sorted[idx]
+    }
+
+    fn print(&self, label: &str) {
+        println!();
+        println!("  per-flow {label} (bytes):");
+        println!(
+            "    flows: {:>5}     total: {:>14}     mean: {:>12.1}",
+            self.n, self.total, self.mean
+        );
+        println!(
+            "    min:   {:>14} (flow #{:<5})  p10:   {:>14}  p50: {:>12}",
+            self.min,
+            self.min_flow,
+            self.at(0.10),
+            self.at(0.50)
+        );
+        println!(
+            "    p90:   {:>14}                  p99:   {:>14}  max: {:>12} (flow #{})",
+            self.at(0.90),
+            self.at(0.99),
+            self.max,
+            self.max_flow
+        );
+        println!(
+            "    stddev:{:>14.1}     CV:    {:>14.4}     Jain: {:>12.4}",
+            self.stddev, self.cv, self.jain
+        );
+        let fairness_verdict = if self.jain >= 0.95 {
+            "FAIR"
+        } else if self.jain >= 0.80 {
+            "uneven"
+        } else {
+            "UNFAIR"
+        };
+        let starve_verdict = if self.zero_flows > 0 {
+            "STARVATION (zero-byte flows present)"
+        } else if self.starved > 0 {
+            "mild starvation (some flows < 10% of mean)"
+        } else {
+            "no starvation"
+        };
+        println!(
+            "    verdict: {fairness_verdict} ({starve_verdict}); zero_flows: {}, <10%-of-mean: {}",
+            self.zero_flows, self.starved
+        );
+    }
+}
+
+/// Periodic RSS sample. We collect (elapsed_ms, rss, alloc_bytes) snapshots
+/// during a many-flow run so we can see whether memory grows over time
+/// (= leak) or plateaus (= bounded, healthy).
+struct MemTrace {
+    samples: Vec<(u64, u64, u64)>, // (ms_since_start, rss_bytes, alloc_bytes_delta)
+    start_wall: StdInstant,
+    start_alloc: u64,
+}
+
+impl MemTrace {
+    fn start() -> Self {
+        Self {
+            samples: Vec::with_capacity(64),
+            start_wall: StdInstant::now(),
+            start_alloc: ALLOC_BYTES.load(Ordering::Relaxed),
+        }
+    }
+    /// Cheap to call from the hot loop: only takes a sample if at least
+    /// `interval_ms` have elapsed since the last one.
+    fn maybe_sample(&mut self, interval_ms: u64) {
+        let now = StdInstant::now();
+        let elapsed = now.duration_since(self.start_wall).as_millis() as u64;
+        let last = self.samples.last().map(|s| s.0).unwrap_or(0);
+        if self.samples.is_empty() || elapsed >= last + interval_ms {
+            let rss = rss_bytes();
+            let alloc_now = ALLOC_BYTES.load(Ordering::Relaxed);
+            self.samples
+                .push((elapsed, rss, alloc_now - self.start_alloc));
+        }
+    }
+    fn print(&self) {
+        if self.samples.is_empty() {
+            return;
+        }
+        println!();
+        println!("  memory trace (snapshot every ~250 ms):");
+        println!("    {:>8}   {:>10}   {:>10}", "t_ms", "rss_bytes", "alloc_delta");
+        for (t, rss, alloc) in &self.samples {
+            println!("    {:>8}   {:>10}   {:>10}", t, rss, alloc);
+        }
+        // Detect monotonic RSS growth as a leak signal: if last RSS is
+        // > 1.5× the median RSS, flag it.
+        let mut rss_sorted: Vec<u64> = self.samples.iter().map(|s| s.1).collect();
+        rss_sorted.sort_unstable();
+        let median = rss_sorted[rss_sorted.len() / 2];
+        let last = self.samples.last().unwrap().1;
+        let verdict = if last as f64 > 1.5 * median as f64 {
+            "GROWTH (possible leak)"
+        } else {
+            "bounded"
+        };
+        println!("    RSS verdict: {verdict} (last={last}, median={median})");
+    }
+}
 
 /// Take a wall-clock time sample roughly every `LAT_SAMPLE_EVERY` polls. We
 /// don't sample every poll because `Instant::now()` is ~30 cycles (via vDSO),
@@ -1005,6 +1208,416 @@ fn shape_udp_firehose(seconds: u64, offload: bool) {
     .print();
 }
 
+/// `n` concurrent TCP echo flows between two smoltcp endpoints. Each flow has
+/// its own (src_port, dst_port) tuple so the stack treats them independently.
+///
+/// Verifies two properties:
+///   * memory stays bounded (RSS trace + net heap delta)
+///   * no flow is starved (Jain index + per-flow percentiles)
+fn shape_many_tcp(seconds: u64, n: usize, offload: bool) {
+    // Per-flow buffer sized small enough to keep total memory reasonable
+    // even at N=1000: 1000 flows × 2 (rx+tx) × 4 KiB × 2 (server+client) ≈ 16 MiB.
+    const BUF: usize = 4 * 1024;
+    // Lane queue depth scales with N. The minimum has to be large enough
+    // that a full round of egress packets never spills, otherwise
+    // socket_egress short-circuits mid-walk and the late sockets in the
+    // iteration order get systematically starved.
+    let qd = (n * 16).max(1024).min(16384);
+
+    let lane_a: LaneRc = Rc::new(RefCell::new(Lane::new(1500, qd)));
+    let lane_b: LaneRc = Rc::new(RefCell::new(Lane::new(1500, qd)));
+
+    let mut server = make_endpoint(
+        IpAddress::v4(10, 0, 0, 1),
+        1500,
+        lane_a.clone(),
+        lane_b.clone(),
+        offload,
+    );
+    let mut client = make_endpoint(
+        IpAddress::v4(10, 0, 0, 2),
+        1500,
+        lane_b.clone(),
+        lane_a.clone(),
+        offload,
+    );
+
+    let mut srv_handles = Vec::with_capacity(n);
+    let mut cli_handles = Vec::with_capacity(n);
+
+    for i in 0..n {
+        let h_srv = add_tcp_socket(&mut server, BUF);
+        let h_cli = add_tcp_socket(&mut client, BUF);
+
+        let dst_port: u16 = 10_000u16.wrapping_add(i as u16);
+        let src_port: u16 = 30_000u16.wrapping_add(i as u16);
+
+        {
+            let s = server.sockets.get_mut::<tcp::Socket>(h_srv);
+            s.set_ack_delay(None);
+            s.set_nagle_enabled(false);
+            s.listen(dst_port).unwrap();
+        }
+        {
+            let c = client.sockets.get_mut::<tcp::Socket>(h_cli);
+            c.set_ack_delay(None);
+            c.set_nagle_enabled(false);
+        }
+        client
+            .sockets
+            .get_mut::<tcp::Socket>(h_cli)
+            .connect(
+                client.iface.context(),
+                (IpAddress::v4(10, 0, 0, 1), dst_port),
+                src_port,
+            )
+            .unwrap();
+
+        srv_handles.push(h_srv);
+        cli_handles.push(h_cli);
+    }
+
+    // Drive both stacks until every connection is ESTABLISHED.
+    let mut t_us: i64 = 0;
+    let connect_deadline = StdInstant::now() + std::time::Duration::from_secs(seconds.min(5));
+    loop {
+        let now = Instant::from_micros(t_us);
+        server.iface.poll(now, &mut server.device, &mut server.sockets);
+        client.iface.poll(now, &mut client.device, &mut client.sockets);
+        let all_ready = cli_handles
+            .iter()
+            .zip(srv_handles.iter())
+            .all(|(&hc, &hs)| {
+                client.sockets.get::<tcp::Socket>(hc).may_send()
+                    && server.sockets.get::<tcp::Socket>(hs).may_recv()
+            });
+        if all_ready || StdInstant::now() >= connect_deadline {
+            break;
+        }
+        t_us += 1;
+    }
+
+    let established = cli_handles
+        .iter()
+        .zip(srv_handles.iter())
+        .filter(|&(&hc, &hs)| {
+            client.sockets.get::<tcp::Socket>(hc).may_send()
+                && server.sockets.get::<tcp::Socket>(hs).may_recv()
+        })
+        .count();
+    if established < n {
+        eprintln!(
+            "warning: only {established}/{n} flows established within {} s",
+            seconds.min(5)
+        );
+    }
+
+    let payload = vec![0x42u8; 256];
+    let mut sink = vec![0u8; 256];
+    let mut sent = vec![0u64; n];
+    let mut recvd = vec![0u64; n];
+
+    let deadline = StdInstant::now() + std::time::Duration::from_secs(seconds);
+    let start = StdInstant::now();
+    let alloc_before = AllocSnap::now();
+    let mut poll_lat = SampledTimer::new();
+    let mut mem_trace = MemTrace::start();
+    let mut iters: u64 = 0;
+
+    loop {
+        if iters & 0xFF == 0 && StdInstant::now() >= deadline {
+            break;
+        }
+        let now = Instant::from_micros(t_us);
+
+        // Client: try to push one chunk on every flow this iteration.
+        for (i, &h) in cli_handles.iter().enumerate() {
+            let cs = client.sockets.get_mut::<tcp::Socket>(h);
+            if cs.can_send() {
+                if let Ok(w) = cs.send_slice(&payload) {
+                    sent[i] += w as u64;
+                }
+            }
+        }
+
+        poll_lat.measure(|| {
+            client.iface.poll(now, &mut client.device, &mut client.sockets);
+            server.iface.poll(now, &mut server.device, &mut server.sockets);
+        });
+
+        // Server: drain RX completely, then echo as much as TX has room for.
+        // Coupling drain to can_send (the previous shape) deadlocks: if
+        // server.tx_buffer fills, we stop draining rx, the server's
+        // advertised window collapses to 0, and the client backs off
+        // entirely. So drain unconditionally; the echo just becomes lossy
+        // when tx is full.
+        for &h in &srv_handles {
+            let ss = server.sockets.get_mut::<tcp::Socket>(h);
+            while ss.can_recv() {
+                match ss.recv_slice(&mut sink) {
+                    Ok(r) if r > 0 => {
+                        if ss.can_send() {
+                            let _ = ss.send_slice(&sink[..r]);
+                        }
+                    }
+                    _ => break,
+                }
+            }
+        }
+
+        poll_lat.measure(|| {
+            server.iface.poll(now, &mut server.device, &mut server.sockets);
+            client.iface.poll(now, &mut client.device, &mut client.sockets);
+        });
+
+        // Client: drain echo completely on every flow.
+        for (i, &h) in cli_handles.iter().enumerate() {
+            let cs = client.sockets.get_mut::<tcp::Socket>(h);
+            while cs.can_recv() {
+                match cs.recv_slice(&mut sink) {
+                    Ok(r) if r > 0 => recvd[i] += r as u64,
+                    _ => break,
+                }
+            }
+        }
+
+        t_us = t_us.wrapping_add(1);
+        iters = iters.wrapping_add(1);
+        // ~4x/sec — cheap enough not to perturb throughput, dense enough to
+        // see RSS trajectory.
+        mem_trace.maybe_sample(250);
+    }
+    let alloc_after = AllocSnap::now();
+    let elapsed = start.elapsed().as_secs_f64();
+
+    Report {
+        name: "many_tcp",
+        elapsed,
+        app_bytes_sent: sent.iter().sum(),
+        app_bytes_recvd: recvd.iter().sum(),
+        wire_packets: client.device.tx_packets + server.device.tx_packets,
+        wire_bytes: client.device.tx_bytes + server.device.tx_bytes,
+        poll_lat: poll_lat.histo,
+        alloc_before,
+        alloc_after,
+        work_units: n as u64,
+        unit_label: "flows",
+    }
+    .print();
+
+    let sent_stats = Fairness::from(&sent);
+    let recvd_stats = Fairness::from(&recvd);
+    sent_stats.print("sent");
+    recvd_stats.print("recvd");
+
+    // If we detected a starved or zero-byte flow, dump its TCP socket state
+    // side-by-side with a healthy flow (the max-throughput one). The
+    // delta in send_queue/recv_queue at end-of-test usually points at the
+    // root cause (RST, zero-window deadlock, sequence-arithmetic edge case).
+    if recvd_stats.zero_flows > 0 || recvd_stats.starved > 0 {
+        let dump = |label: &str, idx: usize| {
+            let cs = client.sockets.get::<tcp::Socket>(cli_handles[idx]);
+            let ss = server.sockets.get::<tcp::Socket>(srv_handles[idx]);
+            println!(
+                "  {label} flow #{idx:<4}  client.state={:?}/{:?}  server.state={:?}/{:?}",
+                cs.state(),
+                (cs.may_send(), cs.may_recv()),
+                ss.state(),
+                (ss.may_send(), ss.may_recv()),
+            );
+            println!(
+                "                  client.send_q={:>5}  client.recv_q={:>5}  server.send_q={:>5}  server.recv_q={:>5}",
+                cs.send_queue(),
+                cs.recv_queue(),
+                ss.send_queue(),
+                ss.recv_queue(),
+            );
+            println!(
+                "                  bytes sent={:>10}  bytes recvd={:>10}",
+                sent[idx], recvd[idx]
+            );
+        };
+        println!();
+        println!("  flow-state diagnostic (compare starved vs healthy):");
+        dump("starved", recvd_stats.min_flow);
+        dump("healthy", recvd_stats.max_flow);
+    }
+
+    mem_trace.print();
+
+    // Per-flow socket footprint estimate. Useful for sizing the buffer pool
+    // up-front for tunnel-lib-rust.
+    let tcp_socket_bytes = core::mem::size_of::<tcp::Socket>();
+    let per_flow_bytes = tcp_socket_bytes + 2 * BUF;
+    let total_bytes = 2 * n * per_flow_bytes; // both peers
+    println!();
+    println!("  socket-state footprint (without lane pool):");
+    println!(
+        "    per-flow:           {} bytes (Socket {} + 2 × {} KiB buf)",
+        per_flow_bytes,
+        tcp_socket_bytes,
+        BUF / 1024,
+    );
+    println!(
+        "    total (both peers): {} bytes  ({:.2} MiB)",
+        total_bytes,
+        total_bytes as f64 / (1024.0 * 1024.0)
+    );
+}
+
+/// `n` concurrent UDP echo flows. Same metrics as `many_tcp`. UDP has no
+/// flow control or cwnd so per-flow throughput is bounded only by the rate
+/// at which the runner pumps bytes through.
+fn shape_many_udp(seconds: u64, n: usize, offload: bool) {
+    const PAYLOAD: usize = 256;
+    // Per-flow UDP socket buffer: a small ring with ~32 metadata slots is
+    // enough to keep the pipe full without ballooning memory.
+    const META_SLOTS: usize = 32;
+    let qd = (n * 4).max(256).min(8192);
+
+    let lane_a: LaneRc = Rc::new(RefCell::new(Lane::new(1500, qd)));
+    let lane_b: LaneRc = Rc::new(RefCell::new(Lane::new(1500, qd)));
+
+    let mut server = make_endpoint(
+        IpAddress::v4(10, 0, 0, 1),
+        1500,
+        lane_a.clone(),
+        lane_b.clone(),
+        offload,
+    );
+    let mut client = make_endpoint(
+        IpAddress::v4(10, 0, 0, 2),
+        1500,
+        lane_b.clone(),
+        lane_a.clone(),
+        offload,
+    );
+
+    let mk_udp = || -> (udp::PacketBuffer<'static>, udp::PacketBuffer<'static>) {
+        let rx_meta = vec![udp::PacketMetadata::EMPTY; META_SLOTS];
+        let rx_data = vec![0u8; PAYLOAD * META_SLOTS];
+        let tx_meta = vec![udp::PacketMetadata::EMPTY; META_SLOTS];
+        let tx_data = vec![0u8; PAYLOAD * META_SLOTS];
+        (
+            udp::PacketBuffer::new(rx_meta, rx_data),
+            udp::PacketBuffer::new(tx_meta, tx_data),
+        )
+    };
+
+    let mut srv_handles = Vec::with_capacity(n);
+    let mut cli_handles = Vec::with_capacity(n);
+    let mut dst_metas: Vec<udp::UdpMetadata> = Vec::with_capacity(n);
+
+    for i in 0..n {
+        let dst_port: u16 = 10_000u16.wrapping_add(i as u16);
+        let src_port: u16 = 30_000u16.wrapping_add(i as u16);
+
+        let (rx, tx) = mk_udp();
+        let h_srv = server.sockets.add(udp::Socket::new(rx, tx));
+        server
+            .sockets
+            .get_mut::<udp::Socket>(h_srv)
+            .bind(dst_port)
+            .unwrap();
+        srv_handles.push(h_srv);
+
+        let (rx, tx) = mk_udp();
+        let h_cli = client.sockets.add(udp::Socket::new(rx, tx));
+        client
+            .sockets
+            .get_mut::<udp::Socket>(h_cli)
+            .bind(src_port)
+            .unwrap();
+        cli_handles.push(h_cli);
+
+        dst_metas.push((IpAddress::v4(10, 0, 0, 1), dst_port).into());
+    }
+
+    let payload = vec![0xa5u8; PAYLOAD];
+    let mut sink = vec![0u8; PAYLOAD];
+    let mut sent = vec![0u64; n];
+    let mut recvd = vec![0u64; n];
+
+    let mut t_us: i64 = 0;
+    let deadline = StdInstant::now() + std::time::Duration::from_secs(seconds);
+    let start = StdInstant::now();
+    let alloc_before = AllocSnap::now();
+    let mut poll_lat = SampledTimer::new();
+    let mut mem_trace = MemTrace::start();
+    let mut iters: u64 = 0;
+
+    loop {
+        if iters & 0xFF == 0 && StdInstant::now() >= deadline {
+            break;
+        }
+        let now = Instant::from_micros(t_us);
+
+        // Push on every flow.
+        for (i, &h) in cli_handles.iter().enumerate() {
+            let cs = client.sockets.get_mut::<udp::Socket>(h);
+            if cs.can_send() && cs.send_slice(&payload, dst_metas[i]).is_ok() {
+                sent[i] += PAYLOAD as u64;
+            }
+        }
+
+        poll_lat.measure(|| {
+            client.iface.poll(now, &mut client.device, &mut client.sockets);
+            server.iface.poll(now, &mut server.device, &mut server.sockets);
+        });
+
+        // Drain every server flow.
+        for (i, &h) in srv_handles.iter().enumerate() {
+            let ss = server.sockets.get_mut::<udp::Socket>(h);
+            while ss.can_recv() {
+                match ss.recv_slice(&mut sink) {
+                    Ok((r, _)) => recvd[i] += r as u64,
+                    Err(_) => break,
+                }
+            }
+        }
+
+        t_us = t_us.wrapping_add(1);
+        iters = iters.wrapping_add(1);
+        mem_trace.maybe_sample(250);
+    }
+    let alloc_after = AllocSnap::now();
+    let elapsed = start.elapsed().as_secs_f64();
+
+    Report {
+        name: "many_udp",
+        elapsed,
+        app_bytes_sent: sent.iter().sum(),
+        app_bytes_recvd: recvd.iter().sum(),
+        wire_packets: client.device.tx_packets + server.device.tx_packets,
+        wire_bytes: client.device.tx_bytes + server.device.tx_bytes,
+        poll_lat: poll_lat.histo,
+        alloc_before,
+        alloc_after,
+        work_units: n as u64,
+        unit_label: "flows",
+    }
+    .print();
+
+    Fairness::from(&sent).print("sent");
+    Fairness::from(&recvd).print("recvd");
+    mem_trace.print();
+
+    let udp_socket_bytes = core::mem::size_of::<udp::Socket>();
+    let per_flow_bytes = udp_socket_bytes + 2 * (META_SLOTS * PAYLOAD) + 2 * META_SLOTS * 24; // approx
+    let total_bytes = 2 * n * per_flow_bytes;
+    println!();
+    println!("  socket-state footprint (without lane pool):");
+    println!(
+        "    per-flow approx:    {} bytes (Socket {} + 2 × {} pkt × {} B)",
+        per_flow_bytes, udp_socket_bytes, META_SLOTS, PAYLOAD,
+    );
+    println!(
+        "    total (both peers): {} bytes  ({:.2} MiB)",
+        total_bytes,
+        total_bytes as f64 / (1024.0 * 1024.0)
+    );
+}
+
 fn print_socket_sizes() {
     use core::mem::size_of;
     use smoltcp::socket;
@@ -1024,20 +1637,27 @@ fn print_socket_sizes() {
 }
 
 fn main() {
-    // Args: <shape|all> [seconds] [offload]
-    //   shape:   udp | small | pingpong | firehose | all
+    // Args:
+    //   <shape> [seconds] [offload]                     for single-flow shapes
+    //   many_tcp|many_udp [seconds] [n_flows] [offload] for many-flow shapes
+    //
     //   offload: "offload" | "1" | "true" -> Device advertises checksum
-    //            offload, so smoltcp skips IP/TCP/UDP csums (mimics a
-    //            hardware NIC or iOS NEPacketTunnelFlow).
+    //            offload (mimics a hardware NIC or iOS NEPacketTunnelFlow).
     let args: Vec<String> = env::args().collect();
     let shape = args.get(1).map(String::as_str).unwrap_or("all");
     let seconds: u64 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(3);
-    let offload = matches!(
-        args.get(3).map(String::as_str),
-        Some("offload") | Some("1") | Some("true")
-    );
 
-    let cfg_line = if offload {
+    // The shape argument decides whether `args[3]` is a flow count or the
+    // offload flag, so parse it inside the match arm.
+    let is_offload = |s: Option<&str>| matches!(s, Some("offload") | Some("1") | Some("true"));
+    let offload_simple = is_offload(args.get(3).map(String::as_str));
+
+    let cfg_line = if shape.starts_with("many_") {
+        match args.get(3).and_then(|s| s.parse::<usize>().ok()) {
+            Some(_) => "config: many-flow run",
+            None => "config: many-flow run (default n=100)",
+        }
+    } else if offload_simple {
         "config: checksum offload ENABLED (device-verified, like a NIC or NEPacketTunnelFlow)"
     } else {
         "config: full software checksums on both peers (worst case)"
@@ -1046,17 +1666,32 @@ fn main() {
     print_socket_sizes();
 
     match shape {
-        "firehose" => shape_firehose(seconds, offload),
-        "pingpong" => shape_pingpong(seconds, offload),
-        "small" => shape_small(seconds, offload),
-        "udp" => shape_udp_firehose(seconds, offload),
+        "firehose" => shape_firehose(seconds, offload_simple),
+        "pingpong" => shape_pingpong(seconds, offload_simple),
+        "small" => shape_small(seconds, offload_simple),
+        "udp" => shape_udp_firehose(seconds, offload_simple),
         "all" => {
-            shape_udp_firehose(seconds, offload);
-            shape_small(seconds, offload);
-            shape_pingpong(seconds, offload);
+            shape_udp_firehose(seconds, offload_simple);
+            shape_small(seconds, offload_simple);
+            shape_pingpong(seconds, offload_simple);
+        }
+        "many_tcp" | "many_udp" => {
+            let n: usize = args
+                .get(3)
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(100)
+                .max(1);
+            let offload_many = is_offload(args.get(4).map(String::as_str));
+            if shape == "many_tcp" {
+                shape_many_tcp(seconds, n, offload_many);
+            } else {
+                shape_many_udp(seconds, n, offload_many);
+            }
         }
         _ => {
-            eprintln!("unknown shape '{shape}'. expected udp|small|pingpong|firehose|all");
+            eprintln!(
+                "unknown shape '{shape}'. expected udp|small|pingpong|firehose|all|many_tcp|many_udp"
+            );
             std::process::exit(2);
         }
     }
