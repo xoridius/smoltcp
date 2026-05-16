@@ -1277,11 +1277,17 @@ fn shape_many_tcp(seconds: u64, n: usize, offload: bool) {
         cli_handles.push(h_cli);
     }
 
-    // Drive both stacks until every connection is ESTABLISHED.
-    let mut t_us: i64 = 0;
+    // Drive both stacks until every connection is ESTABLISHED. The single-flow
+    // shapes use a fast (1-µs-per-iter) virtual clock, but that does NOT work
+    // here: smoltcp's RTO is ≥1 s and the zero-window-probe timer needs to
+    // actually fire when a flow ends up in a mutual-zero-window state, which
+    // only happens with realistic virtual time. Drive the smoltcp clock from
+    // the wall clock.
+    let wall0 = StdInstant::now();
+    let smol_now = || Instant::from_micros(wall0.elapsed().as_micros() as i64);
     let connect_deadline = StdInstant::now() + std::time::Duration::from_secs(seconds.min(5));
     loop {
-        let now = Instant::from_micros(t_us);
+        let now = smol_now();
         server.iface.poll(now, &mut server.device, &mut server.sockets);
         client.iface.poll(now, &mut client.device, &mut client.sockets);
         let all_ready = cli_handles
@@ -1294,7 +1300,6 @@ fn shape_many_tcp(seconds: u64, n: usize, offload: bool) {
         if all_ready || StdInstant::now() >= connect_deadline {
             break;
         }
-        t_us += 1;
     }
 
     let established = cli_handles
@@ -1328,7 +1333,7 @@ fn shape_many_tcp(seconds: u64, n: usize, offload: bool) {
         if iters & 0xFF == 0 && StdInstant::now() >= deadline {
             break;
         }
-        let now = Instant::from_micros(t_us);
+        let now = smol_now();
 
         // Client: try to push one chunk on every flow this iteration.
         for (i, &h) in cli_handles.iter().enumerate() {
@@ -1381,7 +1386,6 @@ fn shape_many_tcp(seconds: u64, n: usize, offload: bool) {
             }
         }
 
-        t_us = t_us.wrapping_add(1);
         iters = iters.wrapping_add(1);
         // ~4x/sec — cheap enough not to perturb throughput, dense enough to
         // see RSS trajectory.
@@ -1538,7 +1542,11 @@ fn shape_many_udp(seconds: u64, n: usize, offload: bool) {
     let mut sent = vec![0u64; n];
     let mut recvd = vec![0u64; n];
 
-    let mut t_us: i64 = 0;
+    // Wall-clock-driven virtual time so smoltcp's retry/timeout state
+    // machine behaves realistically even at modest iter rates.
+    let wall0 = StdInstant::now();
+    let smol_now = || Instant::from_micros(wall0.elapsed().as_micros() as i64);
+
     let deadline = StdInstant::now() + std::time::Duration::from_secs(seconds);
     let start = StdInstant::now();
     let alloc_before = AllocSnap::now();
@@ -1550,7 +1558,7 @@ fn shape_many_udp(seconds: u64, n: usize, offload: bool) {
         if iters & 0xFF == 0 && StdInstant::now() >= deadline {
             break;
         }
-        let now = Instant::from_micros(t_us);
+        let now = smol_now();
 
         // Push on every flow.
         for (i, &h) in cli_handles.iter().enumerate() {
@@ -1576,7 +1584,6 @@ fn shape_many_udp(seconds: u64, n: usize, offload: bool) {
             }
         }
 
-        t_us = t_us.wrapping_add(1);
         iters = iters.wrapping_add(1);
         mem_trace.maybe_sample(250);
     }
