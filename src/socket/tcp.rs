@@ -1679,6 +1679,25 @@ impl<'a> Socket<'a> {
             }
         }
 
+        // RFC 7323 §5.3 R1 (PAWS): if the segment carries a Timestamps option,
+        // it's not a RST, and our TS.Recent is valid (non-zero), drop the
+        // segment when SEG.TSval is older than TS.Recent under i32-wrap
+        // arithmetic. The peer's reply will see our current TS.Recent in our
+        // challenge ACK and re-synchronize.
+        if let Some(timestamp) = repr.timestamp {
+            if self.last_remote_tsval != 0
+                && repr.control != TcpControl::Rst
+                && (timestamp.tsval.wrapping_sub(self.last_remote_tsval) as i32) < 0
+            {
+                net_debug!(
+                    "PAWS reject: tsval={} < ts_recent={}",
+                    timestamp.tsval,
+                    self.last_remote_tsval
+                );
+                return self.challenge_ack_reply(cx, ip_repr, repr);
+            }
+        }
+
         let window_start = self.remote_seq_no + self.rx_buffer.len();
         let window_end = if let Some(last_ack) = self.remote_last_ack {
             last_ack + ((self.remote_last_win as usize) << self.remote_win_shift)
@@ -2089,8 +2108,13 @@ impl<'a> Socket<'a> {
             }
         }
 
-        // update last remote tsval
-        if let Some(timestamp) = repr.timestamp {
+        // RFC 7323 §4.3 R2: update TS.Recent only when the segment was at the
+        // left window edge when it arrived. Updating on out-of-order or pure
+        // duplicate segments would let a delayed packet poison PAWS state and
+        // cause us to reject the in-order segments that follow.
+        if let Some(timestamp) = repr.timestamp
+            && segment_start == window_start
+        {
             self.last_remote_tsval = timestamp.tsval;
         }
 
@@ -8965,6 +8989,89 @@ mod test {
                 ..RECV_TEMPL
             }]
         );
+    }
+
+    // =========================================================================================//
+    // PAWS (RFC 7323 §5.3): segments whose timestamp is older than TS.Recent
+    // must be dropped and a challenge ACK sent. TS.Recent must only update
+    // for in-order segments.
+    // =========================================================================================//
+
+    #[test]
+    fn test_paws_rejects_older_tsval() {
+        let mut s = socket_established();
+        s.set_tsval_generator(Some(|| 100));
+
+        // First in-order segment with tsval=500 sets TS.Recent = 500.
+        let _ = send(
+            &mut s,
+            Instant::from_millis(0),
+            &TcpRepr {
+                seq_number: REMOTE_SEQ + 1,
+                ack_number: Some(LOCAL_SEQ + 1),
+                payload: &b"hi"[..],
+                timestamp: Some(TcpTimestampRepr::new(500, 0)),
+                ..SEND_TEMPL
+            },
+        );
+        assert_eq!(s.recv_queue(), 2);
+
+        // A segment with tsval=400 (older than 500 under i32 wrap) is
+        // PAWS-rejected: smoltcp returns a challenge ACK and the payload is
+        // not delivered. Use t > 1s so the challenge-ACK rate-limiter, which
+        // is set on the first send's reply path, has expired.
+        let reply = send(
+            &mut s,
+            Instant::from_millis(1100),
+            &TcpRepr {
+                seq_number: REMOTE_SEQ + 1 + 2,
+                ack_number: Some(LOCAL_SEQ + 1),
+                payload: &b"old"[..],
+                timestamp: Some(TcpTimestampRepr::new(400, 0)),
+                ..SEND_TEMPL
+            },
+        );
+        assert!(
+            reply.is_some(),
+            "PAWS-rejected segment must produce a challenge ACK"
+        );
+        assert_eq!(
+            s.recv_queue(),
+            2,
+            "PAWS-rejected payload must not be delivered"
+        );
+    }
+
+    #[test]
+    fn test_paws_accepts_newer_tsval() {
+        // Two in-order segments with monotonically increasing tsvals must both
+        // be accepted; this guards against the PAWS check rejecting normal
+        // traffic.
+        let mut s = socket_established();
+        s.set_tsval_generator(Some(|| 100));
+        let _ = send(
+            &mut s,
+            Instant::from_millis(0),
+            &TcpRepr {
+                seq_number: REMOTE_SEQ + 1,
+                ack_number: Some(LOCAL_SEQ + 1),
+                payload: &b"ab"[..],
+                timestamp: Some(TcpTimestampRepr::new(200, 0)),
+                ..SEND_TEMPL
+            },
+        );
+        let _ = send(
+            &mut s,
+            Instant::from_millis(1),
+            &TcpRepr {
+                seq_number: REMOTE_SEQ + 1 + 2,
+                ack_number: Some(LOCAL_SEQ + 1),
+                payload: &b"cd"[..],
+                timestamp: Some(TcpTimestampRepr::new(300, 0)),
+                ..SEND_TEMPL
+            },
+        );
+        assert_eq!(s.recv_queue(), 4);
     }
 
     // =========================================================================================//
