@@ -795,8 +795,9 @@ pub mod checksum {
     /// the byte-swap to the final fold. This is the canonical wide-word
     /// approach used by the Linux kernel's `do_csum`: a one's complement sum
     /// of native-endian u16 words equals the byte-swap of the same sum done in
-    /// network byte order, so we recover the network-order checksum with a
-    /// single `swap_bytes` at the end.
+    /// network byte order, so on little-endian targets the final fold needs a
+    /// `swap_bytes` to recover the network-order checksum; on big-endian the
+    /// native sum already is the network-order sum so no swap is needed.
     pub fn data(data: &[u8]) -> u16 {
         let mut accum: u64 = 0;
         let mut tail = data;
@@ -846,10 +847,18 @@ pub mod checksum {
             accum = add_carry_u64(accum, word);
         }
 
-        // Fold to 16 bits (still native byte order), then byte-swap so the result
-        // is the network-order one's complement sum expressed as a host `u16` —
-        // matching the original `propagate_carries`-based implementation.
-        fold_u64(accum).swap_bytes()
+        let folded = fold_u64(accum);
+        // On little-endian, our native-order accumulator stores the byte-swap of
+        // the RFC 1071 (network-order) sum; swap to recover it. On big-endian the
+        // native sum is already the network-order sum.
+        #[cfg(target_endian = "little")]
+        {
+            folded.swap_bytes()
+        }
+        #[cfg(target_endian = "big")]
+        {
+            folded
+        }
     }
 
     /// Combine several RFC 1071 compliant checksums.
@@ -982,6 +991,22 @@ pub mod checksum {
             for b in 0u8..=255 {
                 assert_eq!(data(&[b]), data(&[b, 0]));
             }
+        }
+
+        /// Explicit numerical-value pins. The values are platform-independent
+        /// because they are the RFC 1071 (network-byte-order) sum as a `u16`,
+        /// so this test catches endianness regressions on big-endian targets
+        /// even if the rest of the suite never runs there.
+        #[test]
+        fn checksum_pinned_values() {
+            // `[0xff]` padded to a 16-bit word = 0xff00 = 65280.
+            assert_eq!(data(&[0xff]), 0xff00);
+            // `[0x12, 0x34]` is one big-endian 16-bit word with value 0x1234.
+            assert_eq!(data(&[0x12, 0x34]), 0x1234);
+            // Two BE words 0xffff sum to 0x1_fffe; one's complement fold gives 0xffff.
+            assert_eq!(data(&[0xff, 0xff, 0xff, 0xff]), 0xffff);
+            // 0xff00 + 0x0100 = 0x1_0000; fold gives 0x0001.
+            assert_eq!(data(&[0xff, 0x00, 0x01, 0x00]), 0x0001);
         }
     }
 
