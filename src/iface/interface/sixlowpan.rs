@@ -823,6 +823,31 @@ mod tests {
     }
 
     #[test]
+    fn test_sixlowpan_decompress_truncated_extension_header_payload() {
+        let address_context = [SixlowpanAddressContext([
+            0xfd, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0,
+        ])];
+
+        let mut compressed = SIXLOWPAN_COMPRESSED_RPL_DAO;
+        compressed[26] = 0xff;
+
+        let ieee_frame = Ieee802154Frame::new_checked(&compressed).unwrap();
+        let ieee_repr = Ieee802154Repr::parse(&ieee_frame).unwrap();
+
+        let mut buffer = [0u8; 256];
+        assert!(
+            InterfaceInner::sixlowpan_to_ipv6(
+                &address_context,
+                &ieee_repr,
+                ieee_frame.payload().unwrap(),
+                None,
+                &mut buffer[..],
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
     fn test_sixlowpan_compress_hop_by_hop_with_icmpv6() {
         let ieee_repr = Ieee802154Repr {
             frame_type: Ieee802154FrameType::Data,

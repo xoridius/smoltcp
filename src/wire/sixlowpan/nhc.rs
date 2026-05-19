@@ -144,6 +144,12 @@ impl<T: AsRef<[u8]>> ExtHeaderPacket<T> {
         let mut len = 2;
         len += self.next_header_size();
 
+        if len > buffer.len() {
+            return Err(Error);
+        }
+
+        len += self.length() as usize;
+
         if len <= buffer.len() {
             Ok(())
         } else {
