@@ -28,6 +28,10 @@ bitflags = { version = "1.0", default-features = false }
 defmt = { version = "0.3.8", optional = true, features = ["ip_in_core"] }
 cfg-if = "1.0.0"
 heapless = "0.9"
+# Optional, host-only. Replaces the profiling harness's allocator with one
+# that captures per-callstack heap attribution. Off by default; enable with
+# the `dhat-heap` feature when running examples/profile_loopback.rs.
+dhat = { version = "0.3", optional = true }
 
 [dev-dependencies]
 env_logger = "0.10"
@@ -95,6 +99,9 @@ defmt = ["dep:defmt", "heapless/defmt"]
 "socket-tcp-reno" = []
 
 "packetmeta-id" = []
+# Replaces the profiling harness's CountingAlloc with dhat::Alloc and writes
+# `dhat-heap.json` on exit; load it with https://nnethercote.github.io/dh_view/dh_view.html.
+"dhat-heap" = ["dep:dhat"]
 
 "async" = []
 

@@ -12,7 +12,7 @@ cargo-fuzz = true
 libfuzzer-sys = "0.4"
 arbitrary = { version = "1", features = ["derive"] }
 getopts = "0.2"
-smoltcp = { path = ".." }
+smoltcp = { path = "..", features = ["proto-ipsec-ah", "proto-sixlowpan", "medium-ieee802154"] }
 
 # Prevent this from interfering with workspaces
 [workspace]
@@ -45,5 +45,17 @@ doc = false
 [[bin]]
 name = "sixlowpan_packet"
 path = "fuzz_targets/sixlowpan_packet.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "wire_parsers"
+path = "fuzz_targets/wire_parsers.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "wire_roundtrip"
+path = "fuzz_targets/wire_roundtrip.rs"
 test = false
 doc = false

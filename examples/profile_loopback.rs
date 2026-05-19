@@ -46,6 +46,7 @@ use std::time::Instant as StdInstant;
 
 /// Tracks every allocation routed through the global allocator. We only count
 /// counter atomics (Relaxed), so the overhead is two adds per alloc/free.
+#[allow(dead_code)] // unused when `dhat-heap` feature swaps the global allocator
 struct CountingAlloc;
 static ALLOC_BYTES: AtomicU64 = AtomicU64::new(0);
 static ALLOC_COUNT: AtomicU64 = AtomicU64::new(0);
@@ -63,8 +64,16 @@ unsafe impl GlobalAlloc for CountingAlloc {
     }
 }
 
+#[cfg(not(feature = "dhat-heap"))]
 #[global_allocator]
 static A: CountingAlloc = CountingAlloc;
+
+// dhat::Alloc wraps System and captures per-callstack allocation attribution.
+// When this feature is on, CountingAlloc is unused (kept compiled so the rest
+// of the file still references its ALLOC_* counters; they just stay at zero).
+#[cfg(feature = "dhat-heap")]
+#[global_allocator]
+static A: dhat::Alloc = dhat::Alloc;
 
 /// Read VmRSS (kB) from /proc/self/status, returning bytes. Returns 0 on
 /// non-Linux platforms.
@@ -1629,6 +1638,8 @@ fn main() {
     //
     //   offload: "offload" | "1" | "true" -> Device advertises checksum
     //            offload (mimics a hardware NIC or iOS NEPacketTunnelFlow).
+    #[cfg(feature = "dhat-heap")]
+    let _profiler = dhat::Profiler::builder().file_name("dhat-heap.json").build();
     let args: Vec<String> = env::args().collect();
     let shape = args.get(1).map(String::as_str).unwrap_or("all");
     let seconds: u64 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(3);

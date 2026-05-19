@@ -304,6 +304,28 @@ heaptrack_gui heaptrack.profile_loopback.*.zst
 Faster than massif, lower runtime overhead, has a real UI. Default choice for
 deep allocation analysis.
 
+### 6.3.1 dhat — per-callstack heap attribution
+
+The harness has a build-time switch that swaps the global allocator for
+`dhat::Alloc`. It writes `dhat-heap.json` on exit; load it in
+`https://nnethercote.github.io/dh_view/dh_view.html` for an interactive view.
+
+```
+cargo run --release --example profile_loopback --features dhat-heap -- many_tcp 3 100
+# inspect quickly without the GUI:
+python3 -c "import json; d=json.load(open('dhat-heap.json')); \
+  pps=d['pps']; ftbl=d['ftbl']; import re; g={}
+[g.__setitem__(m.group(1), g.get(m.group(1),0)+p['tb']) \
+  for p in pps for f in [next((x for x in (ftbl[i] for i in p['fs']) \
+  if re.search(r'(profile_loopback|smoltcp)::',x)), '')] \
+  for m in [re.search(r'((profile_loopback|smoltcp)::\w+(?:::\w+)*)',f)] if m]
+[print(f'{b:>12}  {s}') for s,b in sorted(g.items(),key=lambda x:-x[1])[:12]]"
+```
+
+Use this when the harness's `net heap delta` flags growth and you need to
+know *which* callsite, not just how much. Stricter than CountingAlloc;
+slower than baseline (~2× overhead). Don't ship CI on it — run on demand.
+
 ### 6.4 Sizecheck — struct footprint diagnostic
 
 ```
@@ -364,6 +386,61 @@ What each guards:
 - PAWS tests — guard the segment-acceptance check in `Socket::process`
   against future refactors that would re-introduce silent acceptance of
   replayed/wrapped segments.
+
+### 7.1 Coverage-guided fuzzing (`fuzz/`)
+
+The `fuzz/` directory carries libFuzzer harnesses for the wire parsers.
+Coverage-guided fuzzing finds the kinds of input-validation bugs that
+property tests miss — the codex audit PRs that landed (6LoWPAN, IPsec AH,
+IPv6 loopback) were the exact bug class this catches.
+
+```
+cargo install cargo-fuzz   # one-time
+cargo +nightly fuzz run wire_parsers   -- -max_total_time=120 -max_len=2000
+cargo +nightly fuzz run wire_roundtrip -- -max_total_time=60  -max_len=2000
+cargo +nightly fuzz run dhcp_header    -- -max_total_time=60  -max_len=2000
+cargo +nightly fuzz run ieee802154_header -- -max_total_time=60 -max_len=2000
+cargo +nightly fuzz run packet_parser  -- -max_total_time=60  -max_len=2000
+```
+
+Target map:
+
+| Target | What it fuzzes |
+|---|---|
+| `wire_parsers` | IPv4/IPv6, TCP, UDP, IPsec AH, 6LoWPAN ExtHeader, ICMPv4/v6. Parse-only. Discriminates by `data[0] & 0x07`. |
+| `wire_roundtrip` | Differential round-trip: parse → emit → re-parse → assert equal. Catches "accepts but emits malformed" drift. |
+| `packet_parser` | `PrettyPrinter<EthernetFrame>` end-to-end. Survival check for the pretty-printer. |
+| `dhcp_header` | `DhcpPacket::new_checked` + `DhcpRepr::parse` + emit. |
+| `ieee802154_header` | `Ieee802154Frame` parse/emit. |
+
+Operational notes:
+
+- Corpus is committed under `fuzz/corpus/<target>/`. Don't let it grow
+  unbounded; trim with `cargo fuzz cmin <target>` if it gets large.
+- A crash drops a reproducer at `fuzz/artifacts/<target>/crash-<sha>`.
+  Convert to a unit test: `cat fuzz/artifacts/.../crash-... | xxd` and
+  pin the bytes in the corresponding `wire::*::test` module.
+- Run for tens of minutes per parser before treating the result as
+  meaningful. New-units-added stalling near zero is the signal that
+  coverage has plateaued; bumping `-max_len` or expanding the
+  discriminator usually re-opens it.
+
+### 7.2 MIRI
+
+```
+cargo +nightly miri test --lib wire
+cargo +nightly miri test --lib socket::tcp
+```
+
+Detects UB, aliasing violations, out-of-bounds reads, and uninitialised
+memory access — the things release builds compile away silently. Runs
+~30-50× slower than a normal test; restrict to the `wire` and `socket::tcp`
+modules in regular use. Add to a "deep" CI lane, not the default one.
+
+Smoltcp uses very little `unsafe`, so MIRI's value here is mostly
+catching slice-arithmetic mistakes in the wire parsers and TCP option
+walking — same surface as the property tests, with a different shaped
+detector.
 
 Do not delete these without an explicit justification in the same commit.
 
