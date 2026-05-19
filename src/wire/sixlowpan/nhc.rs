@@ -144,11 +144,16 @@ impl<T: AsRef<[u8]>> ExtHeaderPacket<T> {
         let mut len = 2;
         len += self.next_header_size();
 
-        if len <= buffer.len() {
-            Ok(())
-        } else {
-            Err(Error)
+        if len > buffer.len() {
+            return Err(Error);
         }
+
+        len += self.length() as usize;
+        if len > buffer.len() {
+            return Err(Error);
+        }
+
+        Ok(())
     }
 
     /// Consumes the frame, returning the underlying buffer.
@@ -822,6 +827,13 @@ mod test {
         assert_eq!(packet.next_header(), NextHeader::Compressed);
 
         assert_eq!(packet.payload(), [0x03, 0x00, 0xff, 0x00, 0x00, 0x00]);
+    }
+
+    #[test]
+    fn ext_header_truncated_payload_is_rejected() {
+        let bytes = [0xe3, 0x06, 0x03, 0x00, 0xff];
+
+        assert!(ExtHeaderPacket::new_checked(&bytes[..]).is_err());
     }
 
     #[test]
