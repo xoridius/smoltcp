@@ -87,6 +87,7 @@ fn main() {
         Medium::Ip => Config::new(smoltcp::wire::HardwareAddress::Ip),
         Medium::Ieee802154 => todo!(),
     };
+    config.random_seed = 0x0123_4567_89ab_cdef;
 
     let mut iface = Interface::new(config, &mut device, Instant::now());
     iface.update_ip_addrs(|ip_addrs| {

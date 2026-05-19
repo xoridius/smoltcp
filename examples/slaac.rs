@@ -31,6 +31,7 @@ fn main() {
         Medium::Ip => Config::new(smoltcp::wire::HardwareAddress::Ip),
         Medium::Ieee802154 => todo!(),
     };
+    config.random_seed = rand::random();
     config.slaac = true;
 
     let mut iface = Interface::new(config, &mut device, Instant::now());

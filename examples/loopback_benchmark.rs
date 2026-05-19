@@ -22,13 +22,14 @@ fn main() {
     };
 
     // Create interface
-    let config = match device.capabilities().medium {
+    let mut config = match device.capabilities().medium {
         Medium::Ethernet => {
             Config::new(EthernetAddress([0x02, 0x00, 0x00, 0x00, 0x00, 0x01]).into())
         }
         Medium::Ip => Config::new(smoltcp::wire::HardwareAddress::Ip),
         Medium::Ieee802154 => todo!(),
     };
+    config.random_seed = rand::random();
 
     let mut iface = Interface::new(config, &mut device, Instant::now());
     iface.update_ip_addrs(|ip_addrs| {

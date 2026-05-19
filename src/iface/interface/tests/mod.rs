@@ -55,6 +55,18 @@ impl TxToken for MockTxToken {
 #[cfg(all(feature = "medium-ip", feature = "medium-ethernet", feature = "alloc"))]
 fn test_new_panic() {
     let mut device = Loopback::new(Medium::Ethernet);
+    let mut config = Config::new(HardwareAddress::Ip);
+    config.random_seed = 0x0123_4567_89ab_cdef;
+    Interface::new(config, &mut device, Instant::ZERO);
+}
+
+#[test]
+#[should_panic(
+    expected = "Config::random_seed must be set to a non-zero per-boot seed before creating an Interface"
+)]
+#[cfg(feature = "medium-ip")]
+fn test_new_zero_random_seed_panic() {
+    let mut device = Loopback::new(Medium::Ip);
     let config = Config::new(HardwareAddress::Ip);
     Interface::new(config, &mut device, Instant::ZERO);
 }

@@ -892,6 +892,7 @@ fn test_router_advertisement(#[case] medium: Medium) {
         Medium::Ethernet => HardwareAddress::Ethernet(local_hw_addr),
         _ => panic!("Not supported"),
     });
+    config.random_seed = 0x0123_4567_89ab_cdef;
     config.slaac = true;
 
     // Set up interface with link local address

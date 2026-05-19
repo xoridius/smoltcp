@@ -74,9 +74,13 @@ fn run_test(case: TestCase) -> f64 {
     let mut device_a = Tracer::new(device_a, |_timestamp, _printer| log::trace!("{}", _printer));
     let mut device_b = Tracer::new(device_b, |_timestamp, _printer| log::trace!("{}", _printer));
 
-    let mut iface_a = Interface::new(Config::new(MAC_A), &mut device_a, time);
+    let mut config_a = Config::new(MAC_A);
+    config_a.random_seed = 0x0123_4567_89ab_cdef;
+    let mut iface_a = Interface::new(config_a, &mut device_a, time);
     iface_a.update_ip_addrs(|a| a.push(IpCidr::new(IP_A, 8)).unwrap());
-    let mut iface_b = Interface::new(Config::new(MAC_B), &mut device_b, time);
+    let mut config_b = Config::new(MAC_B);
+    config_b.random_seed = 0xfedc_ba98_7654_3210;
+    let mut iface_b = Interface::new(config_b, &mut device_b, time);
     iface_b.update_ip_addrs(|a| a.push(IpCidr::new(IP_B, 8)).unwrap());
 
     // Create sockets
