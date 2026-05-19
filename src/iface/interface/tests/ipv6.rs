@@ -399,6 +399,60 @@ fn imcp_empty_echo_request(#[case] medium: Medium) {
 #[cfg(feature = "medium-ethernet")]
 #[case::ieee802154(Medium::Ieee802154)]
 #[cfg(feature = "medium-ieee802154")]
+fn unassigned_loopback_destination_rejected(#[case] medium: Medium) {
+    let src_addr = Ipv6Address::new(0xfe80, 0, 0, 0, 0, 0, 0, 2);
+    let dst_addr = Ipv6Address::LOCALHOST;
+    let icmp_repr = Icmpv6Repr::EchoRequest {
+        ident: 0,
+        seq_no: 0,
+        data: b"",
+    };
+    let ipv6_repr = Ipv6Repr {
+        src_addr,
+        dst_addr,
+        hop_limit: 64,
+        next_header: IpProtocol::Icmpv6,
+        payload_len: icmp_repr.buffer_len(),
+    };
+
+    let mut bytes = vec![0; ipv6_repr.buffer_len() + icmp_repr.buffer_len()];
+    ipv6_repr.emit(&mut Ipv6Packet::new_unchecked(&mut bytes));
+    icmp_repr.emit(
+        &src_addr,
+        &dst_addr,
+        &mut Icmpv6Packet::new_unchecked(&mut bytes[ipv6_repr.buffer_len()..]),
+        &ChecksumCapabilities::default(),
+    );
+
+    let (mut iface, mut sockets, _device) = setup(medium);
+    let mut addrs = heapless::Vec::<IpCidr, IFACE_MAX_ADDR_COUNT>::new();
+    addrs
+        .push(IpCidr::new(IpAddress::v6(0xfe80, 0, 0, 0, 0, 0, 0, 1), 64))
+        .unwrap();
+    addrs
+        .push(IpCidr::new(IpAddress::v6(0xfdbe, 0, 0, 0, 0, 0, 0, 1), 64))
+        .unwrap();
+    iface.inner.set_ip_addrs(addrs);
+
+    assert!(!iface.has_ip_addr(dst_addr));
+    assert_eq!(
+        iface.inner.process_ipv6(
+            &mut sockets,
+            PacketMeta::default(),
+            HardwareAddress::default(),
+            &Ipv6Packet::new_checked(&bytes[..]).unwrap()
+        ),
+        None
+    );
+}
+
+#[rstest]
+#[case::ip(Medium::Ip)]
+#[cfg(feature = "medium-ip")]
+#[case::ethernet(Medium::Ethernet)]
+#[cfg(feature = "medium-ethernet")]
+#[case::ieee802154(Medium::Ieee802154)]
+#[cfg(feature = "medium-ieee802154")]
 fn icmp_echo_request(#[case] medium: Medium) {
     let data = [
         0x60, 0x0, 0x0, 0x0, 0x0, 0x13, 0x3a, 0x40, 0xfd, 0xbe, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0,
