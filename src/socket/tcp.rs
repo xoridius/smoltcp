@@ -494,8 +494,10 @@ pub struct Socket<'a> {
     /// The last acknowledgement number sent.
     /// I.e. in an idle socket, remote_seq_no+rx_buffer.len().
     remote_last_ack: Option<TcpSeqNumber>,
-    /// The last window length sent.
+    /// The last window field value sent.
     remote_last_win: u16,
+    /// Whether `remote_last_win` was sent in a SYN or SYN|ACK and is therefore unscaled.
+    remote_last_win_unscaled: bool,
     /// The sending window scaling factor advertised to remotes which support RFC 1323.
     /// It is zero if the window <= 64KiB and/or the remote does not support it.
     remote_win_shift: u8,
@@ -593,6 +595,7 @@ impl<'a> Socket<'a> {
             remote_last_seq: TcpSeqNumber::default(),
             remote_last_ack: None,
             remote_last_win: 0,
+            remote_last_win_unscaled: false,
             remote_win_len: 0,
             remote_win_shift: rx_cap_log2.saturating_sub(16) as u8,
             remote_win_scale: None,
@@ -753,6 +756,20 @@ impl<'a> Socket<'a> {
         u16::try_from(self.rx_buffer.window() >> self.remote_win_shift).unwrap_or(u16::MAX)
     }
 
+    /// Return the last advertised receive window length in octets.
+    ///
+    /// SYN and SYN|ACK segments carry an unscaled window field, unlike all later segments.
+    /// When `remote_last_win` came from one of those segments, it already contains the
+    /// advertised window length in octets.
+    #[inline]
+    fn remote_last_window_len(&self) -> usize {
+        if self.remote_last_win_unscaled {
+            self.remote_last_win as usize
+        } else {
+            (self.remote_last_win as usize) << self.remote_win_shift
+        }
+    }
+
     /// Return the last window field value, including scaling according to RFC 1323.
     ///
     /// Used in internal calculations as well as packet generation.
@@ -907,6 +924,7 @@ impl<'a> Socket<'a> {
         self.remote_last_seq = TcpSeqNumber::default();
         self.remote_last_ack = None;
         self.remote_last_win = 0;
+        self.remote_last_win_unscaled = false;
         self.remote_win_len = 0;
         self.remote_win_scale = None;
         self.remote_win_shift = rx_cap_log2.saturating_sub(16) as u8;
@@ -1467,6 +1485,7 @@ impl<'a> Socket<'a> {
         // segments, is right-shifted by [advertised scale value] bits[...]
         reply_repr.window_len = self.scaled_window();
         self.remote_last_win = reply_repr.window_len;
+        self.remote_last_win_unscaled = false;
 
         // If the remote supports selective acknowledgement, add the option to the outgoing
         // segment.
@@ -1699,7 +1718,7 @@ impl<'a> Socket<'a> {
 
         let window_start = self.remote_seq_no + self.rx_buffer.len();
         let window_end = if let Some(last_ack) = self.remote_last_ack {
-            last_ack + ((self.remote_last_win as usize) << self.remote_win_shift)
+            last_ack + self.remote_last_window_len()
         } else {
             window_start
         };
@@ -2676,6 +2695,7 @@ impl<'a> Socket<'a> {
         self.remote_last_seq = repr.seq_number + repr.segment_len();
         self.remote_last_ack = repr.ack_number;
         self.remote_last_win = repr.window_len;
+        self.remote_last_win_unscaled = repr.control == TcpControl::Syn;
 
         if repr.segment_len() > 0 {
             self.rtte
@@ -3638,6 +3658,57 @@ mod test {
             );
             assert_eq!(s.remote_win_scale, Some(scale));
         }
+    }
+
+    #[test]
+    fn test_syn_received_window_scaling_rejects_data_outside_syn_window() {
+        let mut s = socket_with_buffer_sizes(64, 65536);
+        s.listen(LOCAL_PORT).unwrap();
+
+        send!(
+            s,
+            TcpRepr {
+                control: TcpControl::Syn,
+                seq_number: REMOTE_SEQ,
+                ack_number: None,
+                window_scale: Some(1),
+                ..SEND_TEMPL
+            }
+        );
+
+        recv!(
+            s,
+            [TcpRepr {
+                control: TcpControl::Syn,
+                seq_number: LOCAL_SEQ,
+                ack_number: Some(REMOTE_SEQ + 1),
+                window_len: u16::MAX,
+                window_scale: Some(1),
+                max_seg_size: Some(BASE_MSS),
+                ..RECV_TEMPL
+            }]
+        );
+
+        // SYN|ACK window fields are not scaled. The peer must not be able to send
+        // data past the unscaled SYN|ACK window just because window scaling was negotiated.
+        send!(
+            s,
+            TcpRepr {
+                seq_number: REMOTE_SEQ + 1 + 70000,
+                ack_number: Some(LOCAL_SEQ + 1),
+                payload: &[0],
+                ..SEND_TEMPL
+            },
+            Some(TcpRepr {
+                seq_number: LOCAL_SEQ + 1,
+                ack_number: Some(REMOTE_SEQ + 1),
+                window_len: 32768,
+                ..RECV_TEMPL
+            })
+        );
+
+        assert_eq!(s.state(), State::SynReceived);
+        assert_eq!(s.recv_queue(), 0);
     }
 
     #[test]
