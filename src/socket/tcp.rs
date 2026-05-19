@@ -2261,7 +2261,18 @@ impl<'a> Socket<'a> {
         let data_in_flight = self.remote_last_seq != self.local_seq_no;
 
         // If we want to send a SYN and we haven't done so, do it!
-        if matches!(self.state, State::SynSent | State::SynReceived) && !data_in_flight {
+        if self.state == State::SynSent && !data_in_flight {
+            return true;
+        }
+
+        // If the SYN|ACK is intentionally paused, do not ask the interface to
+        // poll immediately: dispatch() will withhold the packet until unpaused.
+        #[cfg(feature = "socket-tcp-pause-synack")]
+        if self.state == State::SynReceived && self.synack_paused {
+            return false;
+        }
+
+        if self.state == State::SynReceived && !data_in_flight {
             return true;
         }
 
@@ -3409,6 +3420,7 @@ mod test {
         s.pause_synack(true);
         recv_nothing!(s);
         assert_eq!(s.state, State::SynReceived);
+        assert_eq!(s.socket.poll_at(&mut s.cx), PollAt::Ingress);
 
         s.pause_synack(false);
         recv!(
