@@ -36,29 +36,30 @@ in §3 — upstream occasionally adds or renames features.
 
 ## 3. Test matrix
 
-Run all of these before any commit lands on `main`. Expected pass counts let
-you spot regressions at a glance.
+Run all of these before any commit lands on `main`. Each must finish with zero
+failures.
 
 ```
-cargo test --release --lib                                            # 663
-cargo test --release --lib --features socket-tcp-cubic                # 673
-cargo test --release --lib --features socket-tcp-reno                 # 668
+cargo test --release --lib
+cargo test --release --lib --features socket-tcp-cubic
+cargo test --release --lib --features socket-tcp-reno
 
 cargo test --release --lib --no-default-features \
-  --features "std,medium-ethernet,proto-ipv4,proto-ipv4-fragmentation,socket-raw,socket-dns"     # 172
+  --features "std,medium-ethernet,proto-ipv4,proto-ipv4-fragmentation,socket-raw,socket-dns"
 
 cargo test --release --lib --no-default-features \
-  --features "std,medium-ethernet,proto-ipv6,socket-tcp,socket-udp"                              # 198
+  --features "std,medium-ethernet,proto-ipv6,socket-tcp,socket-udp"
 
 cargo test --release --lib --no-default-features \
-  --features "alloc,medium-ethernet,proto-ipv4,proto-ipv6,socket-raw,socket-udp,socket-tcp,socket-icmp,proto-ipv6-slaac"     # 284
+  --features "alloc,medium-ethernet,proto-ipv4,proto-ipv6,socket-raw,socket-udp,socket-tcp,socket-icmp,proto-ipv6-slaac"
 
-cargo clippy --release --lib --tests   # clean except a pre-existing ieee802154 warning
-cargo +nightly bench --bench bench     # 11 measurements, no errors
+cargo clippy --release --lib --tests
+cargo +nightly bench --bench bench
 ```
 
-If a number changes, re-derive expectations and update this file in the same
-commit. The numbers move only when a test is added or removed.
+The feature-gated rows guard against build-failure regressions in code paths
+that only some consumers enable. If clippy newly fires on a path you didn't
+touch, fix it rather than allowlisting.
 
 ## 4. Load-test workflows
 
@@ -438,3 +439,85 @@ map for triage:
 | Sizecheck diagnostic | Skip — diagnostic, not a behavioral test. |
 
 When a commit is accepted upstream, drop it from this fork on the next sync.
+
+## 13. Reference measurements
+
+A one-time snapshot from a quiet x86_64 host (governor `performance`,
+release mode, default features unless noted). Treat the **ratios** as
+durable; absolute numbers will move with CPU, RAM, kernel, and toolchain
+version. Use this as a sanity check after a sync or a refactor, not as a
+pass/fail oracle.
+
+### 13.1 Wire microbench (`cargo +nightly bench --bench bench`)
+
+| Bench | ns/iter | Notes |
+|---|---:|---|
+| `bench_checksum_64` | ~3 | Per-call overhead dominates. |
+| `bench_checksum_576` | ~15 | Vectorized loop warm. |
+| `bench_checksum_1500` | ~36 | ≈40 GB/s. Top headline number. |
+| `bench_checksum_1501` | ~37 | Odd-tail path engaged. |
+| `bench_checksum_9000` | ~220 | Jumbo. |
+| `bench_checksum_65535` | ~1600 | Worst-case single buffer. |
+| `bench_emit_ipv4` | ~42 | Includes header checksum. |
+| `bench_emit_ipv6` | ~38 | No header checksum. |
+| `bench_emit_tcp` | ~38 | Pseudo-header + body in one pass. |
+| `bench_emit_udp` | ~36 | Same. |
+| `bench_parse_verify_tcp` | ~47 | 1480 B segment, full RX verify. |
+
+Big-ticket regressions to look for: any `checksum_*` row jumping >2× on
+`-C target-cpu=native` means the auto-vectorizer stopped engaging
+(verify via §5.3). `bench_emit_tcp` rising while `bench_checksum_*`
+holds means the pseudo-header consolidation regressed.
+
+### 13.2 End-to-end shapes (`profile_loopback`)
+
+10-second runs on the same host:
+
+| Shape | Throughput (app) | Per-packet | Notes |
+|---|---:|---:|---|
+| `udp` | ~20–26 Gbps | ~80 ns | Software checksum. |
+| `udp offload` | ~31–33 Gbps | ~63 ns | `ChecksumCapabilities::ignored()`. Loopback-only; see §4.3. |
+| `small` | ~3 Mpps | ~330 ns | State-machine bound. |
+| `pingpong` | ~1.33 M-rtt/s | n/a | Latency-bound. |
+| `firehose` | varies | n/a | Cwnd dynamics on both peers; ratios only. |
+
+Cubic and Reno raise the `pingpong` RTT/s count on short handshakes
+because of the IW10 first-RTT ramp; bulk shapes barely move.
+
+### 13.3 Scaling and fairness (`many_tcp` / `many_udp`)
+
+| Shape | N | Jain | RSS verdict | Net heap delta |
+|---|---:|---:|---|---|
+| `many_tcp` | 100 | ≥0.99 | bounded | small constant |
+| `many_tcp` | 500 | ≥0.98 | bounded | small constant |
+| `many_tcp` | 1000 | ≥0.97 | bounded | small constant |
+| `many_udp` | any | 1.00 | bounded | small constant |
+
+Jain < 0.95 at any flow count is a regression: scheduling or socket-pump
+ordering. RSS verdict ≠ `bounded` is a leak or unbounded buffer growth.
+
+### 13.4 Struct footprint (`sizecheck`)
+
+`size_of::<tcp::Socket>` on a 64-bit host:
+
+| Feature set | Size |
+|---:|---:|
+| default | ~464 B |
+| `socket-tcp-reno` | ~488 B |
+| `socket-tcp-cubic` | ~512 B |
+
+These move on any field-type or congestion-controller field change.
+Record the new values in the commit that moves them.
+
+### 13.5 Allocator state in steady state
+
+Across every shape:
+
+- `net heap delta`: small constant, dominated by the harness's periodic
+  `/proc/self/status` reads (~1.5 KiB visible). Materially larger →
+  smoltcp itself is allocating on the hot path.
+- `allocation count`: scales with `MemTrace` sample count (one per
+  ~250 ms), not with packet count.
+
+If allocation count tracks packet count instead of wall time, a
+`Vec::with_capacity` or boxing has crept into the hot path.
