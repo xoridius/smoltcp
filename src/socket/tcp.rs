@@ -930,6 +930,7 @@ impl<'a> Socket<'a> {
         self.remote_win_shift = rx_cap_log2.saturating_sub(16) as u8;
         self.remote_mss = DEFAULT_MSS as u32;
         self.remote_last_ts = None;
+        self.last_remote_tsval = 0;
         self.ack_delay_timer = AckDelayTimer::Idle;
         self.challenge_ack_timer = Instant::from_secs(0);
 
@@ -1906,6 +1907,7 @@ impl<'a> Socket<'a> {
                 if repr.timestamp.is_none() {
                     self.tsval_generator = None;
                 }
+                self.last_remote_tsval = repr.timestamp.map_or(0, |timestamp| timestamp.tsval);
                 self.set_state(State::SynReceived);
                 self.timer.set_for_idle(cx.now(), self.keep_alive);
             }
@@ -1954,6 +1956,7 @@ impl<'a> Socket<'a> {
                 if repr.timestamp.is_none() {
                     self.tsval_generator = None;
                 }
+                self.last_remote_tsval = repr.timestamp.map_or(0, |timestamp| timestamp.tsval);
 
                 if repr.ack_number.is_some() {
                     self.set_state(State::Established);
