@@ -299,3 +299,61 @@ pub fn tcp_listen_drops_unspecified_src() {
     assert_eq!(reply, None);
     assert!(sockets.get_mut::<tcp::Socket>(handle).is_listening());
 }
+
+#[test]
+#[cfg(feature = "medium-ip")]
+fn poll_processes_at_most_one_ingress_packet() {
+    struct InfiniteIngressDevice {
+        receive_calls: usize,
+    }
+
+    struct EmptyRxToken;
+
+    impl RxToken for EmptyRxToken {
+        fn consume<R, F>(self, f: F) -> R
+        where
+            F: FnOnce(&[u8]) -> R,
+        {
+            f(&[])
+        }
+    }
+
+    impl Device for InfiniteIngressDevice {
+        type RxToken<'a> = EmptyRxToken;
+        type TxToken<'a> = MockTxToken;
+
+        fn receive(
+            &mut self,
+            _timestamp: Instant,
+        ) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
+            self.receive_calls += 1;
+            assert_eq!(
+                self.receive_calls, 1,
+                "poll() must not keep draining a continuously non-empty RX queue"
+            );
+            Some((EmptyRxToken, MockTxToken))
+        }
+
+        fn transmit(&mut self, _timestamp: Instant) -> Option<Self::TxToken<'_>> {
+            Some(MockTxToken)
+        }
+
+        fn capabilities(&self) -> DeviceCapabilities {
+            DeviceCapabilities {
+                medium: Medium::Ip,
+                max_transmission_unit: 1500,
+                checksum: ChecksumCapabilities::ignored(),
+                ..DeviceCapabilities::default()
+            }
+        }
+    }
+
+    let mut device = InfiniteIngressDevice { receive_calls: 0 };
+    let config = Config::new(HardwareAddress::Ip);
+    let mut iface = Interface::new(config, &mut device, Instant::ZERO);
+    let mut sockets = SocketSet::new(vec![]);
+
+    iface.poll(Instant::ZERO, &mut device, &mut sockets);
+
+    assert_eq!(device.receive_calls, 1);
+}

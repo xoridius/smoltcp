@@ -446,25 +446,16 @@ impl Interface {
         self.fragments.reassembly_timeout = timeout;
     }
 
-    /// Transmit packets queued in the sockets, and receive packets queued
+    /// Transmit packets queued in the sockets, and receive one packet queued
     /// in the device.
     ///
     /// This function returns a value indicating whether the state of any socket
     /// might have changed.
     ///
-    /// ## DoS warning
-    ///
-    /// This function processes all packets in the device's queue. This can
-    /// be an unbounded amount of work if packets arrive faster than they're
-    /// processed.
-    ///
-    /// If this is a concern for your application (i.e. your environment doesn't
-    /// have preemptive scheduling, or `poll()` is called from a main loop where
-    /// other important things are processed), you may use the lower-level methods
-    /// [`poll_egress()`](Self::poll_egress), [`poll_maintenance()`](Self::poll_maintenance)
-    /// and [`poll_ingress_single()`](Self::poll_ingress_single).
-    /// This allows you to insert yields or process other events between processing
-    /// individual ingress packets.
+    /// This function processes at most one queued ingress packet per call.
+    /// Call [`poll_ingress_single()`](Self::poll_ingress_single) directly if
+    /// you need finer-grained ingress scheduling, or call `poll()` again if
+    /// more ingress packets may be queued.
     pub fn poll(
         &mut self,
         timestamp: Instant,
@@ -477,13 +468,11 @@ impl Interface {
 
         self.poll_maintenance(timestamp);
 
-        // Process ingress while there's packets available.
-        loop {
-            match self.socket_ingress(device, sockets) {
-                PollIngressSingleResult::None => break,
-                PollIngressSingleResult::PacketProcessed => {}
-                PollIngressSingleResult::SocketStateChanged => res = PollResult::SocketStateChanged,
-            }
+        // Process at most one ingress packet so a continuously non-empty RX
+        // queue cannot starve egress or the embedding application.
+        match self.socket_ingress(device, sockets) {
+            PollIngressSingleResult::None | PollIngressSingleResult::PacketProcessed => {}
+            PollIngressSingleResult::SocketStateChanged => res = PollResult::SocketStateChanged,
         }
 
         // Process egress.
