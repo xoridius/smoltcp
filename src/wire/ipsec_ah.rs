@@ -69,10 +69,15 @@ impl<T: AsRef<[u8]>> Packet<T> {
         let len = data.len();
         if len < field::SEQUENCE_NUMBER.end {
             Err(Error)
-        } else if len < field::ICV(data[field::PAYLOAD_LEN]).end {
-            Err(Error)
         } else {
-            Ok(())
+            let icv = field::ICV(data[field::PAYLOAD_LEN]);
+            if icv.start > icv.end {
+                Err(Error)
+            } else if len < icv.end {
+                Err(Error)
+            } else {
+                Ok(())
+            }
         }
     }
 
@@ -227,9 +232,7 @@ mod test {
         assert_eq!(packet.sequence_number(), 1);
         assert_eq!(
             packet.integrity_check_value(),
-            &[
-                0x27, 0xcf, 0xc0, 0xa5, 0xe4, 0x3d, 0x69, 0xb3, 0x72, 0x8e, 0xc5, 0xb0
-            ]
+            &[0x27, 0xcf, 0xc0, 0xa5, 0xe4, 0x3d, 0x69, 0xb3, 0x72, 0x8e, 0xc5, 0xb0]
         );
     }
 
@@ -253,6 +256,10 @@ mod test {
         assert!(matches!(Packet::new_checked(&PACKET_BYTES1[..10]), Err(_)));
         assert!(matches!(Packet::new_checked(&PACKET_BYTES1[..22]), Err(_)));
         assert!(matches!(Packet::new_checked(&PACKET_BYTES1[..]), Ok(_)));
+
+        let mut bytes = [0u8; field::SEQUENCE_NUMBER.end];
+        bytes[field::PAYLOAD_LEN] = 0;
+        assert!(matches!(Packet::new_checked(&bytes[..]), Err(_)));
     }
 
     fn packet_repr<'a>() -> Repr<'a> {
