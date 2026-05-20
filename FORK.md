@@ -683,6 +683,29 @@ Retries stay near 1 per thread per second even with 8× CPU
 oversubscription. The pool counter is a successful lock-free
 synchronization primitive at this contention level.
 
+### 13.3.2.1 Atomic-operation surface per shape
+
+Hot-path atomics that fire in each shape, listed by emitter. None of
+these is per-packet; rates are per-allocation or per-sample event.
+
+| Shape | `CountingAlloc` `fetch_add` (= alloc/free count) | `MemoryPool` charge/refund | `MemoryPool` CAS retries | `MemTrace` /proc reads |
+|---|---:|---:|---:|---:|
+| `udp` | ~14 (setup-dominated) | 0 (legacy buffers) | 0 | ~4 / sec |
+| `small` | ~7 | 0 | 0 | ~4 / sec |
+| `pingpong` | ~7 | 0 | 0 | ~4 / sec |
+| `firehose` | ~7 | 0 | 0 | ~4 / sec |
+| `many_tcp` N=100 | ~110 (socket + lane setup) | 0 (uses `Socket::new`) | 0 | ~4 / sec |
+| `many_udp` N=50 | ~60 | 0 | 0 | ~4 / sec |
+| `multi_tcp` N=4×30 | per-thread similar | yes (grow per flow) | ~24 over 5 s | ~4 / sec |
+| `churn` 1000/s | ~20K over 5 s | yes (per open/close) | 0–dozens | ~4 / sec |
+| `idle_hot` 500+5 | ~85 over 5 s | yes (5 active grow to max) | 0–dozens | ~4 / sec |
+
+All counters are `Relaxed`. The `MemoryPool` and `CountingAlloc`
+both use `AtomicUsize::fetch_add` / `compare_exchange_weak` with the
+weakest sound ordering. Single-thread shapes pay one uncontended
+locked RMW per event (~3 ns on x86); multi-thread shapes pay the
+CAS-retry rate from §13.3.2.
+
 ### 13.3.3 Per-shape CPU cost map (cachegrind + callgrind)
 
 `perf` isn't always available; in those environments `valgrind`'s
@@ -695,14 +718,19 @@ valgrind --tool=cachegrind --cache-sim=yes --branch-sim=yes \
   target/release/examples/profile_loopback <shape> 1
 ```
 
-| Shape | I refs | D refs (R/W) | Mispred rate | LL miss rate |
-|---|---:|---:|---:|---:|
-| `udp` | 264 M | 74 M / 41 M | 1.9 % | 0.0 % |
-| `small` | 97 M | 24 M / 16 M | 2.4 % | 0.0 % |
-| `pingpong` | 73 M | 18 M / 12 M | 2.5 % | 0.0 % |
-| `firehose` | 158 M | 45 M / 31 M | 1.3 % | 0.0 % |
-| `many_tcp N=50` | 243 M | 59 M / 30 M | 0.7 % | 0.0 % |
-| `many_udp N=50` | 162 M | 40 M / 28 M | 0.6 % | 0.0 % |
+| Shape | I refs | D refs (R/W) | Branches (cond/ind) | Mispred | LL miss |
+|---|---:|---:|---:|---:|---:|
+| `udp` | 264 M | 74 M / 41 M | 24.3 M / 1.4 M | 1.9 % | 0.0 % |
+| `small` | 97 M | 24 M / 16 M | 12.2 M / 1.3 M | 2.4 % | 0.0 % |
+| `pingpong` | 73 M | 18 M / 12 M | 9.1 M / 0.9 M | 2.5 % | 0.0 % |
+| `firehose` | 154 M | 44 M / 30 M | 21.4 M / 2.0 M | 1.3 % | 0.0 % |
+| `many_tcp N=50` | 243 M | 59 M / 30 M | 40.2 M / 1.9 M | 0.7 % | 0.0 % |
+| `many_udp N=50` | 162 M | 40 M / 28 M | 21.3 M / 0.9 M | 0.6 % | 0.0 % |
+| `dynbuf_memcompare N=200` | 12 M | 0.2 M / 11.7 M | 11.7 M / 0.006 M | 0.1 % | 0.8 % |
+
+(`dynbuf_memcompare` is dominated by `vec![0u8; N]` zeroing — high D-write
+count, near-zero D-reads, and 0.8 % LL miss rate from streaming through
+new buffers. Confirms the allocator is the hot path there, not smoltcp.)
 
 Interpretation:
 - LL miss rate at 0.0 % everywhere → working set fits L3. Regressions
@@ -716,40 +744,91 @@ Interpretation:
 
 **IPC.** Cachegrind gives instruction count; the harness now also
 reports a TSC-based cycles-per-packet number (every shape that prints
-a `Report`). Dividing the two yields IPC:
+a `Report`). Dividing the two yields IPC; for shapes whose
+`work_units` are not packets, normalize by `wire_packets` instead:
 
-| Shape | I refs/pkt (cg) | cycles/pkt (native, TSC) | IPC |
+| Shape | I refs / work-unit (cg) | cycles / pkt (native, TSC) | IPC |
 |---|---:|---:|---:|
-| `udp` | ~4030 | ~862 | **~4.7** |
+| `udp` | ~4030 / pkt | ~862 / pkt | **~4.7** |
+| `small` | ~28 / byte ≈ 41 K / pkt | ~723 / pkt | **~57** ⚠️ |
+| `pingpong` | n/a (latency-bound) | ~754 / pkt | — |
+| `firehose` | ~1.1 K / spin (idle dominated) | n/a (cwnd-bounded) | — |
+| `many_tcp N=50` | ~4.86 M / flow (setup) | per-packet varies | — |
+| `many_udp N=50` | ~3.24 M / flow (setup) | per-packet varies | — |
 
-4.7 IPC is in the "well-pipelined, well-vectorized" zone on a modern
-x86 core (theoretical peak ~6 for Zen3/Golden Cove). Most of the
+The udp IPC of ~4.7 is in the "well-pipelined, well-vectorized" zone
+on a modern x86 core (peak ~6 on Zen3 / Golden Cove). Most of the
 remaining cycles are memory-bandwidth-bound on the `__memcpy` +
-`checksum::data` hot paths, not compute-bound. Other shapes have
-more variable work-unit semantics (bytes vs roundtrips vs flows) so
-the per-packet comparison requires native + cachegrind passes with
-matched workloads; the harness prints all the inputs you need.
+`checksum::data` hot paths — confirmed by the callgrind tops above
+and by cachegrind's 0.0 % LL miss rate (working set fits in L3, so
+the wait isn't main-memory; it's L1/L2 fill cycles).
 
-Callgrind top symbols on `udp`:
+⚠️ The `small` shape's `I refs / byte` * (1500 B/pkt) overstates
+per-packet cost — `small` runs sub-MTU TCP segments so the wire
+packet count is much higher than the byte rate suggests. For honest
+IPC on shapes other than `udp`, run the harness once natively (read
+`cycles/pkt`) and once under cachegrind, divide cachegrind's
+`I refs` by *the same `wire_packets` count* the cachegrind run
+reports in its `Report` — not the work-units column.
 
-| % self-cost | Function |
-|---:|---|
-| 19 + 5 + 2 + 1 = ~27 % | `smoltcp::wire::ip::checksum::data` (vectorized; FORK.md §5.1 predicts top-3) |
-| 17 % | `__memcpy_avx_unaligned_erms` (libc; structurally unavoidable per FORK.md §11 zero-copy disclaimer) |
-| 3 % | `RingBuffer::dequeue_one_with` |
-| 3 % | `PacketBuffer::enqueue` |
-| 2.5 % | `process_ipv4` |
-| 2 % | `Interface::poll` |
-| 1.7 % | `dispatch_ip` |
-| 1.6 % | `Ipv4::Repr::parse` |
-| 1.4 % | `process_udp` |
-| 1.4 % | `socket::udp::Socket::recv_slice` |
+Callgrind top symbols per shape (collected via `callgrind_annotate`,
+filtered to `*.rs:smoltcp::*` + `libc memcpy`). Each shape lists the
+top 4–6 cost centers; the pattern is consistent — payload moves
+(`__memcpy`), the vectorized checksum, and the per-socket state
+machine dominate every shape:
 
-The top-of-profile shape (`checksum::data` + `memcpy` + state machine)
-exactly matches FORK.md §5.1's predictions for any reasonable workload.
-The dynamic-buffer feature's `try_grow_*` / `release_dyn_buffers` /
-`MemoryPool` symbols do **not** appear in the top 20 — `#[cold]` is
-doing its job.
+**`udp`** — 528 M I total
+- 27 % `smoltcp::wire::ip::checksum::data` (split across multiple inlining sites)
+- 17 % `__memcpy_avx_unaligned_erms`
+- 3 % `RingBuffer::dequeue_one_with`
+- 3 % `PacketBuffer::enqueue`
+- 2.5 % `process_ipv4`
+- 2 % `Interface::poll`
+
+**`small`** — 186 M I total
+- 4.5 % `__memcpy_avx_unaligned_erms`
+- 3.9 % `Socket::seq_to_transmit`
+- 3.6 % `Interface::poll`
+- 3.6 % `RingBuffer::enqueue_slice`
+- 2.5 % `Socket::window_to_update`
+- 2.3 % `checksum::data`
+
+**`pingpong`** — 195 M I total
+- 4.2 % `__memcpy_avx_unaligned_erms`
+- 3.8 % `checksum::data` (wire/ip.rs)
+- 2.4 % `wire::tcp::Repr::parse`
+- 2.3 % `process_ipv4`
+- 2.2 % `Socket::seq_to_transmit`
+- 2.0 % `Socket::dispatch`
+
+**`firehose`** — 169 M I total
+- 5.8 % `Interface::poll` (state-machine dominated; cwnd dynamics mean little payload moves)
+- 4.0 % `Socket::window_to_update`
+- 3.1 % `Interface::poll_maintenance`
+- 2.7 % `egress_permitted`
+- 2.3 % `__memcpy_avx_unaligned_erms`
+
+**`many_tcp N=50`** — 243 M I total
+- 3.9 % `Socket::accepts` (per-socket dispatch dominates at 50-flow scale)
+- 3.4 % `checksum::data`
+- 3.0 % `__memcpy_avx_unaligned_erms`
+- 2.2 % `Interface::poll`
+- 2.1 % `process_tcp`
+- 2.1 % `wire::tcp::Repr::parse`
+
+**`many_udp N=50`** — 215 M I total
+- 4.3 % `RingBuffer::dequeue_one_with`
+- 4.2 % `process_udp`
+- 4.1 % `__memcpy_avx_unaligned_erms`
+- 3.9 % `checksum::data`
+- 3.2 % `Interface::poll`
+- 3.0 % `udp::Socket::accepts`
+
+The top-of-profile shape (`checksum::data` + `__memcpy` + per-socket
+state machine) is uniform across every shape — exactly what FORK.md
+§5.1 predicts. The dynamic-buffer feature's symbols (`try_grow_*`,
+`release_dyn_buffers`, `MemoryPool::*`) **do not appear in the top 20
+of any shape's profile** — `#[cold]` placement working as designed.
 
 ### 13.3.4 Per-callsite heap attribution (dhat)
 
@@ -853,13 +932,27 @@ Zero. The `dyn_state` field, the new module, all hooks — all
 
 ### 14.4 Cost when feature is **on** but not used (legacy API)
 
-- `tcp::Socket` grows by **8 bytes** (a `Option<Box<DynBufState>>`):
-  472 → 480.
-- The hot dispatch path gains a single null-pointer check (≤ 3 cycles)
-  before the conditional growth code (which is `#[cold]`).
-- Net measured cost: **~2 % UDP throughput** on the `udp` shape from
-  binary-layout shift (Socket enum size bound), TCP perf neutral.
-  Cannot reduce below ~2 % without separate compilation units.
+- `tcp::Socket` is **the same 472 B** size feature-OFF was at before
+  any of this fork's work. The 8 B for `Option<Box<DynBufState>>` is
+  offset by packing 5 scattered `bool` fields into one `flags: u8`
+  byte (§13.4). Net Socket size change vs upstream baseline: **0 B**.
+- The hot dispatch path gains a single null-pointer check
+  (≤ 3 cycles) before the conditional growth code (which is `#[cold]`
+  and verified to live in `.text.unlikely.*`).
+- Net measured UDP cost (8-run medians on a noisy container,
+  feature-OFF vs feature-ON pinned binaries):
+  - OFF median: 26.66 Gbps, ON median: 25.41 Gbps → **−4.7 %**
+- The residual is binary-layout / icache shift from having ~5 KB more
+  cold-path code in the binary; the active code on the UDP packet
+  path is unchanged. On a quiet host the delta typically lands at
+  ~−1 to −2 %; container noise widens the window.
+- Cannot reduce below this floor without one of: splitting `Socket`
+  into separate types, moving `dyn_state` to a SocketHandle-keyed
+  side-table, or per-feature crate compilation. All of these break
+  the additive-API goal. For TCP-driven workloads (e.g. the iOS
+  NetworkExtension consumer that prompted this work), the UDP shape
+  cost is structurally irrelevant — UDP traffic bypasses smoltcp
+  entirely in that use case.
 
 ### 14.5 Cost when feature is **on** and used (`new_dynamic`)
 
