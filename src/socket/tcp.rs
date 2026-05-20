@@ -523,11 +523,10 @@ pub struct Socket<'a> {
     /// The number of packets received directly after
     /// each other which have the same ACK number.
     local_rx_dup_acks: u8,
-    /// Packed bool flags. Members: rx_fin_received, remote_last_win_unscaled,
-    /// remote_has_sack, nagle, synack_paused (last only with the
-    /// `socket-tcp-pause-synack` feature). Bit indices in the `FLAG_*`
-    /// constants below the struct; accessors live next to `set_state`.
-    flags: u8,
+    /// Packed bool flags. See the `Flags` bitflags struct below for
+    /// the bit definitions. Same packing idiom as `wire::dns::Flags`,
+    /// `wire::dhcpv4::Flags`, etc.
+    flags: Flags,
 
     /// Duration for Delayed ACK. If None no ACKs will be delayed.
     ack_delay: Option<Duration>,
@@ -561,16 +560,22 @@ pub struct Socket<'a> {
 
 const DEFAULT_MSS: usize = 536;
 
-// Bitflag indices for `Socket::flags`. Packing the five scattered bools
-// (rx_fin_received, remote_last_win_unscaled, remote_has_sack, nagle,
-// synack_paused) into one byte saves ~8 bytes of inter-field padding the
-// compiler would otherwise emit.
-const FLAG_RX_FIN_RECEIVED: u8 = 1 << 0;
-const FLAG_REMOTE_LAST_WIN_UNSCALED: u8 = 1 << 1;
-const FLAG_REMOTE_HAS_SACK: u8 = 1 << 2;
-const FLAG_NAGLE: u8 = 1 << 3;
-#[cfg(feature = "socket-tcp-pause-synack")]
-const FLAG_SYNACK_PAUSED: u8 = 1 << 4;
+bitflags::bitflags! {
+    /// Packed bool fields on `Socket`. Packing them into one byte saves
+    /// ~8 bytes of inter-field padding the compiler would otherwise emit
+    /// between scattered `bool` fields (`rx_fin_received`,
+    /// `remote_last_win_unscaled`, `remote_has_sack`, `nagle`,
+    /// `synack_paused`). Matches the same `bitflags!`-based packing
+    /// style used by `wire::dns::Flags`, `wire::dhcpv4::Flags`, etc.
+    struct Flags: u8 {
+        const RX_FIN_RECEIVED        = 1 << 0;
+        const REMOTE_LAST_WIN_UNSCALED = 1 << 1;
+        const REMOTE_HAS_SACK        = 1 << 2;
+        const NAGLE                  = 1 << 3;
+        #[cfg(feature = "socket-tcp-pause-synack")]
+        const SYNACK_PAUSED          = 1 << 4;
+    }
+}
 
 impl<'a> Socket<'a> {
     #[allow(unused_comparisons)] // small usize platforms always pass rx_capacity check
@@ -618,7 +623,7 @@ impl<'a> Socket<'a> {
             local_rx_last_seq: None,
             local_rx_dup_acks: 0,
             // Packed flags: nagle = true (default-on); everything else off.
-            flags: FLAG_NAGLE,
+            flags: Flags::NAGLE,
             ack_delay: Some(ACK_DELAY_DEFAULT),
             ack_delay_timer: AckDelayTimer::Idle,
             challenge_ack_timer: Instant::from_secs(0),
@@ -977,7 +982,7 @@ impl<'a> Socket<'a> {
     ///
     /// See also the [set_nagle_enabled](#method.set_nagle_enabled) method.
     pub fn nagle_enabled(&self) -> bool {
-        self.nagle()
+        self.flags.contains(Flags::NAGLE)
     }
 
     /// Pause sending of SYN|ACK packets.
@@ -987,7 +992,7 @@ impl<'a> Socket<'a> {
     /// proxy usecases.
     #[cfg(feature = "socket-tcp-pause-synack")]
     pub fn pause_synack(&mut self, pause: bool) {
-        self.set_synack_paused(pause);
+        self.flags.set(Flags::SYNACK_PAUSED, pause);
     }
 
     /// Return the current window field value, including scaling according to RFC 1323.
@@ -1005,7 +1010,7 @@ impl<'a> Socket<'a> {
     /// advertised window length in octets.
     #[inline]
     fn remote_last_window_len(&self) -> usize {
-        if self.remote_last_win_unscaled() {
+        if self.flags.contains(Flags::REMOTE_LAST_WIN_UNSCALED) {
             self.remote_last_win as usize
         } else {
             (self.remote_last_win as usize) << self.remote_win_shift
@@ -1066,7 +1071,7 @@ impl<'a> Socket<'a> {
     /// at the cost of increased latency in some situations, particularly when the remote peer
     /// has ACK delay enabled.
     pub fn set_nagle_enabled(&mut self, enabled: bool) {
-        self.set_nagle(enabled);
+        self.flags.set(Flags::NAGLE, enabled);
     }
 
     /// Return the keep-alive interval.
@@ -1171,7 +1176,7 @@ impl<'a> Socket<'a> {
         self.assembler = Assembler::new();
         self.tx_buffer.clear();
         self.rx_buffer.clear();
-        self.set_rx_fin_received(false);
+        self.flags.set(Flags::RX_FIN_RECEIVED, false);
 
         // Release any pool-charged backing now that the connection is fully
         // gone. Done before re-listen / re-connect so the next admission has
@@ -1185,7 +1190,7 @@ impl<'a> Socket<'a> {
         self.remote_last_seq = TcpSeqNumber::default();
         self.remote_last_ack = None;
         self.remote_last_win = 0;
-        self.set_remote_last_win_unscaled(false);
+        self.flags.set(Flags::REMOTE_LAST_WIN_UNSCALED, false);
         self.remote_win_len = 0;
         self.remote_win_scale = None;
         self.remote_win_shift = rx_cap_log2.saturating_sub(16) as u8;
@@ -1587,7 +1592,7 @@ impl<'a> Socket<'a> {
         // is fully open we must not dequeue any data, as it may be overwritten by e.g.
         // another (stale) SYN. (We do not support TCP Fast Open.)
         if !self.may_recv() {
-            if self.rx_fin_received() {
+            if self.flags.contains(Flags::RX_FIN_RECEIVED) {
                 return Err(RecvError::Finished);
             }
             return Err(RecvError::InvalidState);
@@ -1685,75 +1690,6 @@ impl<'a> Socket<'a> {
         self.rx_buffer.len()
     }
 
-    // ===========================================================
-    // Packed-bool accessors. Each compiles to AND-with-mask + test
-    // (read) or AND/OR with the mask (write) — no worse than the
-    // original scattered bool fields, but with ~8 bytes less
-    // inter-field padding (see the `flags: u8` field).
-    // ===========================================================
-    #[inline(always)]
-    fn rx_fin_received(&self) -> bool {
-        self.flags & FLAG_RX_FIN_RECEIVED != 0
-    }
-    #[inline(always)]
-    fn set_rx_fin_received(&mut self, v: bool) {
-        if v {
-            self.flags |= FLAG_RX_FIN_RECEIVED;
-        } else {
-            self.flags &= !FLAG_RX_FIN_RECEIVED;
-        }
-    }
-    #[inline(always)]
-    fn remote_last_win_unscaled(&self) -> bool {
-        self.flags & FLAG_REMOTE_LAST_WIN_UNSCALED != 0
-    }
-    #[inline(always)]
-    fn set_remote_last_win_unscaled(&mut self, v: bool) {
-        if v {
-            self.flags |= FLAG_REMOTE_LAST_WIN_UNSCALED;
-        } else {
-            self.flags &= !FLAG_REMOTE_LAST_WIN_UNSCALED;
-        }
-    }
-    #[inline(always)]
-    fn remote_has_sack(&self) -> bool {
-        self.flags & FLAG_REMOTE_HAS_SACK != 0
-    }
-    #[inline(always)]
-    fn set_remote_has_sack(&mut self, v: bool) {
-        if v {
-            self.flags |= FLAG_REMOTE_HAS_SACK;
-        } else {
-            self.flags &= !FLAG_REMOTE_HAS_SACK;
-        }
-    }
-    #[inline(always)]
-    fn nagle(&self) -> bool {
-        self.flags & FLAG_NAGLE != 0
-    }
-    #[inline(always)]
-    fn set_nagle(&mut self, v: bool) {
-        if v {
-            self.flags |= FLAG_NAGLE;
-        } else {
-            self.flags &= !FLAG_NAGLE;
-        }
-    }
-    #[cfg(feature = "socket-tcp-pause-synack")]
-    #[inline(always)]
-    fn synack_paused(&self) -> bool {
-        self.flags & FLAG_SYNACK_PAUSED != 0
-    }
-    #[cfg(feature = "socket-tcp-pause-synack")]
-    #[inline(always)]
-    fn set_synack_paused(&mut self, v: bool) {
-        if v {
-            self.flags |= FLAG_SYNACK_PAUSED;
-        } else {
-            self.flags &= !FLAG_SYNACK_PAUSED;
-        }
-    }
-
     fn set_state(&mut self, state: State) {
         if self.state != state {
             tcp_trace!("state={}=>{}", self.state, state);
@@ -1844,11 +1780,11 @@ impl<'a> Socket<'a> {
         // segments, is right-shifted by [advertised scale value] bits[...]
         reply_repr.window_len = self.scaled_window();
         self.remote_last_win = reply_repr.window_len;
-        self.set_remote_last_win_unscaled(false);
+        self.flags.set(Flags::REMOTE_LAST_WIN_UNSCALED, false);
 
         // If the remote supports selective acknowledgement, add the option to the outgoing
         // segment.
-        if self.remote_has_sack() {
+        if self.flags.contains(Flags::REMOTE_HAS_SACK) {
             net_debug!("sending sACK option with current assembler ranges");
 
             // RFC 2018: The first SACK block (i.e., the one immediately following the kind and
@@ -2255,7 +2191,7 @@ impl<'a> Socket<'a> {
                 self.local_seq_no = Self::random_seq_no(cx);
                 self.remote_seq_no = repr.seq_number + 1;
                 self.remote_last_seq = self.local_seq_no;
-                self.set_remote_has_sack(repr.sack_permitted);
+                self.flags.set(Flags::REMOTE_HAS_SACK, repr.sack_permitted);
                 self.remote_win_scale = repr.window_scale;
                 // Remote doesn't support window scaling, don't do it.
                 if self.remote_win_scale.is_none() {
@@ -2280,7 +2216,7 @@ impl<'a> Socket<'a> {
             // 7th and 8th steps in the "SEGMENT ARRIVES" event describe this behavior.
             (State::SynReceived, TcpControl::Fin) => {
                 self.remote_seq_no += 1;
-                self.set_rx_fin_received(true);
+                self.flags.set(Flags::RX_FIN_RECEIVED, true);
                 self.set_state(State::CloseWait);
             }
 
@@ -2304,7 +2240,7 @@ impl<'a> Socket<'a> {
                 self.remote_seq_no = repr.seq_number + 1;
                 self.remote_last_seq = self.local_seq_no + 1;
                 self.remote_last_ack = Some(repr.seq_number);
-                self.set_remote_has_sack(repr.sack_permitted);
+                self.flags.set(Flags::REMOTE_HAS_SACK, repr.sack_permitted);
                 self.remote_win_scale = repr.window_scale;
                 // Remote doesn't support window scaling, don't do it.
                 if self.remote_win_scale.is_none() {
@@ -2328,7 +2264,7 @@ impl<'a> Socket<'a> {
             // FIN packets in ESTABLISHED state indicate the remote side has closed.
             (State::Established, TcpControl::Fin) => {
                 self.remote_seq_no += 1;
-                self.set_rx_fin_received(true);
+                self.flags.set(Flags::RX_FIN_RECEIVED, true);
                 self.set_state(State::CloseWait);
             }
 
@@ -2344,7 +2280,7 @@ impl<'a> Socket<'a> {
             // if they also acknowledge our FIN.
             (State::FinWait1, TcpControl::Fin) => {
                 self.remote_seq_no += 1;
-                self.set_rx_fin_received(true);
+                self.flags.set(Flags::RX_FIN_RECEIVED, true);
                 if ack_of_fin {
                     self.set_state(State::TimeWait);
                     self.timer.set_for_close(cx.now());
@@ -2358,7 +2294,7 @@ impl<'a> Socket<'a> {
             // FIN packets in FIN-WAIT-2 state change it to TIME-WAIT.
             (State::FinWait2, TcpControl::Fin) => {
                 self.remote_seq_no += 1;
-                self.set_rx_fin_received(true);
+                self.flags.set(Flags::RX_FIN_RECEIVED, true);
                 self.set_state(State::TimeWait);
                 self.timer.set_for_close(cx.now());
             }
@@ -2648,7 +2584,7 @@ impl<'a> Socket<'a> {
         // If the SYN|ACK is intentionally paused, do not ask the interface to
         // poll immediately: dispatch() will withhold the packet until unpaused.
         #[cfg(feature = "socket-tcp-pause-synack")]
-        if self.state == State::SynReceived && self.synack_paused() {
+        if self.state == State::SynReceived && self.flags.contains(Flags::SYNACK_PAUSED) {
             return false;
         }
 
@@ -2688,7 +2624,7 @@ impl<'a> Socket<'a> {
         // * There's no data in flight
         // * We can send a full packet
         // * We have all the data we'll ever send (we're closing send)
-        if self.nagle() && data_in_flight && !can_send_full && !want_fin {
+        if self.flags.contains(Flags::NAGLE) && data_in_flight && !can_send_full && !want_fin {
             can_send = false;
         }
 
@@ -2848,7 +2784,7 @@ impl<'a> Socket<'a> {
         }
 
         #[cfg(feature = "socket-tcp-pause-synack")]
-        if matches!(self.state, State::SynReceived) && self.synack_paused() {
+        if matches!(self.state, State::SynReceived) && self.flags.contains(Flags::SYNACK_PAUSED) {
             return Ok(());
         }
 
@@ -2933,7 +2869,7 @@ impl<'a> Socket<'a> {
                     repr.window_scale = Some(self.remote_win_shift);
                     repr.sack_permitted = true;
                 } else {
-                    repr.sack_permitted = self.remote_has_sack();
+                    repr.sack_permitted = self.flags.contains(Flags::REMOTE_HAS_SACK);
                     repr.window_scale = self.remote_win_scale.map(|_| self.remote_win_shift);
                 }
             }
@@ -3092,7 +3028,7 @@ impl<'a> Socket<'a> {
         self.remote_last_seq = new_remote_last_seq;
         self.remote_last_ack = new_remote_last_ack;
         self.remote_last_win = new_remote_last_win;
-        self.set_remote_last_win_unscaled(new_remote_last_win_unscaled);
+        self.flags.set(Flags::REMOTE_LAST_WIN_UNSCALED, new_remote_last_win_unscaled);
 
         if seg_len > 0 {
             self.rtte.on_send(cx.now(), new_remote_last_seq);
@@ -3641,7 +3577,7 @@ mod test {
                 ..SEND_TEMPL
             }
         );
-        assert!(!s.remote_has_sack());
+        assert!(!s.flags.contains(Flags::REMOTE_HAS_SACK));
         recv!(
             s,
             [TcpRepr {
@@ -3664,7 +3600,7 @@ mod test {
                 ..SEND_TEMPL
             }
         );
-        assert!(s.remote_has_sack());
+        assert!(s.flags.contains(Flags::REMOTE_HAS_SACK));
         recv!(
             s,
             [TcpRepr {
@@ -4590,7 +4526,7 @@ mod test {
                 ..SEND_TEMPL
             }
         );
-        assert!(s.remote_has_sack());
+        assert!(s.flags.contains(Flags::REMOTE_HAS_SACK));
 
         let mut s = socket_syn_sent();
         recv!(
@@ -4617,7 +4553,7 @@ mod test {
                 ..SEND_TEMPL
             }
         );
-        assert!(!s.remote_has_sack());
+        assert!(!s.flags.contains(Flags::REMOTE_HAS_SACK));
     }
 
     #[test]
@@ -4812,7 +4748,7 @@ mod test {
         // RFC 2018: Assume the left window edge is 5000 and that the data transmitter sends [...]
         // segments, each containing 500 data bytes.
         let mut s = socket_established_with_buffer_sizes(4000, 4000);
-        s.set_remote_has_sack(true);
+        s.flags.set(Flags::REMOTE_HAS_SACK, true);
 
         // create a segment that is 500 bytes long
         let mut segment: Vec<u8> = Vec::with_capacity(500);
@@ -4907,7 +4843,7 @@ mod test {
     #[test]
     fn test_established_sack_no_overflow_on_near_max_seqnumber() {
         let mut s = socket_established();
-        s.set_remote_has_sack(true);
+        s.flags.set(Flags::REMOTE_HAS_SACK, true);
         s.remote_seq_no = TcpSeqNumber(-4);
         s.remote_last_ack = Some(TcpSeqNumber(-4));
 
