@@ -832,6 +832,10 @@ impl<'a> Report<'a> {
             unit_rate / 1e6,
             self.unit_label
         );
+        println!(
+            "  wire packets:           {:>8}   (use for IPC: cachegrind I refs / this = I/pkt)",
+            self.wire_packets,
+        );
         println!();
         println!("  poll-cycle latency (ns):");
         println!(

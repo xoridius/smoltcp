@@ -742,34 +742,41 @@ Interpretation:
   stream processing). Pingpong runs cooler because handshake control
   flow dominates and payload copies are small.
 
-**IPC.** Cachegrind gives instruction count; the harness now also
-reports a TSC-based cycles-per-packet number (every shape that prints
-a `Report`). Dividing the two yields IPC; for shapes whose
-`work_units` are not packets, normalize by `wire_packets` instead:
+**IPC, per shape.** Every shape's `Report` now prints `wire packets:`
+(the count for that run). Divide cachegrind's `I refs` by the
+cachegrind run's `wire packets` to get I/pkt; the native run reports
+`cycles/pkt` directly; IPC = I/pkt ÷ cycles/pkt.
 
-| Shape | I refs / work-unit (cg) | cycles / pkt (native, TSC) | IPC |
+| Shape | I/pkt (cg) | cycles/pkt (native) | IPC |
 |---|---:|---:|---:|
-| `udp` | ~4030 / pkt | ~862 / pkt | **~4.7** |
-| `small` | ~28 / byte ≈ 41 K / pkt | ~723 / pkt | **~57** ⚠️ |
-| `pingpong` | n/a (latency-bound) | ~754 / pkt | — |
-| `firehose` | ~1.1 K / spin (idle dominated) | n/a (cwnd-bounded) | — |
-| `many_tcp N=50` | ~4.86 M / flow (setup) | per-packet varies | — |
-| `many_udp N=50` | ~3.24 M / flow (setup) | per-packet varies | — |
+| `udp` | 4027 | 887 | **4.54** |
+| `pingpong` | 4310 | 758 | **5.69** |
+| `many_tcp N=50` | 4730 | 859 | **5.51** |
+| `many_udp N=50` | 4189 | 824 | **5.09** |
+| `small` | 9869 | 689 | 14.3 ⚠️ |
+| `firehose` | 157535 | 3.17 M | 0.05 ⚠️ |
 
-The udp IPC of ~4.7 is in the "well-pipelined, well-vectorized" zone
-on a modern x86 core (peak ~6 on Zen3 / Golden Cove). Most of the
-remaining cycles are memory-bandwidth-bound on the `__memcpy` +
+The four well-behaved shapes (udp, pingpong, many_tcp, many_udp) land
+between **4.5 and 5.7 IPC**, the "well-pipelined, well-vectorized"
+zone on a modern x86 core (peak ~6 on Zen3 / Golden Cove). Most of
+the remaining cycles are memory-bandwidth-bound on the `__memcpy` +
 `checksum::data` hot paths — confirmed by the callgrind tops above
-and by cachegrind's 0.0 % LL miss rate (working set fits in L3, so
-the wait isn't main-memory; it's L1/L2 fill cycles).
+and by cachegrind's 0.0 % LL miss rate (working set fits in L3; the
+wait isn't main-memory, it's L1/L2 fill cycles).
 
-⚠️ The `small` shape's `I refs / byte` * (1500 B/pkt) overstates
-per-packet cost — `small` runs sub-MTU TCP segments so the wire
-packet count is much higher than the byte rate suggests. For honest
-IPC on shapes other than `udp`, run the harness once natively (read
-`cycles/pkt`) and once under cachegrind, divide cachegrind's
-`I refs` by *the same `wire_packets` count* the cachegrind run
-reports in its `Report` — not the work-units column.
+⚠️ Two shapes don't yield clean IPC numbers, for understood reasons:
+
+- **`small`** — TCP state machine is sensitive to the ~30× slowdown
+  valgrind introduces. Under cachegrind the ACK / retransmit cadence
+  shifts, so the per-packet instruction count and the native
+  per-packet cycle count aren't measuring the same workload. The
+  number above (14.3) is artifact, not real IPC.
+- **`firehose`** — cwnd-bounded; most native cycles are spent in
+  idle-spin waiting for ACKs, not in productive packet work. The TSC
+  delta divides over a small wire-packet count, inflating cycles/pkt
+  to the millions. Real-IPC-of-productive-work is closer to the
+  others; we just can't isolate it without sampling-profiler PMU
+  data (`perf stat`), which this container doesn't expose.
 
 Callgrind top symbols per shape (collected via `callgrind_annotate`,
 filtered to `*.rs:smoltcp::*` + `libc memcpy`). Each shape lists the
@@ -939,13 +946,22 @@ Zero. The `dyn_state` field, the new module, all hooks — all
 - The hot dispatch path gains a single null-pointer check
   (≤ 3 cycles) before the conditional growth code (which is `#[cold]`
   and verified to live in `.text.unlikely.*`).
-- Net measured UDP cost (8-run medians on a noisy container,
-  feature-OFF vs feature-ON pinned binaries):
-  - OFF median: 26.66 Gbps, ON median: 25.41 Gbps → **−4.7 %**
-- The residual is binary-layout / icache shift from having ~5 KB more
-  cold-path code in the binary; the active code on the UDP packet
-  path is unchanged. On a quiet host the delta typically lands at
-  ~−1 to −2 %; container noise widens the window.
+- Net measured UDP cost (20-run pinned-binary, 8 s each, on this
+  containerized x86_64 host, feature-OFF vs feature-ON):
+  - OFF: mean 27.24 ± 0.35, median **27.24** Gbps
+  - ON:  mean 25.92 ± 0.54, median **26.08** Gbps
+  - Mean delta: **−4.8 %**, median delta: **−4.3 %**
+  - 20 samples, stddev tight → statistically significant; not noise.
+- The cost source is **binary-layout shift**: feature-ON adds
+  **~60 KiB of stripped code** to the executable (cold-section symbols
+  for `MemoryPool`, `try_grow_*`, `release_dyn_buffers`, `DynBufState`,
+  the `Drop` glue, `bitflags!`-derived methods, etc.). That shifts the
+  load addresses of all other code; even though none of it runs on the
+  UDP packet path (callgrind §13.3.3 confirms dynamic-buffer symbols
+  don't appear in any shape's top 20), the prefetcher / branch-
+  predictor / icache state interacts differently with the new layout.
+- The active code on the UDP fast path is unchanged. The cost is
+  passive.
 - Cannot reduce below this floor without one of: splitting `Socket`
   into separate types, moving `dyn_state` to a SocketHandle-keyed
   side-table, or per-feature crate compilation. All of these break
