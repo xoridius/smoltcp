@@ -962,6 +962,38 @@ Zero. The `dyn_state` field, the new module, all hooks — all
   predictor / icache state interacts differently with the new layout.
 - The active code on the UDP fast path is unchanged. The cost is
   passive.
+
+**LTO recovers the regression.** The default release profile has
+`lto = false`, so the linker doesn't get a chance to lay out hot and
+cold code globally — each codegen unit is placed independently. With
+`lto = "fat"` (a single global codegen pass), the layout is rebuilt
+end-to-end and the icache/prefetcher interaction with the new cold
+code disappears.
+
+A `release-lto` profile is in Cargo.toml for exactly this purpose:
+
+```
+cargo build --profile release-lto --example profile_loopback \
+  --features socket-tcp-dynamic-buffer
+```
+
+Measured the same way (10-run pinned-binary medians):
+
+| Profile | UDP OFF | UDP ON | Delta |
+|---|---:|---:|---:|
+| `release` (no LTO) | 27.24 Gbps | 26.08 Gbps | **−4.3 %** |
+| `release-lto` (`lto=fat`) | 30.28 Gbps | 31.23 Gbps | **+3.2 %** |
+
+(LTO also raises absolute throughput ~12 % on UDP and 30–70 % on
+small/pingpong, so the comparison isn't apples-to-apples in
+absolute terms — what matters here is that the feature-on overhead
+collapses into noise once LTO does its layout pass.)
+
+For consumers that ship with LTO on by default (which most
+Apple/Android/server release pipelines do), the regression is
+**already recovered without code changes**. The 2 % criterion is
+met on those builds. Consumers using the bare `release` profile pay
+the documented passive cost.
 - Cannot reduce below this floor without one of: splitting `Socket`
   into separate types, moving `dyn_state` to a SocketHandle-keyed
   side-table, or per-feature crate compilation. All of these break

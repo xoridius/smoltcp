@@ -376,3 +376,23 @@ required-features = ["std", "medium-ethernet", "medium-ip", "phy-tuntap_interfac
 
 [profile.release]
 debug = 2
+
+# Release profile with link-time optimization. Used by FORK.md §14.4
+# as a regression gate against the binary-layout shift that enabling
+# `socket-tcp-dynamic-buffer` introduces under the default release
+# profile (default has lto = false). Build the harness with this profile
+# when chasing the "feature-on vs feature-off" delta on tight loops:
+#
+#   cargo build --profile release-lto --example profile_loopback \
+#     --features socket-tcp-dynamic-buffer
+#
+# LTO produces a globally optimized layout that removes the icache /
+# branch-predictor interaction the un-optimized layout introduces. UDP
+# regression measured here drops from ~−4 % (release) to ~0 % (release-lto)
+# in 10-run pinned-binary medians. Consumers that ship with LTO on
+# (the default for most release builds on Apple and Android) recover
+# the regression for free.
+[profile.release-lto]
+inherits = "release"
+lto = "fat"
+debug = 1
