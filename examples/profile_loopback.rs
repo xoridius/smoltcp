@@ -640,6 +640,25 @@ fn add_tcp_socket(ep: &mut Endpoint<'static>, buf_size: usize) -> smoltcp::iface
     ep.sockets.add(socket)
 }
 
+/// Pool-backed dynamic-buffer variant. Buffers start at 0 and grow on
+/// pressure up to `max_buf`, charged against the shared `pool`.
+#[cfg(feature = "socket-tcp-dynamic-buffer")]
+fn add_tcp_socket_dyn(
+    ep: &mut Endpoint<'static>,
+    max_buf: u32,
+    pool: &tcp::MemoryPool,
+) -> smoltcp::iface::SocketHandle {
+    let cfg = tcp::DynamicBufferConfig {
+        rx_initial: 0,
+        rx_max: max_buf,
+        tx_initial: 0,
+        tx_max: max_buf,
+        grow_chunk: 8 * 1024,
+    };
+    let socket = tcp::Socket::new_dynamic(cfg, Some(pool.clone()));
+    ep.sockets.add(socket)
+}
+
 /// Snapshot of the allocator counters + RSS at one instant. Take two and
 /// `diff()` them to see what happened during a phase.
 #[derive(Copy, Clone)]
@@ -1437,8 +1456,8 @@ fn shape_many_tcp(seconds: u64, n: usize, offload: bool) {
 
     mem_trace.print();
 
-    // Per-flow socket footprint estimate. Useful for sizing the buffer pool
-    // up-front for tunnel-lib-rust.
+    // Per-flow socket footprint estimate. Useful for sizing per-flow
+    // budgets in downstream consumers that admit many concurrent flows.
     let tcp_socket_bytes = core::mem::size_of::<tcp::Socket>();
     let per_flow_bytes = tcp_socket_bytes + 2 * BUF;
     let total_bytes = 2 * n * per_flow_bytes; // both peers
@@ -1613,6 +1632,600 @@ fn shape_many_udp(seconds: u64, n: usize, offload: bool) {
     );
 }
 
+/// Multi-Interface pool-contention shape. Spawns `n_threads` threads, each
+/// owning its own server/client `Interface` pair and `flows_per_thread`
+/// TCP echo flows, all sharing a single [`tcp::MemoryPool`]. Measures the
+/// aggregate throughput scaling and serves as a regression gate against
+/// pool-counter cache-line / CAS-retry contention.
+///
+/// Each thread runs the same workload as `many_tcp` but with sockets
+/// created via `new_dynamic` so the pool is exercised. Threads start
+/// in lockstep via a barrier so the contention window aligns.
+#[cfg(feature = "socket-tcp-dynamic-buffer")]
+fn shape_multi_tcp(seconds: u64, n_threads: usize, flows_per_thread: usize, offload: bool) {
+    use std::sync::{Arc, Barrier};
+    use std::thread;
+    use std::time::Instant as StdInstant;
+
+    const MAX_BUF: u32 = 32 * 1024;
+    const PAYLOAD: usize = 1024;
+    let total_flows = n_threads * flows_per_thread;
+    // Pool sized to hold every flow's full max — exercises CAS contention
+    // without forcing refusal (which would obscure the perf signal).
+    let pool_bytes: usize = total_flows * 2 * MAX_BUF as usize;
+    let pool = tcp::MemoryPool::new(pool_bytes);
+
+    let barrier = Arc::new(Barrier::new(n_threads));
+    let start_wall = StdInstant::now();
+
+    let mut handles: Vec<thread::JoinHandle<(u64, u64, u64)>> = Vec::with_capacity(n_threads);
+    for tid in 0..n_threads {
+        let pool = pool.clone();
+        let barrier = barrier.clone();
+        handles.push(thread::spawn(move || {
+            let qd = (flows_per_thread * 16).clamp(1024, 16384);
+            let lane_a: LaneRc = Rc::new(RefCell::new(Lane::new(1500, qd)));
+            let lane_b: LaneRc = Rc::new(RefCell::new(Lane::new(1500, qd)));
+            // Use distinct addresses per thread so server/client tuples don't
+            // clash if anything inspects them (they won't — lanes are isolated).
+            let base = 10 + tid as u8;
+            let mut server = make_endpoint(
+                IpAddress::v4(base, 0, 0, 1),
+                1500,
+                lane_a.clone(),
+                lane_b.clone(),
+                offload,
+            );
+            let mut client = make_endpoint(
+                IpAddress::v4(base, 0, 0, 2),
+                1500,
+                lane_b.clone(),
+                lane_a.clone(),
+                offload,
+            );
+
+            let mut srv_handles = Vec::with_capacity(flows_per_thread);
+            let mut cli_handles = Vec::with_capacity(flows_per_thread);
+            for i in 0..flows_per_thread {
+                let h_srv = add_tcp_socket_dyn(&mut server, MAX_BUF, &pool);
+                let h_cli = add_tcp_socket_dyn(&mut client, MAX_BUF, &pool);
+                let dst_port: u16 = 10_000u16.wrapping_add(i as u16);
+                let src_port: u16 = 30_000u16.wrapping_add(i as u16);
+                {
+                    let s = server.sockets.get_mut::<tcp::Socket>(h_srv);
+                    s.set_ack_delay(None);
+                    s.set_nagle_enabled(false);
+                    s.listen(dst_port).unwrap();
+                }
+                {
+                    let c = client.sockets.get_mut::<tcp::Socket>(h_cli);
+                    c.set_ack_delay(None);
+                    c.set_nagle_enabled(false);
+                }
+                client
+                    .sockets
+                    .get_mut::<tcp::Socket>(h_cli)
+                    .connect(
+                        client.iface.context(),
+                        (IpAddress::v4(base, 0, 0, 1), dst_port),
+                        src_port,
+                    )
+                    .unwrap();
+                srv_handles.push(h_srv);
+                cli_handles.push(h_cli);
+            }
+
+            // Drive until ESTABLISHED on every flow.
+            let smol_now = |w0: StdInstant| Instant::from_micros(w0.elapsed().as_micros() as i64);
+            let w0 = StdInstant::now();
+            let connect_deadline = w0 + std::time::Duration::from_secs(seconds.min(5));
+            loop {
+                let now = smol_now(w0);
+                server.iface.poll(now, &mut server.device, &mut server.sockets);
+                client.iface.poll(now, &mut client.device, &mut client.sockets);
+                let all_ready = cli_handles
+                    .iter()
+                    .zip(srv_handles.iter())
+                    .all(|(&hc, &hs)| {
+                        client.sockets.get::<tcp::Socket>(hc).may_send()
+                            && server.sockets.get::<tcp::Socket>(hs).may_recv()
+                    });
+                if all_ready || StdInstant::now() >= connect_deadline {
+                    break;
+                }
+            }
+
+            // Synchronize the steady-state start across threads.
+            barrier.wait();
+
+            let mut sent: u64 = 0;
+            let mut recvd: u64 = 0;
+            let payload = vec![0xa5u8; PAYLOAD];
+            let mut sink = vec![0u8; PAYLOAD];
+            let deadline = StdInstant::now() + std::time::Duration::from_secs(seconds);
+            while StdInstant::now() < deadline {
+                let now = smol_now(w0);
+                // Client: send chunks. Don't gate on can_send — for dynamic
+                // buffers, tx_buffer starts at 0 capacity and grows inside
+                // send_impl; can_send() returns false until the first grow.
+                for &h in &cli_handles {
+                    let s = client.sockets.get_mut::<tcp::Socket>(h);
+                    if s.may_send()
+                        && let Ok(n) = s.send_slice(&payload)
+                    {
+                        sent += n as u64;
+                    }
+                }
+                // Push client TX onto wire, let server receive.
+                client.iface.poll(now, &mut client.device, &mut client.sockets);
+                server.iface.poll(now, &mut server.device, &mut server.sockets);
+                // Server: drain and echo so the client's tx_buffer frees up
+                // (otherwise it stalls at the dynamic-buffer cap).
+                for &h in &srv_handles {
+                    let s = server.sockets.get_mut::<tcp::Socket>(h);
+                    while s.can_recv() {
+                        match s.recv_slice(&mut sink) {
+                            Ok(r) if r > 0 => {
+                                recvd += r as u64;
+                                if s.may_send() {
+                                    let _ = s.send_slice(&sink[..r]);
+                                }
+                            }
+                            _ => break,
+                        }
+                    }
+                }
+                // Push server ACKs / echo back to client.
+                server.iface.poll(now, &mut server.device, &mut server.sockets);
+                client.iface.poll(now, &mut client.device, &mut client.sockets);
+                // Drain client RX (we don't count it; the recvd above
+                // measures the server-side bytes which is the workload signal).
+                for &h in &cli_handles {
+                    let s = client.sockets.get_mut::<tcp::Socket>(h);
+                    while s.can_recv() {
+                        match s.recv_slice(&mut sink) {
+                            Ok(r) if r > 0 => {}
+                            _ => break,
+                        }
+                    }
+                }
+            }
+            let elapsed_us = w0.elapsed().as_micros() as u64;
+            (sent, recvd, elapsed_us)
+        }));
+    }
+
+    let results: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+    let total_secs = start_wall.elapsed().as_secs_f64();
+    let agg_sent: u64 = results.iter().map(|(s, _, _)| s).sum();
+    let agg_recvd: u64 = results.iter().map(|(_, r, _)| r).sum();
+    let agg_gbps = (agg_recvd as f64 * 8.0) / total_secs / 1e9;
+    let per_thread_gbps: Vec<f64> = results
+        .iter()
+        .map(|(_, r, _)| (*r as f64 * 8.0) / total_secs / 1e9)
+        .collect();
+    let min = per_thread_gbps.iter().cloned().fold(f64::INFINITY, f64::min);
+    let max = per_thread_gbps.iter().cloned().fold(0f64, f64::max);
+    let mean = agg_gbps / n_threads as f64;
+    let cv = if mean > 0.0 {
+        let variance: f64 = per_thread_gbps
+            .iter()
+            .map(|v| (v - mean).powi(2))
+            .sum::<f64>()
+            / per_thread_gbps.len() as f64;
+        variance.sqrt() / mean
+    } else {
+        0.0
+    };
+    // Jain's fairness across threads.
+    let sum: f64 = per_thread_gbps.iter().sum();
+    let sum_sq: f64 = per_thread_gbps.iter().map(|v| v * v).sum();
+    let jain = if sum_sq > 0.0 {
+        (sum * sum) / (n_threads as f64 * sum_sq)
+    } else {
+        0.0
+    };
+
+    println!("\n========== shape: multi_tcp ==========");
+    println!(
+        "  threads:                {n_threads}   flows/thread: {flows_per_thread}   total flows: {total_flows}"
+    );
+    println!(
+        "  pool budget:            {} KiB    pool used (end): {} KiB",
+        pool_bytes / 1024,
+        pool.used() / 1024,
+    );
+    println!("  elapsed:                {:.3}s", total_secs);
+    println!(
+        "  aggregate app sent:     {:.3} GB    ({:.3} Gbps)",
+        agg_sent as f64 / 1e9,
+        (agg_sent as f64 * 8.0) / total_secs / 1e9
+    );
+    println!(
+        "  aggregate app recvd:    {:.3} GB    ({:.3} Gbps)",
+        agg_recvd as f64 / 1e9,
+        agg_gbps,
+    );
+    println!("  per-thread throughput:");
+    for (i, gbps) in per_thread_gbps.iter().enumerate() {
+        println!("    t{i:>2}: {gbps:>7.3} Gbps");
+    }
+    println!(
+        "  min/max/mean:           {min:.3} / {max:.3} / {mean:.3} Gbps   CV: {cv:.4}   Jain: {jain:.4}"
+    );
+    let verdict = if jain >= 0.95 {
+        "FAIR (pool contention bounded)"
+    } else {
+        "UNFAIR (pool contention or scheduling)"
+    };
+    println!("  verdict: {verdict}");
+}
+
+/// Connection-churn shape. Repeatedly opens and tears down TCP flows at
+/// `target_conn_per_sec`, each exchanging one short payload before close.
+/// Exercises the release path (`set_state(Closed)`, `reset()`, `Drop`)
+/// under load; verifies that pool refunds keep up with admissions and
+/// the connection cap doesn't drift.
+#[cfg(feature = "socket-tcp-dynamic-buffer")]
+fn shape_churn(seconds: u64, target_conn_per_sec: usize, offload: bool) {
+    use std::time::Instant as StdInstant;
+    const MAX_BUF: u32 = 32 * 1024;
+    const SLOTS: usize = 256;
+    const PAYLOAD: usize = 128;
+
+    let qd = (SLOTS * 16).clamp(1024, 16384);
+    let lane_a: LaneRc = Rc::new(RefCell::new(Lane::new(1500, qd)));
+    let lane_b: LaneRc = Rc::new(RefCell::new(Lane::new(1500, qd)));
+    let pool_bytes: usize = SLOTS * 2 * MAX_BUF as usize;
+    let pool = tcp::MemoryPool::new(pool_bytes);
+
+    let mut server = make_endpoint(
+        IpAddress::v4(10, 0, 0, 1),
+        1500,
+        lane_a.clone(),
+        lane_b.clone(),
+        offload,
+    );
+    let mut client = make_endpoint(
+        IpAddress::v4(10, 0, 0, 2),
+        1500,
+        lane_b.clone(),
+        lane_a.clone(),
+        offload,
+    );
+
+    // Pre-allocate a ring of socket handles. Each "churn slot" is a pair
+    // we cycle through; once a pair is fully torn down we recycle the slot.
+    let mut slots: Vec<(smoltcp::iface::SocketHandle, smoltcp::iface::SocketHandle, u16)> =
+        Vec::with_capacity(SLOTS);
+    for i in 0..SLOTS {
+        let h_srv = add_tcp_socket_dyn(&mut server, MAX_BUF, &pool);
+        let h_cli = add_tcp_socket_dyn(&mut client, MAX_BUF, &pool);
+        slots.push((h_srv, h_cli, i as u16));
+    }
+
+    let alloc_before = AllocSnap::now();
+    let start = StdInstant::now();
+    let smol_now = |w0: StdInstant| Instant::from_micros(w0.elapsed().as_micros() as i64);
+
+    let mut next_slot = 0usize;
+    let mut opened: u64 = 0;
+    let mut closed: u64 = 0;
+    let mut bytes_xferred: u64 = 0;
+    let payload = vec![0xc5u8; PAYLOAD];
+    let mut scratch = vec![0u8; PAYLOAD];
+    let interval_us = if target_conn_per_sec > 0 {
+        1_000_000 / target_conn_per_sec as u64
+    } else {
+        100
+    };
+    let mut next_open_us: u64 = 0;
+    let deadline = start + std::time::Duration::from_secs(seconds);
+
+    while StdInstant::now() < deadline {
+        let elapsed_us = start.elapsed().as_micros() as u64;
+
+        // Time to open another connection? Walk forward through slots
+        // until we've either caught up to the schedule or exhausted free
+        // slots; recycled slots become available as soon as both halves
+        // are Closed (abort path avoids TIME_WAIT — the workload we want
+        // here is admission-and-release rate, not a graceful shutdown
+        // microbench).
+        while elapsed_us >= next_open_us {
+            let slot = next_slot % SLOTS;
+            let (h_srv, h_cli, base_port) = slots[slot];
+            let cs = client.sockets.get_mut::<tcp::Socket>(h_cli);
+            let ss = server.sockets.get_mut::<tcp::Socket>(h_srv);
+            if matches!(cs.state(), tcp::State::Closed)
+                && matches!(ss.state(), tcp::State::Closed | tcp::State::Listen)
+            {
+                let dst_port: u16 = 10_000u16.wrapping_add(base_port);
+                let src_port: u16 = 30_000u16.wrapping_add(opened as u16);
+                ss.set_ack_delay(None);
+                ss.set_nagle_enabled(false);
+                let _ = ss.listen(dst_port);
+                cs.set_ack_delay(None);
+                cs.set_nagle_enabled(false);
+                let _ = cs.connect(
+                    client.iface.context(),
+                    (IpAddress::v4(10, 0, 0, 1), dst_port),
+                    src_port,
+                );
+                opened += 1;
+                next_open_us += interval_us;
+            }
+            next_slot += 1;
+            if next_slot % SLOTS == 0 {
+                break; // one full sweep per outer iteration max
+            }
+        }
+
+        let now = smol_now(start);
+
+        // Client: push payload on every Established flow (no can_send gate
+        // — dynamic tx buffer grows on first send_impl call).
+        for &(_h_srv, h_cli, _) in &slots {
+            let cs = client.sockets.get_mut::<tcp::Socket>(h_cli);
+            if cs.may_send() {
+                let _ = cs.send_slice(&payload);
+            }
+        }
+        client.iface.poll(now, &mut client.device, &mut client.sockets);
+        server.iface.poll(now, &mut server.device, &mut server.sockets);
+
+        // Server: drain. After receiving payload, abort the connection
+        // (skips TIME_WAIT so the slot recycles immediately). Client
+        // sees the RST and transitions to Closed on its next poll.
+        for &(h_srv, _h_cli, _) in &slots {
+            let ss = server.sockets.get_mut::<tcp::Socket>(h_srv);
+            if ss.can_recv()
+                && let Ok(n) = ss.recv_slice(&mut scratch)
+                && n > 0
+            {
+                bytes_xferred += n as u64;
+                ss.abort();
+                closed += 1;
+            }
+        }
+        server.iface.poll(now, &mut server.device, &mut server.sockets);
+        client.iface.poll(now, &mut client.device, &mut client.sockets);
+    }
+
+    let elapsed = start.elapsed().as_secs_f64();
+    let alloc_after = AllocSnap::now();
+    let conn_rate = opened as f64 / elapsed;
+    let close_rate = closed as f64 / elapsed;
+    let alloc_bytes = alloc_after.alloc_bytes - alloc_before.alloc_bytes;
+    let free_bytes = alloc_after.free_bytes - alloc_before.free_bytes;
+    let alloc_count = alloc_after.alloc_count - alloc_before.alloc_count;
+
+    println!("\n========== shape: churn ==========");
+    println!("  target rate:            {} conn/s", target_conn_per_sec);
+    println!("  slot ring size:         {SLOTS}");
+    println!("  elapsed:                {elapsed:.3}s");
+    println!("  opened:                 {opened}   ({conn_rate:.1} conn/s)");
+    println!("  closed:                 {closed}   ({close_rate:.1} conn/s)");
+    println!("  app bytes xfer:         {bytes_xferred}");
+    println!("  pool used (end):        {} KiB", pool.used() / 1024);
+    println!("  pool budget:            {} KiB", pool_bytes / 1024);
+    println!("  bytes allocated:        {alloc_bytes}");
+    println!("  bytes freed:            {free_bytes}");
+    println!("  net heap delta:         {}", alloc_bytes as i64 - free_bytes as i64);
+    println!("  allocation count:       {alloc_count}");
+}
+
+/// Mixed idle + active shape. Creates `n_idle` TCP sockets that never see
+/// data and `n_active` TCP sockets that run a steady-state echo workload.
+/// All share one [`tcp::MemoryPool`]. The point is to verify that lazy
+/// allocation keeps idle-flow memory at ~0 while active flows still hit
+/// full throughput.
+#[cfg(feature = "socket-tcp-dynamic-buffer")]
+fn shape_idle_hot(seconds: u64, n_idle: usize, n_active: usize, offload: bool) {
+    use std::time::Instant as StdInstant;
+
+    const MAX_BUF: u32 = 32 * 1024;
+    const PAYLOAD: usize = 1024;
+    let total = n_idle + n_active;
+    let qd = (total * 16).clamp(1024, 16384);
+    let lane_a: LaneRc = Rc::new(RefCell::new(Lane::new(1500, qd)));
+    let lane_b: LaneRc = Rc::new(RefCell::new(Lane::new(1500, qd)));
+    let pool_bytes: usize = (n_active * 2 + 1) * MAX_BUF as usize * 2;
+    let pool = tcp::MemoryPool::new(pool_bytes);
+
+    let mut server = make_endpoint(
+        IpAddress::v4(10, 0, 0, 1),
+        1500,
+        lane_a.clone(),
+        lane_b.clone(),
+        offload,
+    );
+    let mut client = make_endpoint(
+        IpAddress::v4(10, 0, 0, 2),
+        1500,
+        lane_b.clone(),
+        lane_a.clone(),
+        offload,
+    );
+
+    // Active flows: open & connect.
+    let mut srv_active: Vec<smoltcp::iface::SocketHandle> = Vec::with_capacity(n_active);
+    let mut cli_active: Vec<smoltcp::iface::SocketHandle> = Vec::with_capacity(n_active);
+    for i in 0..n_active {
+        let h_srv = add_tcp_socket_dyn(&mut server, MAX_BUF, &pool);
+        let h_cli = add_tcp_socket_dyn(&mut client, MAX_BUF, &pool);
+        let dst_port: u16 = 10_000u16.wrapping_add(i as u16);
+        let src_port: u16 = 30_000u16.wrapping_add(i as u16);
+        {
+            let s = server.sockets.get_mut::<tcp::Socket>(h_srv);
+            s.set_ack_delay(None);
+            s.set_nagle_enabled(false);
+            s.listen(dst_port).unwrap();
+        }
+        {
+            let c = client.sockets.get_mut::<tcp::Socket>(h_cli);
+            c.set_ack_delay(None);
+            c.set_nagle_enabled(false);
+        }
+        client
+            .sockets
+            .get_mut::<tcp::Socket>(h_cli)
+            .connect(
+                client.iface.context(),
+                (IpAddress::v4(10, 0, 0, 1), dst_port),
+                src_port,
+            )
+            .unwrap();
+        srv_active.push(h_srv);
+        cli_active.push(h_cli);
+    }
+
+    // Idle flows: create sockets, do not connect — they sit in Closed state
+    // and exercise the dyn-buffer footprint that idle sockets pay for.
+    for _ in 0..n_idle {
+        let _ = add_tcp_socket_dyn(&mut server, MAX_BUF, &pool);
+        let _ = add_tcp_socket_dyn(&mut client, MAX_BUF, &pool);
+    }
+
+    let rss_after_create = rss_bytes();
+    let pool_after_create = pool.used();
+
+    let alloc_before = AllocSnap::now();
+    let start = StdInstant::now();
+    let smol_now = |w0: StdInstant| Instant::from_micros(w0.elapsed().as_micros() as i64);
+
+    // Establish active flows.
+    let connect_deadline = start + std::time::Duration::from_secs(seconds.min(5));
+    let mut connect_iters = 0u64;
+    loop {
+        let now = smol_now(start);
+        server.iface.poll(now, &mut server.device, &mut server.sockets);
+        client.iface.poll(now, &mut client.device, &mut client.sockets);
+        let ready = cli_active
+            .iter()
+            .zip(srv_active.iter())
+            .all(|(&hc, &hs)| {
+                client.sockets.get::<tcp::Socket>(hc).may_send()
+                    && server.sockets.get::<tcp::Socket>(hs).may_recv()
+            });
+        connect_iters += 1;
+        if ready || StdInstant::now() >= connect_deadline {
+            // Diagnostic: how many flows are actually Established?
+            let est = cli_active
+                .iter()
+                .zip(srv_active.iter())
+                .filter(|&(&hc, &hs)| {
+                    matches!(
+                        client.sockets.get::<tcp::Socket>(hc).state(),
+                        tcp::State::Established
+                    ) && matches!(
+                        server.sockets.get::<tcp::Socket>(hs).state(),
+                        tcp::State::Established
+                    )
+                })
+                .count();
+            eprintln!(
+                "idle_hot connect: {connect_iters} iters, {est}/{} flows Established (ready={ready})",
+                n_active
+            );
+            if !ready && n_active > 0 {
+                let cs = client.sockets.get::<tcp::Socket>(cli_active[0]);
+                let ss = server.sockets.get::<tcp::Socket>(srv_active[0]);
+                eprintln!(
+                    "  flow[0]: client.state={:?} server.state={:?} \
+                     client.rx_cap={} client.tx_cap={} server.rx_cap={} server.tx_cap={}",
+                    cs.state(),
+                    ss.state(),
+                    cs.recv_capacity(),
+                    cs.send_capacity(),
+                    ss.recv_capacity(),
+                    ss.send_capacity(),
+                );
+            }
+            break;
+        }
+    }
+
+    // Steady-state echo on active flows only.
+    let mut sent: u64 = 0;
+    let mut recvd: u64 = 0;
+    let payload = vec![0xa5u8; PAYLOAD];
+    let mut sink = vec![0u8; PAYLOAD];
+    let deadline = start + std::time::Duration::from_secs(seconds);
+    while StdInstant::now() < deadline {
+        let now = smol_now(start);
+        for &h in &cli_active {
+            let s = client.sockets.get_mut::<tcp::Socket>(h);
+            if s.may_send()
+                && let Ok(n) = s.send_slice(&payload)
+            {
+                sent += n as u64;
+            }
+        }
+        client.iface.poll(now, &mut client.device, &mut client.sockets);
+        server.iface.poll(now, &mut server.device, &mut server.sockets);
+        for &h in &srv_active {
+            let s = server.sockets.get_mut::<tcp::Socket>(h);
+            while s.can_recv() {
+                match s.recv_slice(&mut sink) {
+                    Ok(r) if r > 0 => {
+                        recvd += r as u64;
+                        if s.may_send() {
+                            let _ = s.send_slice(&sink[..r]);
+                        }
+                    }
+                    _ => break,
+                }
+            }
+        }
+        server.iface.poll(now, &mut server.device, &mut server.sockets);
+        client.iface.poll(now, &mut client.device, &mut client.sockets);
+        for &h in &cli_active {
+            let s = client.sockets.get_mut::<tcp::Socket>(h);
+            while s.can_recv() {
+                if s.recv_slice(&mut sink).map(|r| r > 0).unwrap_or(false) {
+                    continue;
+                }
+                break;
+            }
+        }
+    }
+    let elapsed = start.elapsed().as_secs_f64();
+    let alloc_after = AllocSnap::now();
+    let pool_steady = pool.used();
+    let rss_end = rss_bytes();
+    let gbps = (recvd as f64 * 8.0) / elapsed / 1e9;
+
+    println!("\n========== shape: idle_hot ==========");
+    println!("  idle flows:             {n_idle}");
+    println!("  active flows:           {n_active}");
+    println!(
+        "  per-flow max budget:    {} KiB (rx) + {} KiB (tx)",
+        MAX_BUF / 1024,
+        MAX_BUF / 1024,
+    );
+    println!(
+        "  pool budget:            {} KiB",
+        pool_bytes / 1024
+    );
+    println!("  RSS post-create:        {} KiB", rss_after_create / 1024);
+    println!("  pool used post-create:  {} KiB  (expect ~0)", pool_after_create / 1024);
+    println!("  elapsed:                {elapsed:.3}s");
+    println!("  app sent / recvd:       {} / {}", sent, recvd);
+    println!("  active throughput:      {gbps:.3} Gbps");
+    println!("  pool used steady:       {} KiB", pool_steady / 1024);
+    println!("  RSS end:                {} KiB", rss_end / 1024);
+    let alloc_bytes = alloc_after.alloc_bytes - alloc_before.alloc_bytes;
+    let free_bytes = alloc_after.free_bytes - alloc_before.free_bytes;
+    let alloc_count = alloc_after.alloc_count - alloc_before.alloc_count;
+    println!("  bytes allocated:        {alloc_bytes}");
+    println!("  net heap delta:         {}", alloc_bytes as i64 - free_bytes as i64);
+    println!("  allocation count:       {alloc_count}");
+    println!(
+        "  expected: idle pool charge ≈ 0 KiB; steady should equal {} KiB (active flows × per-flow grown peak)",
+        (n_active * 2 * MAX_BUF as usize) / 1024
+    );
+}
+
 fn print_socket_sizes() {
     use core::mem::size_of;
     use smoltcp::socket;
@@ -1648,6 +2261,8 @@ fn main() {
 
     // Many-flow shapes interpret args[3] as the flow count and args[4] as the
     // offload flag; single-flow shapes interpret args[3] directly as offload.
+    // Pool-aware shapes (multi_tcp, churn, idle_hot) use args[3]/args[4]
+    // for their own knobs; offload is interpreted positionally per shape.
     let (n_flows, offload) = if shape.starts_with("many_") {
         let n: usize = args
             .get(3)
@@ -1655,6 +2270,9 @@ fn main() {
             .unwrap_or(100)
             .max(1);
         (Some(n), is_offload(args.get(4).map(String::as_str)))
+    } else if matches!(shape, "multi_tcp" | "churn" | "idle_hot") {
+        // For these shapes, offload is the 5th arg position.
+        (None, is_offload(args.get(5).map(String::as_str)))
     } else {
         (None, is_offload(args.get(3).map(String::as_str)))
     };
@@ -1690,9 +2308,27 @@ fn main() {
         }
         "many_tcp" => shape_many_tcp(seconds, n_flows.unwrap(), offload),
         "many_udp" => shape_many_udp(seconds, n_flows.unwrap(), offload),
+        #[cfg(feature = "socket-tcp-dynamic-buffer")]
+        "multi_tcp" => {
+            let n_threads: usize = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(2).max(1);
+            let flows: usize = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(50).max(1);
+            shape_multi_tcp(seconds, n_threads, flows, offload);
+        }
+        #[cfg(feature = "socket-tcp-dynamic-buffer")]
+        "churn" => {
+            let rate: usize = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(500).max(1);
+            shape_churn(seconds, rate, offload);
+        }
+        #[cfg(feature = "socket-tcp-dynamic-buffer")]
+        "idle_hot" => {
+            let n_idle: usize = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(500).max(0);
+            let n_active: usize = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(10).max(1);
+            shape_idle_hot(seconds, n_idle, n_active, offload);
+        }
         _ => {
             eprintln!(
-                "unknown shape '{shape}'. expected udp|small|pingpong|firehose|all|many_tcp|many_udp"
+                "unknown shape '{shape}'. expected udp|small|pingpong|firehose|all|many_tcp|many_udp\
+                 |multi_tcp|churn|idle_hot (last three need --features socket-tcp-dynamic-buffer)"
             );
             std::process::exit(2);
         }

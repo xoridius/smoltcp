@@ -54,9 +54,25 @@ pub struct MemoryPool {
     inner: Arc<MemoryPoolInner>,
 }
 
+/// Cache-line-aligned to keep `used` off the same line as the `Arc`
+/// strong/weak counts that precede it. Without this, every `Arc::clone`
+/// or `Drop` touches the cache line that `used` lives on — false-sharing-
+/// adjacent (it's true sharing of the line, false sharing of the field)
+/// and visible as cross-core LLC traffic on multi-Interface pool sharing.
+///
+/// Linux's per-CPU `mibs[]` arrays use the same idiom (`____cacheline_aligned`).
+#[repr(align(64))]
 #[derive(Debug)]
 struct MemoryPoolInner {
+    /// Immutable for the pool's lifetime; placed first so cold readers
+    /// only touch this cache line.
     budget: usize,
+    /// Hot atomic counter. `Relaxed` everywhere: we maintain a single
+    /// totally-ordered count, and no other memory writes are gated on
+    /// the counter's value (each Interface owns its own buffers; the
+    /// pool only tracks an aggregate sum). This matches Linux's
+    /// `proto_memory_allocated` atomic, which uses `atomic_long_add/sub`
+    /// with no explicit barriers.
     used: AtomicUsize,
 }
 
@@ -81,7 +97,7 @@ impl MemoryPool {
 
     /// Bytes currently charged against the pool by all sockets.
     pub fn used(&self) -> usize {
-        self.inner.used.load(Ordering::Acquire)
+        self.inner.used.load(Ordering::Relaxed)
     }
 
     /// Bytes still available for further growth (snapshot).
@@ -92,12 +108,15 @@ impl MemoryPool {
     /// Attempt to charge `bytes` against the budget.
     ///
     /// Returns `true` on success. On contention, retries via CAS until either
-    /// the charge succeeds or the budget is exceeded.
+    /// the charge succeeds or the budget is exceeded. Relaxed ordering: we
+    /// maintain a single counter with no other memory writes gated on its
+    /// value — atomic-RMW on x86 already implies the ordering we need, and
+    /// on ARM this drops the dmb/ldar/stlr fences we were paying for nothing.
     pub(crate) fn try_charge(&self, bytes: usize) -> bool {
         if bytes == 0 {
             return true;
         }
-        let mut current = self.inner.used.load(Ordering::Acquire);
+        let mut current = self.inner.used.load(Ordering::Relaxed);
         loop {
             let next = match current.checked_add(bytes) {
                 Some(n) if n <= self.inner.budget => n,
@@ -106,8 +125,8 @@ impl MemoryPool {
             match self.inner.used.compare_exchange_weak(
                 current,
                 next,
-                Ordering::AcqRel,
-                Ordering::Acquire,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
             ) {
                 Ok(_) => return true,
                 Err(now) => current = now,
@@ -115,12 +134,14 @@ impl MemoryPool {
         }
     }
 
-    /// Release `bytes` back to the budget.
+    /// Release `bytes` back to the budget. Relaxed ordering for the same
+    /// reason as `try_charge` — counter consistency is provided by the
+    /// atomic RMW itself.
     pub(crate) fn refund(&self, bytes: usize) {
         if bytes == 0 {
             return;
         }
-        self.inner.used.fetch_sub(bytes, Ordering::AcqRel);
+        self.inner.used.fetch_sub(bytes, Ordering::Relaxed);
     }
 
     /// Whether the pool is past its growth-throttle threshold (~75% used).
