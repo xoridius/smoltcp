@@ -640,6 +640,32 @@ allocator-on-hot-path slipped in (use `dhat` to localize).
 Non-zero `Pool post-create` is the canary: lazy allocation broken.
 `Pool steady` should equal `n_active × 2 × MAX_BUF` exactly.
 
+### 13.3.2 Context switches
+
+Every shape now prints `voluntary` / `nonvoluntary` context-switch
+counts read from `/proc/self/status`. Voluntary means a thread blocked
+or yielded; nonvoluntary means the OS scheduler preempted a running
+thread. Both should stay tiny in our spin-loop designs.
+
+Reference on a 4-core container, 5-second runs:
+
+| Shape | Voluntary | Nonvoluntary | Notes |
+|---|---:|---:|---|
+| `udp` (1 task) | 0 | ~4 | setup-dominated |
+| `many_tcp 200` (1 task) | 0 | ~5 | setup-dominated |
+| `multi_tcp × 1 thread × 30` | 1 | 0 | spawn/join + spin |
+| `multi_tcp × 4 threads × 30` | 1 | 0 | matches core count |
+| `multi_tcp × 8 threads × 30` | 9 | 0 | 2× oversubscribed |
+| `multi_tcp × 16 threads × 30` | 16 | 0 | 4× oversubscribed |
+| `multi_tcp × 32 threads × 30` | 19 | 2 | 8× oversubscribed |
+
+Nonvoluntary > 0 at any thread count where threads ≤ core count is a
+regression: it means something in our hot path is yielding, either via
+a syscall (allocator hitting `brk`?) or a Mutex contention path we don't
+own. Voluntary growing super-linearly with thread count signals a
+blocking synchronization primitive crept in — the `MemoryPool` CAS is
+lock-free and should never block.
+
 ### 13.4 Struct footprint (`sizecheck`)
 
 `size_of::<tcp::Socket>` on a 64-bit host:
