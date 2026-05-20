@@ -598,3 +598,112 @@ Across every shape:
 
 If allocation count tracks packet count instead of wall time, a
 `Vec::with_capacity` or boxing has crept into the hot path.
+
+## 14. Dynamic-buffer TCP sockets (`socket-tcp-dynamic-buffer`)
+
+Pool-backed, lazy, resizable rx/tx buffers for TCP. Opt-in. Designed
+for memory-constrained hosts that admit many concurrent flows — the
+iOS NetworkExtension case (~50 MiB jetsam ceiling, hundreds of TCP
+flows). Disabled by default; the legacy `Socket::new(rx_buf, tx_buf)`
+API is bit-for-bit unchanged.
+
+### 14.1 What it adds
+
+- `tcp::MemoryPool` — shared `AtomicUsize`-tracked byte budget, the
+  smoltcp analogue of Linux `tcp_memory_allocated` against `tcp_mem`.
+- `tcp::DynamicBufferConfig` — per-flow `{rx, tx} × {initial, max}` +
+  `grow_chunk`. Analogue of `tcp_rmem`/`tcp_wmem`.
+- `tcp::Socket::new_dynamic(config, Option<MemoryPool>)` — alternate
+  constructor. Buffers start at `initial`, grow geometrically on
+  pressure (mirrors Linux `tcp_rcv_space_adjust`/`tcp_sndbuf_expand`,
+  XNU `tcp_sbrcv_grow`), and release on `Closed`/`reset`/`Drop`.
+
+### 14.2 Canonical patterns mirrored
+
+| Pattern | Kernel | Here |
+|---|---|---|
+| Limit, not reservation | XNU `sbreserve` (no alloc); Linux `sk_rcvbuf` cap | `rx_max`/`tx_max` |
+| Global accounting | Linux `tcp_mem` low/pressure/high | `MemoryPool.budget` |
+| Lazy alloc on pressure | Linux `tcp_data_queue` charges on arrival; XNU mbuf chain | `try_grow_rx` at dispatch |
+| Pressure → window collapse | Linux `__tcp_select_window` zero | grow refuses → backpressure |
+| Pressure-tier autotune throttle | Linux `tcp_under_memory_pressure(sk)` gates `tcp_rcv_space_adjust` | `MemoryPool::under_pressure` (75% threshold) forces linear growth |
+| Geometric grow | Linux `copied << 1`; XNU ×2/×4 | `max(cur+chunk, cur×2)` |
+| Release on close | Linux `tcp_done` returns `sk_forward_alloc` | `set_state(Closed)` releases |
+| Fallible alloc | n/a (kernel context) | `Vec::try_reserve_exact` |
+
+### 14.3 Cost when feature is **off**
+
+Zero. The `dyn_state` field, the new module, all hooks — all
+`#[cfg(feature = "socket-tcp-dynamic-buffer")]`-gated.
+
+### 14.4 Cost when feature is **on** but not used (legacy API)
+
+- `tcp::Socket` grows by **8 bytes** (a `Option<Box<DynBufState>>`):
+  472 → 480.
+- The hot dispatch path gains a single null-pointer check (≤ 3 cycles)
+  before the conditional growth code (which is `#[cold]`).
+- Net measured cost: **~2 % UDP throughput** on the `udp` shape from
+  binary-layout shift (Socket enum size bound), TCP perf neutral.
+  Cannot reduce below ~2 % without separate compilation units.
+
+### 14.5 Cost when feature is **on** and used (`new_dynamic`)
+
+- Per-flow steady state: `Vec<u8>` per buffer sized to current
+  capacity (between `initial` and `max`).
+- Growth path: amortized O(rx_max) total memcpy across O(log(rx_max))
+  steps. Geometric.
+- Atomic CAS on each grow attempt (pool charge) and on each refund.
+  Single-thread per Interface; multi-Interface contention rare.
+
+### 14.6 Memory savings (idle flows)
+
+Per the `dynbuf_memcompare` example, 32 KiB rx + 32 KiB tx per flow:
+
+| N | Legacy fixed (KiB / flow) | Dynamic idle (KiB / flow) |
+|---:|---:|---:|
+| 100 | 55.0 | 0.0 |
+| 1000 | 55.0 | 0.4 |
+| 4000 | 55.0 | 0.5 |
+
+### 14.7 Test matrix additions
+
+Run alongside §3:
+
+```
+cargo test --release --lib --features socket-tcp-dynamic-buffer
+cargo test --release --lib --no-default-features \
+  --features "alloc,medium-ethernet,proto-ipv4,proto-ipv6,socket-raw,socket-udp,socket-tcp,socket-icmp,proto-ipv6-slaac,socket-tcp-dynamic-buffer"
+cargo +nightly miri test --lib --features socket-tcp-dynamic-buffer socket::tcp::test::dyn_buf
+cargo run --release --example dynbuf_memcompare --features socket-tcp-dynamic-buffer -- 1000
+```
+
+### 14.8 Upstream-sync surface
+
+Touched files:
+
+- `Cargo.toml` — feature decl, example registration.
+- `src/storage/ring_buffer.rs` — `try_grow` + `release_owned` (alloc-gated,
+  appended).
+- `src/socket/tcp.rs` — module decl, struct field, `new_dynamic`,
+  grow/release helpers, hooks in `dispatch`/`send_impl`/`set_state`/
+  `reset`. All `#[cfg(feature = "socket-tcp-dynamic-buffer")]`-gated.
+- `src/socket/tcp/dynbuf.rs` — new file, no conflict.
+- `examples/dynbuf_memcompare.rs` — new file.
+
+Conflict surface on `git merge upstream/main` is the cfg-gated additions
+in `tcp.rs`. Each hook is 4–6 lines, easy to re-apply if upstream
+restructures the surrounding code.
+
+### 14.9 Limitations
+
+- O(len) memcpy on each grow step (amortized to O(rx_max) by geometric
+  growth). True zero-copy chunked storage would require restructuring
+  `RingBuffer`; out of scope.
+- No per-RTT BDP autotuner (Linux `tcp_rcv_space_adjust` measures
+  bytes copied per RTT and grows proportionally). We use a simpler
+  "near-full → grow" trigger. Adequate for the iOS use case.
+- No OOO `Assembler` collapse / drop under pressure (Linux
+  `tcp_prune_ofo_queue`). `Assembler` is fixed-size, so unbounded
+  growth there is impossible anyway.
+- Per-flow `rx_max`/`tx_max` is fixed at `new_dynamic`. No setter
+  yet for runtime adjustment (analogous to `setsockopt(SO_RCVBUF)`).
