@@ -2005,7 +2005,7 @@ fn shape_churn(seconds: u64, target_conn_per_sec: usize, offload: bool) {
                 next_open_us += interval_us;
             }
             next_slot += 1;
-            if next_slot % SLOTS == 0 {
+            if next_slot.is_multiple_of(SLOTS) {
                 break; // one full sweep per outer iteration max
             }
         }
@@ -2148,7 +2148,6 @@ fn shape_idle_hot(seconds: u64, n_idle: usize, n_active: usize, offload: bool) {
 
     // Establish active flows.
     let connect_deadline = start + std::time::Duration::from_secs(seconds.min(5));
-    let mut connect_iters = 0u64;
     loop {
         let now = smol_now(start);
         server.iface.poll(now, &mut server.device, &mut server.sockets);
@@ -2160,38 +2159,24 @@ fn shape_idle_hot(seconds: u64, n_idle: usize, n_active: usize, offload: bool) {
                 client.sockets.get::<tcp::Socket>(hc).may_send()
                     && server.sockets.get::<tcp::Socket>(hs).may_recv()
             });
-        connect_iters += 1;
         if ready || StdInstant::now() >= connect_deadline {
-            // Diagnostic: how many flows are actually Established?
-            let est = cli_active
-                .iter()
-                .zip(srv_active.iter())
-                .filter(|&(&hc, &hs)| {
-                    matches!(
-                        client.sockets.get::<tcp::Socket>(hc).state(),
-                        tcp::State::Established
-                    ) && matches!(
-                        server.sockets.get::<tcp::Socket>(hs).state(),
-                        tcp::State::Established
-                    )
-                })
-                .count();
-            eprintln!(
-                "idle_hot connect: {connect_iters} iters, {est}/{} flows Established (ready={ready})",
-                n_active
-            );
             if !ready && n_active > 0 {
-                let cs = client.sockets.get::<tcp::Socket>(cli_active[0]);
-                let ss = server.sockets.get::<tcp::Socket>(srv_active[0]);
+                let est = cli_active
+                    .iter()
+                    .zip(srv_active.iter())
+                    .filter(|&(&hc, &hs)| {
+                        matches!(
+                            client.sockets.get::<tcp::Socket>(hc).state(),
+                            tcp::State::Established
+                        ) && matches!(
+                            server.sockets.get::<tcp::Socket>(hs).state(),
+                            tcp::State::Established
+                        )
+                    })
+                    .count();
                 eprintln!(
-                    "  flow[0]: client.state={:?} server.state={:?} \
-                     client.rx_cap={} client.tx_cap={} server.rx_cap={} server.tx_cap={}",
-                    cs.state(),
-                    ss.state(),
-                    cs.recv_capacity(),
-                    cs.send_capacity(),
-                    ss.recv_capacity(),
-                    ss.send_capacity(),
+                    "warning: only {est}/{n_active} idle_hot flows established within {} s",
+                    seconds.min(5)
                 );
             }
             break;

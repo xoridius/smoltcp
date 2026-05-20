@@ -21,7 +21,6 @@ fn rss_kib() -> usize {
     for line in s.lines() {
         if let Some(rest) = line.strip_prefix("VmRSS:") {
             let kib: usize = rest
-                .trim()
                 .split_whitespace()
                 .next()
                 .unwrap()
