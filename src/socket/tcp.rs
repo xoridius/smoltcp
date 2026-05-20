@@ -9943,5 +9943,28 @@ mod test {
             // Clamp at max even with linear.
             assert_eq!(Socket::next_capacity(60000, 4096, 65536, true), 64096);
         }
+
+        #[test]
+        fn release_is_idempotent() {
+            // Defensive: calling release twice (via abort then drop, or
+            // via close-then-reset, etc.) must not double-refund the pool.
+            let pool = MemoryPool::new(64 * 1024);
+            let cfg = DynamicBufferConfig::symmetric(4 * 1024, 32 * 1024, 4 * 1024);
+            let mut s = Socket::new_dynamic(cfg, Some(pool.clone()));
+            assert_eq!(pool.used(), 8 * 1024);
+            // Force more growth.
+            while s.try_grow_rx() {}
+            let charged = pool.used();
+            assert!(charged > 8 * 1024);
+            // First release via abort.
+            s.abort();
+            assert_eq!(pool.used(), 0);
+            // Re-set the state to simulate stale-state code paths.
+            s.set_state(State::Closed);
+            assert_eq!(pool.used(), 0);
+            // And Drop.
+            drop(s);
+            assert_eq!(pool.used(), 0);
+        }
     }
 }
