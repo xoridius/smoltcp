@@ -92,6 +92,26 @@ fn rss_bytes() -> u64 {
     0
 }
 
+/// Read voluntary + involuntary context-switch counts from
+/// /proc/self/status. Returns `(voluntary, nonvoluntary)`.
+/// Voluntary = process blocked / yielded (rare in our spin loops);
+/// nonvoluntary = preempted by the scheduler. Multi-thread shapes
+/// expect a small voluntary count and a nonvoluntary count proportional
+/// to N_threads × wall_time / time_slice.
+fn ctxsw_counts() -> (u64, u64) {
+    let s = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
+    let mut vol = 0u64;
+    let mut nvol = 0u64;
+    for line in s.lines() {
+        if let Some(rest) = line.strip_prefix("voluntary_ctxt_switches:") {
+            vol = rest.trim().parse().unwrap_or(0);
+        } else if let Some(rest) = line.strip_prefix("nonvoluntary_ctxt_switches:") {
+            nvol = rest.trim().parse().unwrap_or(0);
+        }
+    }
+    (vol, nvol)
+}
+
 /// Log-linear latency histogram: each power-of-two range [2^k, 2^(k+1)) is
 /// split into `SUBBUCKETS=16` linear sub-buckets of width `2^k / SUBBUCKETS`,
 /// giving ~6% relative error across the full range. Constant per-sample cost,
@@ -668,15 +688,24 @@ struct AllocSnap {
     /// Live bytes = alloc_bytes - free_bytes, used to show net heap growth.
     free_bytes: u64,
     rss: u64,
+    /// Voluntary context switches — process blocked or yielded.
+    /// Hot-loop shapes should see this stay tiny.
+    ctxsw_voluntary: u64,
+    /// Involuntary context switches — preempted by the scheduler.
+    /// Proportional to wall_time / scheduling_quantum × runnable_threads.
+    ctxsw_nonvoluntary: u64,
 }
 
 impl AllocSnap {
     fn now() -> Self {
+        let (cv, cn) = ctxsw_counts();
         Self {
             alloc_bytes: ALLOC_BYTES.load(Ordering::Relaxed),
             alloc_count: ALLOC_COUNT.load(Ordering::Relaxed),
             free_bytes: FREE_BYTES.load(Ordering::Relaxed),
             rss: rss_bytes(),
+            ctxsw_voluntary: cv,
+            ctxsw_nonvoluntary: cn,
         }
     }
 }
@@ -798,6 +827,18 @@ impl<'a> Report<'a> {
             self.alloc_after.rss,
             self.alloc_after.rss as f64 / (1024.0 * 1024.0)
         );
+
+        let cv = self.alloc_after.ctxsw_voluntary - self.alloc_before.ctxsw_voluntary;
+        let cn = self.alloc_after.ctxsw_nonvoluntary - self.alloc_before.ctxsw_nonvoluntary;
+        println!("  context switches:");
+        println!("    voluntary:            {cv:>10}  (process yields / blocks)");
+        println!("    nonvoluntary:         {cn:>10}  (scheduler preemption)");
+        if self.elapsed > 0.0 {
+            println!(
+                "    rate:                  {:>10.1} cs/s total",
+                (cv + cn) as f64 / self.elapsed
+            );
+        }
     }
 }
 
@@ -1656,6 +1697,7 @@ fn shape_multi_tcp(seconds: u64, n_threads: usize, flows_per_thread: usize, offl
     let pool = tcp::MemoryPool::new(pool_bytes);
 
     let barrier = Arc::new(Barrier::new(n_threads));
+    let (vol_before, nvol_before) = ctxsw_counts();
     let start_wall = StdInstant::now();
 
     let mut handles: Vec<thread::JoinHandle<(u64, u64, u64)>> = Vec::with_capacity(n_threads);
@@ -1797,6 +1839,9 @@ fn shape_multi_tcp(seconds: u64, n_threads: usize, flows_per_thread: usize, offl
 
     let results: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
     let total_secs = start_wall.elapsed().as_secs_f64();
+    let (vol_after, nvol_after) = ctxsw_counts();
+    let vol_delta = vol_after - vol_before;
+    let nvol_delta = nvol_after - nvol_before;
     let agg_sent: u64 = results.iter().map(|(s, _, _)| s).sum();
     let agg_recvd: u64 = results.iter().map(|(_, r, _)| r).sum();
     let agg_gbps = (agg_recvd as f64 * 8.0) / total_secs / 1e9;
@@ -1859,6 +1904,10 @@ fn shape_multi_tcp(seconds: u64, n_threads: usize, flows_per_thread: usize, offl
         "UNFAIR (pool contention or scheduling)"
     };
     println!("  verdict: {verdict}");
+    println!(
+        "  context switches:       {vol_delta} voluntary, {nvol_delta} nonvoluntary  ({:.0} cs/thread/s)",
+        (vol_delta + nvol_delta) as f64 / n_threads as f64 / total_secs
+    );
 }
 
 /// Connection-churn shape. Repeatedly opens and tears down TCP flows at
