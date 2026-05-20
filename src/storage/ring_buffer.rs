@@ -416,9 +416,12 @@ impl<'a, T: 'a + Copy + Default> RingBuffer<'a, T> {
     /// contents and their order. Returns `true` if the growth was applied.
     ///
     /// `false` is returned if storage is borrowed, if `new_capacity` does not
-    /// strictly exceed the current capacity, or if allocation fails.
+    /// strictly exceed the current capacity, or if allocation fails (via
+    /// `Vec::try_reserve_exact`). The latter matters on hosts with strict
+    /// memory accounting (Darwin); on overcommit hosts (Linux) and jetsam-
+    /// style hosts (iOS) malloc rarely returns NULL but we still surface
+    /// failure instead of panicking.
     pub fn try_grow(&mut self, new_capacity: usize) -> bool {
-        use alloc::vec;
         use alloc::vec::Vec;
 
         let old_capacity = self.capacity();
@@ -430,10 +433,14 @@ impl<'a, T: 'a + Copy + Default> RingBuffer<'a, T> {
             _ => return false,
         };
 
+        let mut new_vec: Vec<T> = Vec::new();
+        if new_vec.try_reserve_exact(new_capacity).is_err() {
+            return false;
+        }
+        new_vec.resize(new_capacity, T::default());
+
         let len = self.length;
         let read_at = self.read_at;
-        let mut new_vec: Vec<T> = vec![T::default(); new_capacity];
-
         if len > 0 && old_capacity > 0 {
             if read_at + len <= old_capacity {
                 new_vec[..len].copy_from_slice(&owned[read_at..read_at + len]);

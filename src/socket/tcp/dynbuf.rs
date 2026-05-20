@@ -122,6 +122,21 @@ impl MemoryPool {
         }
         self.inner.used.fetch_sub(bytes, Ordering::AcqRel);
     }
+
+    /// Whether the pool is past its growth-throttle threshold (~75% used).
+    ///
+    /// Above this point, individual sockets back off from geometric growth
+    /// to linear growth, leaving headroom for other sockets to claim. This
+    /// is the smoltcp analogue of Linux's `tcp_under_memory_pressure(sk)`
+    /// gate, which suppresses receive-window autotuning when
+    /// `memory_allocated > sysctl_mem[1]` (the middle of the three-tier
+    /// `tcp_mem` budget).
+    pub(crate) fn under_pressure(&self) -> bool {
+        // 75% threshold: budget × 3 / 4 ≤ used. Integer-arithmetic only.
+        let used = self.used();
+        let budget = self.budget();
+        used.saturating_mul(4) >= budget.saturating_mul(3)
+    }
 }
 
 /// Per-flow configuration for a dynamic-buffer TCP socket.
