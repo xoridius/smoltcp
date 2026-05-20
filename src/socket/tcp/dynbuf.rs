@@ -67,6 +67,11 @@ struct MemoryPoolInner {
     /// Immutable for the pool's lifetime; placed first so cold readers
     /// only touch this cache line.
     budget: usize,
+    /// Pre-computed `budget * 3 / 4`. The pressure-throttle gate in
+    /// `under_pressure` checks `used >= pressure_threshold`, replacing
+    /// two saturating multiplies on the hot path with a single load
+    /// and compare.
+    pressure_threshold: usize,
     /// Hot atomic counter. `Relaxed` everywhere: we maintain a single
     /// totally-ordered count, and no other memory writes are gated on
     /// the counter's value (each Interface owns its own buffers; the
@@ -82,9 +87,15 @@ impl MemoryPool {
     /// `budget` is the maximum sum of `rx_buffer.capacity() + tx_buffer.capacity()`
     /// across all sockets that share this pool.
     pub fn new(budget: usize) -> Self {
+        // 75 % threshold. Saturating math is overkill for any realistic
+        // budget; `usize::MAX / 4 * 3` is still ~13 EiB. Use plain * / 4
+        // (no overflow path), but keep saturating semantics for the
+        // pathological-input case so we never panic on a debug build.
+        let pressure_threshold = (budget / 4).saturating_mul(3);
         Self {
             inner: Arc::new(MemoryPoolInner {
                 budget,
+                pressure_threshold,
                 used: AtomicUsize::new(0),
             }),
         }
@@ -151,12 +162,10 @@ impl MemoryPool {
     /// is the smoltcp analogue of Linux's `tcp_under_memory_pressure(sk)`
     /// gate, which suppresses receive-window autotuning when
     /// `memory_allocated > sysctl_mem[1]` (the middle of the three-tier
-    /// `tcp_mem` budget).
+    /// `tcp_mem` budget). Threshold pre-computed at construction so the
+    /// hot path is one atomic load and one compare.
     pub(crate) fn under_pressure(&self) -> bool {
-        // 75% threshold: budget × 3 / 4 ≤ used. Integer-arithmetic only.
-        let used = self.used();
-        let budget = self.budget();
-        used.saturating_mul(4) >= budget.saturating_mul(3)
+        self.inner.used.load(Ordering::Relaxed) >= self.inner.pressure_threshold
     }
 }
 
