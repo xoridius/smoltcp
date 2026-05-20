@@ -3100,19 +3100,14 @@ impl<'a> fmt::Write for Socket<'a> {
     }
 }
 
-/// Refund any pool reservation on drop, so a leaked or forcibly-dropped
-/// `Socket` (e.g. removed from a `SocketSet`) returns memory immediately.
-///
-/// `release_dyn_buffers` is itself a no-op when `dyn_state` is `None`, so
-/// legacy fixed-buffer sockets that happen to be compiled with the feature
-/// enabled pay nothing here beyond a single null-pointer check.
-#[cfg(feature = "socket-tcp-dynamic-buffer")]
-impl<'a> Drop for Socket<'a> {
-    #[cold]
-    fn drop(&mut self) {
-        self.release_dyn_buffers();
-    }
-}
+// Pool refund-on-drop lives on `DynBufState`, not on `Socket`. Putting it
+// on `Socket` would add drop glue to the enclosing `socket::Socket`
+// enum and cost ~3–5 % UDP throughput in workloads that never touch a
+// dynamic-buffer TCP socket. Hanging the Drop off the inner state lets
+// the compiler synthesize the outer drop calls only when `dyn_state` is
+// `Some`. Set_state(Closed)/reset() still call `refund_all` explicitly
+// so the pool is returned eagerly on close; the Drop path here just
+// guarantees correctness on `SocketSet::remove` and teardown.
 
 // TODO: TCP should work for all features. For now, we only test with the IP feature. We could do
 // it for other features as well with rstest, however, this means we have to modify a lot of the

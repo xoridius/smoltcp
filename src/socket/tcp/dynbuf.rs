@@ -242,6 +242,17 @@ impl DynBufState {
     }
 }
 
+/// Refund the pool when the per-socket state is dropped — covers
+/// `SocketSet::remove`, SocketSet teardown, and any other path where a
+/// `Socket` is dropped without first going through `set_state(Closed)`
+/// or `reset()`. Idempotent: explicit close paths already call
+/// `refund_all` and leave `charged == 0` here.
+impl Drop for DynBufState {
+    fn drop(&mut self) {
+        self.refund_all();
+    }
+}
+
 #[cfg(test)]
 mod test {
     use super::*;
