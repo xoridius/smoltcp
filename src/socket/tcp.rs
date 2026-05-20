@@ -467,17 +467,6 @@ pub enum CongestionControl {
 /// Note that, for listening sockets, there is no "backlog"; to be able to simultaneously
 /// accept several connections, as many sockets must be allocated, or any new connection
 /// attempts will be reset.
-/// Bitflag indices for `Socket::flags`. Packing the bools into one byte
-/// removes ~8 bytes of inter-field padding the compiler would otherwise
-/// emit between scattered `bool`s — net effect on a 64-bit target is one
-/// fewer cache line per `Socket`.
-const FLAG_RX_FIN_RECEIVED: u8 = 1 << 0;
-const FLAG_REMOTE_LAST_WIN_UNSCALED: u8 = 1 << 1;
-const FLAG_REMOTE_HAS_SACK: u8 = 1 << 2;
-const FLAG_NAGLE: u8 = 1 << 3;
-#[cfg(feature = "socket-tcp-pause-synack")]
-const FLAG_SYNACK_PAUSED: u8 = 1 << 4;
-
 #[derive(Debug)]
 pub struct Socket<'a> {
     state: State,
@@ -534,9 +523,10 @@ pub struct Socket<'a> {
     /// The number of packets received directly after
     /// each other which have the same ACK number.
     local_rx_dup_acks: u8,
-    /// Packed bool flags. See `FLAG_*` constants above.
-    /// Members: rx_fin_received, remote_last_win_unscaled, remote_has_sack,
-    /// nagle, synack_paused (last only with `socket-tcp-pause-synack`).
+    /// Packed bool flags. Members: rx_fin_received, remote_last_win_unscaled,
+    /// remote_has_sack, nagle, synack_paused (last only with the
+    /// `socket-tcp-pause-synack` feature). Bit indices in the `FLAG_*`
+    /// constants below the struct; accessors live next to `set_state`.
     flags: u8,
 
     /// Duration for Delayed ACK. If None no ACKs will be delayed.
@@ -571,73 +561,18 @@ pub struct Socket<'a> {
 
 const DEFAULT_MSS: usize = 536;
 
-impl<'a> Socket<'a> {
-    /// Accessors for the packed bool flags. All compile to a single
-    /// AND + branch (read) or AND-with-mask + OR (write); no worse than
-    /// the original scattered bool fields, and saves cache footprint.
-    #[inline(always)]
-    fn rx_fin_received(&self) -> bool {
-        self.flags & FLAG_RX_FIN_RECEIVED != 0
-    }
-    #[inline(always)]
-    fn set_rx_fin_received(&mut self, v: bool) {
-        if v {
-            self.flags |= FLAG_RX_FIN_RECEIVED;
-        } else {
-            self.flags &= !FLAG_RX_FIN_RECEIVED;
-        }
-    }
-    #[inline(always)]
-    fn remote_last_win_unscaled(&self) -> bool {
-        self.flags & FLAG_REMOTE_LAST_WIN_UNSCALED != 0
-    }
-    #[inline(always)]
-    fn set_remote_last_win_unscaled(&mut self, v: bool) {
-        if v {
-            self.flags |= FLAG_REMOTE_LAST_WIN_UNSCALED;
-        } else {
-            self.flags &= !FLAG_REMOTE_LAST_WIN_UNSCALED;
-        }
-    }
-    #[inline(always)]
-    fn remote_has_sack(&self) -> bool {
-        self.flags & FLAG_REMOTE_HAS_SACK != 0
-    }
-    #[inline(always)]
-    fn set_remote_has_sack(&mut self, v: bool) {
-        if v {
-            self.flags |= FLAG_REMOTE_HAS_SACK;
-        } else {
-            self.flags &= !FLAG_REMOTE_HAS_SACK;
-        }
-    }
-    #[inline(always)]
-    fn nagle(&self) -> bool {
-        self.flags & FLAG_NAGLE != 0
-    }
-    #[inline(always)]
-    fn set_nagle(&mut self, v: bool) {
-        if v {
-            self.flags |= FLAG_NAGLE;
-        } else {
-            self.flags &= !FLAG_NAGLE;
-        }
-    }
-    #[cfg(feature = "socket-tcp-pause-synack")]
-    #[inline(always)]
-    fn synack_paused(&self) -> bool {
-        self.flags & FLAG_SYNACK_PAUSED != 0
-    }
-    #[cfg(feature = "socket-tcp-pause-synack")]
-    #[inline(always)]
-    fn set_synack_paused(&mut self, v: bool) {
-        if v {
-            self.flags |= FLAG_SYNACK_PAUSED;
-        } else {
-            self.flags &= !FLAG_SYNACK_PAUSED;
-        }
-    }
+// Bitflag indices for `Socket::flags`. Packing the five scattered bools
+// (rx_fin_received, remote_last_win_unscaled, remote_has_sack, nagle,
+// synack_paused) into one byte saves ~8 bytes of inter-field padding the
+// compiler would otherwise emit.
+const FLAG_RX_FIN_RECEIVED: u8 = 1 << 0;
+const FLAG_REMOTE_LAST_WIN_UNSCALED: u8 = 1 << 1;
+const FLAG_REMOTE_HAS_SACK: u8 = 1 << 2;
+const FLAG_NAGLE: u8 = 1 << 3;
+#[cfg(feature = "socket-tcp-pause-synack")]
+const FLAG_SYNACK_PAUSED: u8 = 1 << 4;
 
+impl<'a> Socket<'a> {
     #[allow(unused_comparisons)] // small usize platforms always pass rx_capacity check
     /// Create a socket using the given buffers.
     pub fn new<T>(rx_buffer: T, tx_buffer: T) -> Socket<'a>
@@ -1748,6 +1683,75 @@ impl<'a> Socket<'a> {
     /// Note that the Berkeley sockets interface does not have an equivalent of this API.
     pub fn recv_queue(&self) -> usize {
         self.rx_buffer.len()
+    }
+
+    // ===========================================================
+    // Packed-bool accessors. Each compiles to AND-with-mask + test
+    // (read) or AND/OR with the mask (write) — no worse than the
+    // original scattered bool fields, but with ~8 bytes less
+    // inter-field padding (see the `flags: u8` field).
+    // ===========================================================
+    #[inline(always)]
+    fn rx_fin_received(&self) -> bool {
+        self.flags & FLAG_RX_FIN_RECEIVED != 0
+    }
+    #[inline(always)]
+    fn set_rx_fin_received(&mut self, v: bool) {
+        if v {
+            self.flags |= FLAG_RX_FIN_RECEIVED;
+        } else {
+            self.flags &= !FLAG_RX_FIN_RECEIVED;
+        }
+    }
+    #[inline(always)]
+    fn remote_last_win_unscaled(&self) -> bool {
+        self.flags & FLAG_REMOTE_LAST_WIN_UNSCALED != 0
+    }
+    #[inline(always)]
+    fn set_remote_last_win_unscaled(&mut self, v: bool) {
+        if v {
+            self.flags |= FLAG_REMOTE_LAST_WIN_UNSCALED;
+        } else {
+            self.flags &= !FLAG_REMOTE_LAST_WIN_UNSCALED;
+        }
+    }
+    #[inline(always)]
+    fn remote_has_sack(&self) -> bool {
+        self.flags & FLAG_REMOTE_HAS_SACK != 0
+    }
+    #[inline(always)]
+    fn set_remote_has_sack(&mut self, v: bool) {
+        if v {
+            self.flags |= FLAG_REMOTE_HAS_SACK;
+        } else {
+            self.flags &= !FLAG_REMOTE_HAS_SACK;
+        }
+    }
+    #[inline(always)]
+    fn nagle(&self) -> bool {
+        self.flags & FLAG_NAGLE != 0
+    }
+    #[inline(always)]
+    fn set_nagle(&mut self, v: bool) {
+        if v {
+            self.flags |= FLAG_NAGLE;
+        } else {
+            self.flags &= !FLAG_NAGLE;
+        }
+    }
+    #[cfg(feature = "socket-tcp-pause-synack")]
+    #[inline(always)]
+    fn synack_paused(&self) -> bool {
+        self.flags & FLAG_SYNACK_PAUSED != 0
+    }
+    #[cfg(feature = "socket-tcp-pause-synack")]
+    #[inline(always)]
+    fn set_synack_paused(&mut self, v: bool) {
+        if v {
+            self.flags |= FLAG_SYNACK_PAUSED;
+        } else {
+            self.flags &= !FLAG_SYNACK_PAUSED;
+        }
     }
 
     fn set_state(&mut self, state: State) {
