@@ -2,3 +2,5 @@
 Cargo.lock
 *.pcap
 dhat-heap.json
+cachegrind.out.*
+callgrind.out.*
