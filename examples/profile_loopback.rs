@@ -1906,6 +1906,7 @@ fn shape_churn(seconds: u64, target_conn_per_sec: usize, offload: bool) {
 
     let alloc_before = AllocSnap::now();
     let start = StdInstant::now();
+    let mut mem_trace = MemTrace::start();
     let smol_now = |w0: StdInstant| Instant::from_micros(w0.elapsed().as_micros() as i64);
 
     let mut next_slot = 0usize;
@@ -1989,6 +1990,7 @@ fn shape_churn(seconds: u64, target_conn_per_sec: usize, offload: bool) {
         }
         server.iface.poll(now, &mut server.device, &mut server.sockets);
         client.iface.poll(now, &mut client.device, &mut client.sockets);
+        mem_trace.maybe_sample(250);
     }
 
     let elapsed = start.elapsed().as_secs_f64();
@@ -2012,6 +2014,7 @@ fn shape_churn(seconds: u64, target_conn_per_sec: usize, offload: bool) {
     println!("  bytes freed:            {free_bytes}");
     println!("  net heap delta:         {}", alloc_bytes as i64 - free_bytes as i64);
     println!("  allocation count:       {alloc_count}");
+    mem_trace.print();
 }
 
 /// Mixed idle + active shape. Creates `n_idle` TCP sockets that never see
@@ -2091,6 +2094,7 @@ fn shape_idle_hot(seconds: u64, n_idle: usize, n_active: usize, offload: bool) {
 
     let alloc_before = AllocSnap::now();
     let start = StdInstant::now();
+    let mut mem_trace = MemTrace::start();
     let smol_now = |w0: StdInstant| Instant::from_micros(w0.elapsed().as_micros() as i64);
 
     // Establish active flows.
@@ -2188,6 +2192,7 @@ fn shape_idle_hot(seconds: u64, n_idle: usize, n_active: usize, offload: bool) {
                 break;
             }
         }
+        mem_trace.maybe_sample(250);
     }
     let elapsed = start.elapsed().as_secs_f64();
     let alloc_after = AllocSnap::now();
@@ -2224,6 +2229,7 @@ fn shape_idle_hot(seconds: u64, n_idle: usize, n_active: usize, offload: bool) {
         "  expected: idle pool charge ≈ 0 KiB; steady should equal {} KiB (active flows × per-flow grown peak)",
         (n_active * 2 * MAX_BUF as usize) / 1024
     );
+    mem_trace.print();
 }
 
 fn print_socket_sizes() {
