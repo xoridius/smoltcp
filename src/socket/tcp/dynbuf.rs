@@ -79,6 +79,13 @@ struct MemoryPoolInner {
     /// `proto_memory_allocated` atomic, which uses `atomic_long_add/sub`
     /// with no explicit barriers.
     used: AtomicUsize,
+    /// Diagnostic: total CAS retries observed in `try_charge`. Each
+    /// failure of the CAS-weak loop bumps this once. Uncontended
+    /// single-thread use sees 0 retries; multi-Interface deployments
+    /// see retries proportional to inter-thread grow simultaneity.
+    /// Bounded growth of this counter under load is the
+    /// "bounded CAS retry rate" gate the multi-Interface bench checks.
+    cas_retries: AtomicUsize,
 }
 
 impl MemoryPool {
@@ -97,8 +104,18 @@ impl MemoryPool {
                 budget,
                 pressure_threshold,
                 used: AtomicUsize::new(0),
+                cas_retries: AtomicUsize::new(0),
             }),
         }
+    }
+
+    /// Total CAS retries observed in `try_charge` across this pool's
+    /// lifetime. Use as a diagnostic for multi-Interface contention:
+    /// uncontended single-thread sees zero; under realistic
+    /// many-Interface load it should grow much slower than the
+    /// `(charge_calls × threads)` upper bound.
+    pub fn cas_retries(&self) -> usize {
+        self.inner.cas_retries.load(Ordering::Relaxed)
     }
 
     /// Total byte budget configured for the pool.
@@ -128,10 +145,16 @@ impl MemoryPool {
             return true;
         }
         let mut current = self.inner.used.load(Ordering::Relaxed);
+        let mut retries: usize = 0;
         loop {
             let next = match current.checked_add(bytes) {
                 Some(n) if n <= self.inner.budget => n,
-                _ => return false,
+                _ => {
+                    if retries > 0 {
+                        self.inner.cas_retries.fetch_add(retries, Ordering::Relaxed);
+                    }
+                    return false;
+                }
             };
             match self.inner.used.compare_exchange_weak(
                 current,
@@ -139,8 +162,16 @@ impl MemoryPool {
                 Ordering::Relaxed,
                 Ordering::Relaxed,
             ) {
-                Ok(_) => return true,
-                Err(now) => current = now,
+                Ok(_) => {
+                    if retries > 0 {
+                        self.inner.cas_retries.fetch_add(retries, Ordering::Relaxed);
+                    }
+                    return true;
+                }
+                Err(now) => {
+                    retries += 1;
+                    current = now;
+                }
             }
         }
     }

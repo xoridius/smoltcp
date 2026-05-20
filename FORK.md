@@ -666,6 +666,23 @@ own. Voluntary growing super-linearly with thread count signals a
 blocking synchronization primitive crept in — the `MemoryPool` CAS is
 lock-free and should never block.
 
+**Pool CAS retries.** `multi_tcp` also reports `pool CAS retries:` —
+the count of `compare_exchange_weak` failures observed across all
+threads, surfaced via `MemoryPool::cas_retries()`. Bounded and
+sub-linear in thread count is the gate: the pool counter shouldn't
+become a serialization point.
+
+| Threads × flows | Aggregate Gbps | Retries (5 s) | Per-thread/s | Jain |
+|---:|---:|---:|---:|---:|
+| 4 × 30 | 20.5 | 24 | 1.2 | 0.9999 |
+| 8 × 30 | 20.5 | 46 | 1.1 | 0.9973 |
+| 16 × 30 | 20.2 | 79 | 1.0 | 0.9935 |
+| 32 × 30 | 19.7 | 57 | 0.4 | 0.9916 |
+
+Retries stay near 1 per thread per second even with 8× CPU
+oversubscription. The pool counter is a successful lock-free
+synchronization primitive at this contention level.
+
 ### 13.3.3 Per-shape CPU cost map (cachegrind + callgrind)
 
 `perf` isn't always available; in those environments `valgrind`'s
@@ -696,6 +713,22 @@ Interpretation:
 - Per-shape ratio of D refs to I refs: ~0.35–0.45 (typical for byte-
   stream processing). Pingpong runs cooler because handshake control
   flow dominates and payload copies are small.
+
+**IPC.** Cachegrind gives instruction count; the harness now also
+reports a TSC-based cycles-per-packet number (every shape that prints
+a `Report`). Dividing the two yields IPC:
+
+| Shape | I refs/pkt (cg) | cycles/pkt (native, TSC) | IPC |
+|---|---:|---:|---:|
+| `udp` | ~4030 | ~862 | **~4.7** |
+
+4.7 IPC is in the "well-pipelined, well-vectorized" zone on a modern
+x86 core (theoretical peak ~6 for Zen3/Golden Cove). Most of the
+remaining cycles are memory-bandwidth-bound on the `__memcpy` +
+`checksum::data` hot paths, not compute-bound. Other shapes have
+more variable work-unit semantics (bytes vs roundtrips vs flows) so
+the per-packet comparison requires native + cachegrind passes with
+matched workloads; the harness prints all the inputs you need.
 
 Callgrind top symbols on `udp`:
 

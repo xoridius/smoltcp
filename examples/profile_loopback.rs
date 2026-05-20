@@ -694,6 +694,46 @@ struct AllocSnap {
     /// Involuntary context switches — preempted by the scheduler.
     /// Proportional to wall_time / scheduling_quantum × runnable_threads.
     ctxsw_nonvoluntary: u64,
+    /// Calling-thread user CPU time, nanoseconds. Pairs with the TSC
+    /// snapshot below to estimate the effective CPU frequency we ran
+    /// at, which the `Report` then uses to convert cachegrind's
+    /// instruction count into an IPC ratio.
+    cpu_ns: u64,
+    /// Time-stamp counter snapshot. On x86 this is rdtsc; on other
+    /// archs it's zero (we just skip the IPC calculation).
+    tsc: u64,
+}
+
+/// `CLOCK_THREAD_CPUTIME_ID` in nanoseconds. Caller thread's user CPU
+/// time only. Returns 0 on unsupported platforms; we just skip the
+/// IPC line in that case.
+fn thread_cpu_ns() -> u64 {
+    #[cfg(target_os = "linux")]
+    {
+        let mut ts: libc::timespec = unsafe { std::mem::zeroed() };
+        if unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut ts) } == 0 {
+            return (ts.tv_sec as u64) * 1_000_000_000 + (ts.tv_nsec as u64);
+        }
+        0
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        0
+    }
+}
+
+/// Read the x86 timestamp counter. Each tick is one core cycle (modulo
+/// invariant-TSC behavior, which has been ubiquitous since ~2010).
+/// Cheap (~20 cycles), so safe to call at run boundaries.
+fn read_tsc() -> u64 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        unsafe { core::arch::x86_64::_rdtsc() }
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        0
+    }
 }
 
 impl AllocSnap {
@@ -706,6 +746,8 @@ impl AllocSnap {
             rss: rss_bytes(),
             ctxsw_voluntary: cv,
             ctxsw_nonvoluntary: cn,
+            cpu_ns: thread_cpu_ns(),
+            tsc: read_tsc(),
         }
     }
 }
@@ -838,6 +880,32 @@ impl<'a> Report<'a> {
                 "    rate:                  {:>10.1} cs/s total",
                 (cv + cn) as f64 / self.elapsed
             );
+        }
+
+        // CPU-time + TSC: lets us compute an effective CPU frequency
+        // (cycles/sec) and report cycles-per-packet alongside the
+        // wall-clock ns/packet number. Cachegrind already has the
+        // instruction count; combining the two yields IPC.
+        let cpu_ns = self.alloc_after.cpu_ns.saturating_sub(self.alloc_before.cpu_ns);
+        let tsc_d = self.alloc_after.tsc.saturating_sub(self.alloc_before.tsc);
+        if cpu_ns > 0 && tsc_d > 0 {
+            let eff_ghz = tsc_d as f64 / cpu_ns as f64;
+            println!("  CPU:");
+            println!(
+                "    user time:            {:>10.3} s   ({:.3}% of wall)",
+                cpu_ns as f64 / 1e9,
+                (cpu_ns as f64 / 1e9) / self.elapsed * 100.0,
+            );
+            println!(
+                "    TSC ticks:            {:>10}   (~{eff_ghz:.3} GHz effective)",
+                tsc_d
+            );
+            if self.wire_packets > 0 {
+                let cycles_per_pkt = tsc_d as f64 / self.wire_packets as f64;
+                println!(
+                    "    cycles/pkt:            {cycles_per_pkt:>9.1}  (use cachegrind I refs / this for IPC)"
+                );
+            }
         }
     }
 }
@@ -1907,6 +1975,11 @@ fn shape_multi_tcp(seconds: u64, n_threads: usize, flows_per_thread: usize, offl
     println!(
         "  context switches:       {vol_delta} voluntary, {nvol_delta} nonvoluntary  ({:.0} cs/thread/s)",
         (vol_delta + nvol_delta) as f64 / n_threads as f64 / total_secs
+    );
+    let cas_retries = pool.cas_retries();
+    println!(
+        "  pool CAS retries:       {cas_retries}  ({:.1} retries/thread/s)",
+        cas_retries as f64 / n_threads as f64 / total_secs
     );
 }
 
