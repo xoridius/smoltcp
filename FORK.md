@@ -646,9 +646,20 @@ Non-zero `Pool post-create` is the canary: lazy allocation broken.
 
 | Feature set | Size |
 |---:|---:|
-| default | ~464 B |
-| `socket-tcp-reno` | ~488 B |
-| `socket-tcp-cubic` | ~512 B |
+| default | 464 B |
+| `socket-tcp-dynamic-buffer` | 472 B |
+| `socket-tcp-reno` | 488 B |
+| `socket-tcp-cubic` | 512 B |
+
+The 5 scattered `bool` fields (`rx_fin_received`, `remote_last_win_unscaled`,
+`remote_has_sack`, `nagle`, `synack_paused`) are packed into a single
+`flags: u8`. This recovers ~8 B of inter-field padding the compiler would
+otherwise emit between bools, so enabling `socket-tcp-dynamic-buffer`
+(which adds an `Option<Box<DynBufState>>` = 8 B field) lands at the same
+size as default *was* before the pack. Read/write goes through small
+`#[inline(always)]` accessors that compile to a single AND-with-mask
+plus a branch (read) or AND/OR (write) — same hot-path cost as the
+original bool field access.
 
 These move on any field-type or congestion-controller field change.
 Record the new values in the commit that moves them.
