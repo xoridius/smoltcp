@@ -132,6 +132,35 @@ Report fields to read:
 | `RSS verdict` | `bounded` or `GROWTH`. GROWTH means the median RSS over the run is materially smaller than the final RSS — leak suspect. |
 | `net heap delta` | Should be a small constant (each periodic `/proc/self/status` read accounts for it). Non-constant values mean smoltcp itself allocated on the hot path → bug. |
 
+### 4.2.1 Dynamic-buffer / multi-thread shapes
+
+Three shapes that require `--features socket-tcp-dynamic-buffer`. They
+exercise the pool-backed dynamic-buffer paths (§14) under workloads
+that the legacy `many_tcp` / `many_udp` shapes don't cover.
+
+```
+# Multi-Interface pool contention: N threads, M flows each, shared MemoryPool.
+cargo run --release --example profile_loopback --features socket-tcp-dynamic-buffer \
+  -- multi_tcp <seconds> <n_threads> <flows_per_thread>
+
+# Connection churn: open/close at the target rate; verifies pool refund
+# accounting under high lifecycle pressure.
+cargo run --release --example profile_loopback --features socket-tcp-dynamic-buffer \
+  -- churn <seconds> <conn_per_sec>
+
+# Mixed idle + active: many idle sockets + few hot ones.
+cargo run --release --example profile_loopback --features socket-tcp-dynamic-buffer \
+  -- idle_hot <seconds> <n_idle> <n_active>
+```
+
+What each catches:
+
+| Shape | What's measured | What a regression looks like |
+|---|---|---|
+| `multi_tcp` | aggregate throughput scaling, per-thread Jain across `MemoryPool` contention | `Jain < 0.95` or aggregate throughput drops by >10 % at N=4 threads relative to N=1 |
+| `churn` | open+close rate sustained, `pool used` returns to 0, `net heap delta` bounded | `pool used (end) > 0` (leaked reservations); `net heap delta` growing with rate (allocator-on-hot-path) |
+| `idle_hot` | `pool used post-create == 0` for idle flows; steady-state pool = N_active × 2 × MAX_BUF | non-zero charge from idle sockets (lazy alloc broken); active flows can't reach max (grow policy broken) |
+
 ### 4.3 Configuration variants worth measuring
 
 **Checksum offload:**
@@ -572,6 +601,44 @@ because of the IW10 first-RTT ramp; bulk shapes barely move.
 
 Jain < 0.95 at any flow count is a regression: scheduling or socket-pump
 ordering. RSS verdict ≠ `bounded` is a leak or unbounded buffer growth.
+
+### 13.3.1 Dynamic-buffer / multi-thread shapes
+
+Reference numbers from a containerized x86_64 host (high noise floor;
+ratios more durable than absolute Gbps).
+
+`multi_tcp` aggregate Gbps and Jain across threads:
+
+| Threads × flows/thread | Total flows | Aggregate Gbps | Jain |
+|---|---:|---:|---:|
+| 2 × 30 | 60 | ~7.5 | ≥0.99 |
+| 4 × 20 | 80 | ~11.7 | ≥0.98 |
+
+Sub-linear scaling at 4 threads is expected (each thread is fully
+CPU-bound). Jain < 0.95 across threads suggests `MemoryPool` cache-
+line contention regressed (verify §14 `#[repr(align(64))]` is intact).
+
+`churn` sustained connections/sec and pool balance:
+
+| Target rate | Achieved | Pool end | Net heap delta |
+|---:|---:|---:|---:|
+| 500 conn/s | 500 conn/s | 0 KiB | ~256 B |
+| 1000 conn/s | 1000 conn/s | 0 KiB | ~256 B |
+| 2000 conn/s | 2000 conn/s | 0 KiB | ~256 B |
+
+`pool end != 0` means the refund path leaked (regression to debug at
+§14 release sites). `net heap delta` proportional to rate means an
+allocator-on-hot-path slipped in (use `dhat` to localize).
+
+`idle_hot` per-flow accounting:
+
+| n_idle + n_active | Pool post-create | Pool steady | Idle/flow |
+|---|---:|---:|---:|
+| 200 + 10 | 0 KiB | 640 KiB | 0 B |
+| 1000 + 0 | 0 KiB | 0 KiB | 0 B |
+
+Non-zero `Pool post-create` is the canary: lazy allocation broken.
+`Pool steady` should equal `n_active × 2 × MAX_BUF` exactly.
 
 ### 13.4 Struct footprint (`sizecheck`)
 
