@@ -666,6 +666,84 @@ own. Voluntary growing super-linearly with thread count signals a
 blocking synchronization primitive crept in — the `MemoryPool` CAS is
 lock-free and should never block.
 
+### 13.3.3 Per-shape CPU cost map (cachegrind + callgrind)
+
+`perf` isn't always available; in those environments `valgrind`'s
+simulated cache/branch model gives a stable cross-shape baseline.
+Numbers below are from 1-second runs on x86_64; valgrind slows each
+run ~30–50×, but the per-iteration ratios stay representative.
+
+```
+valgrind --tool=cachegrind --cache-sim=yes --branch-sim=yes \
+  target/release/examples/profile_loopback <shape> 1
+```
+
+| Shape | I refs | D refs (R/W) | Mispred rate | LL miss rate |
+|---|---:|---:|---:|---:|
+| `udp` | 264 M | 74 M / 41 M | 1.9 % | 0.0 % |
+| `small` | 97 M | 24 M / 16 M | 2.4 % | 0.0 % |
+| `pingpong` | 73 M | 18 M / 12 M | 2.5 % | 0.0 % |
+| `firehose` | 158 M | 45 M / 31 M | 1.3 % | 0.0 % |
+| `many_tcp N=50` | 243 M | 59 M / 30 M | 0.7 % | 0.0 % |
+| `many_udp N=50` | 162 M | 40 M / 28 M | 0.6 % | 0.0 % |
+
+Interpretation:
+- LL miss rate at 0.0 % everywhere → working set fits L3. Regressions
+  that push this above 0.5 % indicate a per-flow data-structure bloat.
+- Branch mispred at ~1–3 %, lower on bulky / many-flow shapes (more
+  predictable instruction streams). Regressions above 5 % point at a
+  hot-path conditional whose direction is unpredictable.
+- Per-shape ratio of D refs to I refs: ~0.35–0.45 (typical for byte-
+  stream processing). Pingpong runs cooler because handshake control
+  flow dominates and payload copies are small.
+
+Callgrind top symbols on `udp`:
+
+| % self-cost | Function |
+|---:|---|
+| 19 + 5 + 2 + 1 = ~27 % | `smoltcp::wire::ip::checksum::data` (vectorized; FORK.md §5.1 predicts top-3) |
+| 17 % | `__memcpy_avx_unaligned_erms` (libc; structurally unavoidable per FORK.md §11 zero-copy disclaimer) |
+| 3 % | `RingBuffer::dequeue_one_with` |
+| 3 % | `PacketBuffer::enqueue` |
+| 2.5 % | `process_ipv4` |
+| 2 % | `Interface::poll` |
+| 1.7 % | `dispatch_ip` |
+| 1.6 % | `Ipv4::Repr::parse` |
+| 1.4 % | `process_udp` |
+| 1.4 % | `socket::udp::Socket::recv_slice` |
+
+The top-of-profile shape (`checksum::data` + `memcpy` + state machine)
+exactly matches FORK.md §5.1's predictions for any reasonable workload.
+The dynamic-buffer feature's `try_grow_*` / `release_dyn_buffers` /
+`MemoryPool` symbols do **not** appear in the top 20 — `#[cold]` is
+doing its job.
+
+### 13.3.4 Per-callsite heap attribution (dhat)
+
+```
+cargo build --release --example profile_loopback \
+  --features socket-tcp-dynamic-buffer,dhat-heap
+target/release/examples/profile_loopback many_tcp 3 100
+# Reads dhat-heap.json
+```
+
+Top callsites by total bytes allocated (lifetime, not steady-state):
+
+| Bytes | Callsite |
+|---:|---|
+| 4.80 MB | `profile_loopback::Packet::with_capacity` (lane buffer pool — 1500 B × queue depth × 2 lanes) |
+| 1.64 MB | `profile_loopback::add_tcp_socket` (100 sockets × 16 KB rx+tx) |
+| 258 KB | `smoltcp::iface::socket_set::SocketSet::add` (slab growth) |
+| 205 KB | `profile_loopback::Lane::new` (VecDeque + pool Vec) |
+| 61 KB | `profile_loopback::rss_bytes` (periodic `/proc/self/status` reads) |
+| 8 KB | `profile_loopback::ctxsw_counts` (periodic `/proc/self/status` reads) |
+
+Smoltcp internals (`process_ipv4`, `dispatch_ip`, `Interface::poll`,
+…) **do not appear** — confirming the "smoltcp itself does not
+allocate on the hot path" invariant (FORK.md §6.5). Hot-path
+allocations live entirely in the harness's lane pool and in the
+sampling-instrumentation `/proc` reads.
+
 ### 13.4 Struct footprint (`sizecheck`)
 
 `size_of::<tcp::Socket>` on a 64-bit host:
