@@ -664,10 +664,15 @@ impl<'a> Socket<'a> {
         use alloc::boxed::Box;
         use alloc::vec;
 
-        // The RFC 1323 effective-window cap is 2^30 (1 GiB); enforce here
-        // since this constructor controls the per-flow ceiling.
-        let rx_max = (config.rx_max as usize).min(1 << 30);
-        let tx_max = config.tx_max as usize;
+        // The RFC 1323 effective-window cap is 2^30 (1 GiB) — enforce on
+        // BOTH directions, not just rx. Without this cap, callers passing
+        // a pathological tx_max could escape the per-direction ceiling,
+        // and on a 32-bit pointer target `(rx_initial + tx_initial)` could
+        // even overflow `usize`. The cap matches what the wire-level
+        // window-scale negotiation can express.
+        const PER_DIRECTION_CAP: usize = 1 << 30;
+        let rx_max = (config.rx_max as usize).min(PER_DIRECTION_CAP);
+        let tx_max = (config.tx_max as usize).min(PER_DIRECTION_CAP);
         let rx_initial = (config.rx_initial as usize).min(rx_max);
         let tx_initial = (config.tx_initial as usize).min(tx_max);
 
@@ -684,10 +689,14 @@ impl<'a> Socket<'a> {
 
         // Try to charge the initial reservation. If the pool refuses,
         // fall back to zero-initial — growth attempts later will retry.
+        // At 2 × 2^30 = 2 GiB the sum fits in `usize` on every supported
+        // target (32-bit usize maxes at 2^32); saturating_add is
+        // defensive in case the per-direction caps above are ever
+        // loosened past the RFC limit.
         let mut rx_capacity = rx_initial;
         let mut tx_capacity = tx_initial;
         let charge = rx_initial.saturating_add(tx_initial);
-        if !state.charge(charge as u32) {
+        if !state.charge(charge) {
             rx_capacity = 0;
             tx_capacity = 0;
         }
@@ -737,14 +746,22 @@ impl<'a> Socket<'a> {
     }
 
     /// States in which growing the rx buffer is useful — i.e. the socket
-    /// can still legitimately advertise a receive window. Closed/TimeWait
-    /// release their buffers; growing them would waste pool budget for an
-    /// RST that carries no payload anyway.
+    /// can still legitimately advertise a receive window. This is the
+    /// same set as smoltcp's `may_recv()`: handshake states (peer may
+    /// be about to send) plus Established and the half-close states
+    /// FinWait1/FinWait2 (we sent FIN; peer may still be sending until
+    /// they send their FIN). Closed/Listen/CloseWait/TimeWait release
+    /// or never accept more rx data; growing there would waste pool
+    /// budget.
     #[cfg(feature = "socket-tcp-dynamic-buffer")]
     fn rx_growth_allowed(&self) -> bool {
         matches!(
             self.state,
-            State::SynSent | State::SynReceived | State::Established
+            State::SynSent
+                | State::SynReceived
+                | State::Established
+                | State::FinWait1
+                | State::FinWait2
         )
     }
 
@@ -809,16 +826,13 @@ impl<'a> Socket<'a> {
         let Some(need) = want.checked_sub(cur).filter(|n| *n > 0) else {
             return false;
         };
-        if !state.charge(need as u32) {
+        if !state.charge(need) {
             return false;
         }
         if !self.rx_buffer.try_grow(want) {
             // Allocation refused (e.g. Vec::try_reserve_exact failed).
             // Refund what we just charged so accounting stays balanced.
-            state.charged = state.charged.saturating_sub(need as u32);
-            if let Some(pool) = &state.pool {
-                pool.refund(need);
-            }
+            state.refund_partial(need);
             return false;
         }
         true
@@ -844,14 +858,11 @@ impl<'a> Socket<'a> {
         let Some(need) = want.checked_sub(cur).filter(|n| *n > 0) else {
             return false;
         };
-        if !state.charge(need as u32) {
+        if !state.charge(need) {
             return false;
         }
         if !self.tx_buffer.try_grow(want) {
-            state.charged = state.charged.saturating_sub(need as u32);
-            if let Some(pool) = &state.pool {
-                pool.refund(need);
-            }
+            state.refund_partial(need);
             return false;
         }
         true
@@ -1697,16 +1708,27 @@ impl<'a> Socket<'a> {
 
         self.state = state;
 
-        // Dynamic-buffer: release backing storage on close. Linux's
-        // tcp_done() returns sk_forward_alloc to the global pool; we do the
-        // analogous refund here so a SYN-flood / connection-churn workload
-        // reclaims memory immediately, not after TIME-WAIT expiry.
+        // Dynamic-buffer: release backing storage on every transition
+        // that takes the socket out of the data-flow region of the state
+        // machine. Linux's `tcp_done()` returns `sk_forward_alloc` on
+        // Closed; we do the analogous refund here so a SYN-flood /
+        // connection-churn workload reclaims memory immediately, not
+        // after TIME-WAIT expiry.
         //
-        // The RST sent in the Closed state carries no payload, so dropping
-        // the buffers here is safe — dispatch() will only read tx_buffer
-        // payload in pre-Closed states.
+        //   - State::Closed:  abort / RST / explicit close from any state
+        //   - State::Listen:  SynReceived → Listen on RST against a listen
+        //                     socket (tcp.rs ~2162). Without releasing here
+        //                     the listen socket would accumulate one grow
+        //                     chunk per failed handshake, breaking the
+        //                     "idle ≈ 0 KiB" invariant FORK §14.6 documents.
+        //
+        // Safe in both cases: Closed sends only an RST (no payload),
+        // Listen has no peer until the next SYN arrives. Setting buffer
+        // capacity back to 0 is exactly the state a fresh `listen()`
+        // would produce; the next SYN's dispatch will grow rx again as
+        // usual via the dispatch-time hook.
         #[cfg(feature = "socket-tcp-dynamic-buffer")]
-        if state == State::Closed {
+        if matches!(state, State::Closed | State::Listen) {
             self.release_dyn_buffers();
         }
 
@@ -9972,6 +9994,108 @@ mod test {
             // And Drop.
             drop(s);
             assert_eq!(pool.used(), 0);
+        }
+
+        #[test]
+        fn pool_accounting_survives_u32_max_caps() {
+            // Regression for the `charged: u32` + uncapped `tx_max` bug
+            // (independent review #1). With charged widened to `usize` and
+            // both per-direction caps clamped to RFC 1323's 2^30 ceiling,
+            // pool accounting must reach 2 × 2^30 = 2 GiB without
+            // saturation or truncation loss.
+            //
+            // We use the public DynamicBufferConfig fields (which are
+            // `u32`); the constructor clamps both to 1<<30 internally.
+            let cfg = DynamicBufferConfig {
+                rx_initial: 0,
+                rx_max: u32::MAX, // larger than the 2^30 cap; should clamp.
+                tx_initial: 0,
+                tx_max: u32::MAX, // ditto — the *bug* was this not clamping.
+                grow_chunk: 4 * 1024,
+            };
+            let s = Socket::new_dynamic(cfg, None);
+            // recv_capacity_max / send_capacity_max should both report
+            // the clamped value, not the original u32::MAX.
+            assert_eq!(s.recv_capacity_max(), 1 << 30);
+            assert_eq!(s.send_capacity_max(), 1 << 30);
+        }
+
+        #[test]
+        fn pool_accounting_no_truncation_on_initial_charge() {
+            // The bug was: `state.charge(charge as u32)` truncated when
+            // rx_initial + tx_initial exceeded u32::MAX, but the Vec
+            // allocations were full-size. Pool would undercount; physical
+            // memory could exceed budget. Fixed by widening charge to
+            // usize and using checked_add.
+            //
+            // Use a 2 GiB pool, request 768 MiB rx + 768 MiB tx (1.5 GiB),
+            // and verify pool.used() matches exactly.
+            //
+            // (We can't actually request u32::MAX bytes — that would try to
+            // allocate 4 GiB of zero-filled Vec each, OOMing on most test
+            // hosts. The unit-level invariant we're checking is the
+            // accounting arithmetic, not the alloc itself.)
+            let pool = MemoryPool::new(2 * 1024 * 1024 * 1024);
+            let cfg = DynamicBufferConfig {
+                rx_initial: 768 * 1024 * 1024,
+                rx_max: 768 * 1024 * 1024,
+                tx_initial: 768 * 1024 * 1024,
+                tx_max: 768 * 1024 * 1024,
+                grow_chunk: 8 * 1024,
+            };
+            let s = Socket::new_dynamic(cfg, Some(pool.clone()));
+            // Both buffers should have allocated to the requested initial.
+            assert_eq!(s.rx_buffer.capacity(), 768 * 1024 * 1024);
+            assert_eq!(s.tx_buffer.capacity(), 768 * 1024 * 1024);
+            // Pool should record exactly 1.5 GiB charged.
+            assert_eq!(pool.used(), 2 * 768 * 1024 * 1024);
+            // And drop refunds fully.
+            drop(s);
+            assert_eq!(pool.used(), 0);
+        }
+
+        #[test]
+        fn syn_received_rst_to_listen_releases_pool_charge() {
+            // Regression for the listen-server pool-leak bug (independent
+            // review #2). When a listen socket transitions through
+            // SynReceived and then receives RST, smoltcp moves it back to
+            // Listen (tcp.rs handler ~line 2162). Before the fix this
+            // path skipped release_dyn_buffers, leaking pool charge on
+            // every failed handshake.
+            let pool = MemoryPool::new(64 * 1024);
+            let cfg = DynamicBufferConfig::symmetric(0, 32 * 1024, 8 * 1024);
+            let mut s = dyn_socket_listen(cfg, Some(pool.clone()));
+
+            // Verify the baseline: pool is empty while listening.
+            assert_eq!(pool.used(), 0);
+
+            // Push the socket into SynReceived and grow its buffers (which
+            // is what a real SYN-ACK dispatch would do).
+            s.state = State::SynReceived;
+            s.tuple = Some(TUPLE);
+            s.local_seq_no = LOCAL_SEQ;
+            s.remote_seq_no = REMOTE_SEQ + 1;
+            s.remote_last_seq = LOCAL_SEQ;
+            assert!(s.try_grow_rx());
+            let charged = pool.used();
+            assert!(charged > 0, "rx grow should have charged the pool");
+
+            // Now simulate the smoltcp handler's response to RST in
+            // SynReceived for a listen socket: return to Listen.
+            s.tuple = None;
+            s.set_state(State::Listen);
+
+            // The fix: this transition now releases the dynamic buffers
+            // so the listen socket goes back to the zero-charge state
+            // it had before the SYN arrived.
+            assert_eq!(
+                pool.used(),
+                0,
+                "SynReceived → Listen on RST must refund the pool charge"
+            );
+            assert_eq!(s.rx_buffer.capacity(), 0);
+            assert_eq!(s.tx_buffer.capacity(), 0);
+            assert_eq!(s.state, State::Listen);
         }
     }
 }

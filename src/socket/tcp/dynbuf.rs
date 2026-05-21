@@ -261,8 +261,12 @@ pub(super) struct DynBufState {
     pub grow_chunk: u32,
     /// Bytes currently charged to `pool` for rx + tx buffers. Tracked so
     /// reset() and Drop refund exactly what was charged regardless of any
-    /// future shrinks.
-    pub charged: u32,
+    /// future shrinks. `usize` (not `u32`) so that pool accounting stays
+    /// correct even when rx_max + tx_max approach the RFC 1323 cap
+    /// (2 × 1 GiB = 2 GiB > u32::MAX on 32-bit pointers — and unbounded
+    /// on 64-bit if a caller passed pathological values before the
+    /// per-direction clamp landed).
+    pub charged: usize,
     pub pool: Option<MemoryPool>,
 }
 
@@ -279,15 +283,19 @@ impl DynBufState {
 
     /// Try to charge `bytes` against the pool, if any. Returns true if the
     /// reservation succeeded (or no pool is attached).
-    pub(super) fn charge(&mut self, bytes: u32) -> bool {
+    pub(super) fn charge(&mut self, bytes: usize) -> bool {
         if bytes == 0 {
             return true;
         }
         if let Some(pool) = &self.pool
-            && !pool.try_charge(bytes as usize)
+            && !pool.try_charge(bytes)
         {
             return false;
         }
+        // Saturating against `usize::MAX` is informational only: a 16 EiB
+        // overflow on 64-bit isn't physically reachable. The point of using
+        // `usize` over `u32` is that the saturating arm becomes unreachable
+        // in practice rather than a known stick-at-u32-max bug.
         self.charged = self.charged.saturating_add(bytes);
         true
     }
@@ -297,9 +305,18 @@ impl DynBufState {
         if let Some(pool) = &self.pool
             && self.charged > 0
         {
-            pool.refund(self.charged as usize);
+            pool.refund(self.charged);
         }
         self.charged = 0;
+    }
+
+    /// Refund a partial amount (used on the grow-failure rollback path
+    /// where `try_grow` rejects the freshly-charged increment).
+    pub(super) fn refund_partial(&mut self, bytes: usize) {
+        self.charged = self.charged.saturating_sub(bytes);
+        if let Some(pool) = &self.pool {
+            pool.refund(bytes);
+        }
     }
 }
 
