@@ -18,6 +18,11 @@ use crate::wire::{
 };
 
 mod congestion;
+#[cfg(feature = "socket-tcp-dynamic-buffer")]
+mod dynbuf;
+
+#[cfg(feature = "socket-tcp-dynamic-buffer")]
+pub use dynbuf::{DynamicBufferConfig, MemoryPool};
 
 macro_rules! tcp_trace {
     ($($arg:expr),*) => (net_log!(trace, $($arg),*));
@@ -469,7 +474,6 @@ pub struct Socket<'a> {
     rtte: RttEstimator,
     assembler: Assembler,
     rx_buffer: SocketBuffer<'a>,
-    rx_fin_received: bool,
     tx_buffer: SocketBuffer<'a>,
     /// Interval after which, if no inbound packets are received, the connection is aborted.
     timeout: Option<Duration>,
@@ -496,8 +500,6 @@ pub struct Socket<'a> {
     remote_last_ack: Option<TcpSeqNumber>,
     /// The last window field value sent.
     remote_last_win: u16,
-    /// Whether `remote_last_win` was sent in a SYN or SYN|ACK and is therefore unscaled.
-    remote_last_win_unscaled: bool,
     /// The sending window scaling factor advertised to remotes which support RFC 1323.
     /// It is zero if the window <= 64KiB and/or the remote does not support it.
     remote_win_shift: u8,
@@ -508,8 +510,6 @@ pub struct Socket<'a> {
     remote_win_len: u32,
     /// The receive window scaling factor for remotes which support RFC 1323, None if unsupported.
     remote_win_scale: Option<u8>,
-    /// Whether or not the remote supports selective ACK as described in RFC 2018.
-    remote_has_sack: bool,
     /// The maximum number of data octets that the remote side may receive.
     /// MSS is a 16-bit TCP option (RFC 879); `u32` is more than enough and
     /// saves 4 bytes per socket on 64-bit targets.
@@ -523,6 +523,10 @@ pub struct Socket<'a> {
     /// The number of packets received directly after
     /// each other which have the same ACK number.
     local_rx_dup_acks: u8,
+    /// Packed bool flags. See the `Flags` bitflags struct below for
+    /// the bit definitions. Same packing idiom as `wire::dns::Flags`,
+    /// `wire::dhcpv4::Flags`, etc.
+    flags: Flags,
 
     /// Duration for Delayed ACK. If None no ACKs will be delayed.
     ack_delay: Option<Duration>,
@@ -532,9 +536,6 @@ pub struct Socket<'a> {
 
     /// Used for rate-limiting: No more challenge ACKs will be sent until this instant.
     challenge_ack_timer: Instant,
-
-    /// Nagle's Algorithm enabled.
-    nagle: bool,
 
     /// The congestion control algorithm.
     congestion_controller: congestion::AnyController,
@@ -550,12 +551,31 @@ pub struct Socket<'a> {
     #[cfg(feature = "async")]
     tx_waker: WakerRegistration,
 
-    /// If this is set, we will not send a SYN|ACK until this is unset.
-    #[cfg(feature = "socket-tcp-pause-synack")]
-    synack_paused: bool,
+    /// Pool-backed dynamic-buffer state. When `Some`, the socket grows its
+    /// rx/tx buffers on demand up to per-flow caps and releases on close.
+    /// `None` preserves the legacy fixed-buffer behavior bit-for-bit.
+    #[cfg(feature = "socket-tcp-dynamic-buffer")]
+    dyn_state: Option<alloc::boxed::Box<dynbuf::DynBufState>>,
 }
 
 const DEFAULT_MSS: usize = 536;
+
+bitflags::bitflags! {
+    /// Packed bool fields on `Socket`. Packing them into one byte saves
+    /// ~8 bytes of inter-field padding the compiler would otherwise emit
+    /// between scattered `bool` fields (`rx_fin_received`,
+    /// `remote_last_win_unscaled`, `remote_has_sack`, `nagle`,
+    /// `synack_paused`). Matches the same `bitflags!`-based packing
+    /// style used by `wire::dns::Flags`, `wire::dhcpv4::Flags`, etc.
+    struct Flags: u8 {
+        const RX_FIN_RECEIVED        = 1 << 0;
+        const REMOTE_LAST_WIN_UNSCALED = 1 << 1;
+        const REMOTE_HAS_SACK        = 1 << 2;
+        const NAGLE                  = 1 << 3;
+        #[cfg(feature = "socket-tcp-pause-synack")]
+        const SYNACK_PAUSED          = 1 << 4;
+    }
+}
 
 impl<'a> Socket<'a> {
     #[allow(unused_comparisons)] // small usize platforms always pass rx_capacity check
@@ -584,7 +604,6 @@ impl<'a> Socket<'a> {
             assembler: Assembler::new(),
             tx_buffer,
             rx_buffer,
-            rx_fin_received: false,
             timeout: None,
             keep_alive: None,
             hop_limit: None,
@@ -595,20 +614,19 @@ impl<'a> Socket<'a> {
             remote_last_seq: TcpSeqNumber::default(),
             remote_last_ack: None,
             remote_last_win: 0,
-            remote_last_win_unscaled: false,
             remote_win_len: 0,
             remote_win_shift: rx_cap_log2.saturating_sub(16) as u8,
             remote_win_scale: None,
-            remote_has_sack: false,
             remote_mss: DEFAULT_MSS as u32,
             remote_last_ts: None,
             local_rx_last_ack: None,
             local_rx_last_seq: None,
             local_rx_dup_acks: 0,
+            // Packed flags: nagle = true (default-on); everything else off.
+            flags: Flags::NAGLE,
             ack_delay: Some(ACK_DELAY_DEFAULT),
             ack_delay_timer: AckDelayTimer::Idle,
             challenge_ack_timer: Instant::from_secs(0),
-            nagle: true,
             tsval_generator: None,
             last_remote_tsval: 0,
             congestion_controller: congestion::AnyController::new(),
@@ -618,8 +636,240 @@ impl<'a> Socket<'a> {
             #[cfg(feature = "async")]
             tx_waker: WakerRegistration::new(),
 
-            #[cfg(feature = "socket-tcp-pause-synack")]
-            synack_paused: false,
+            #[cfg(feature = "socket-tcp-dynamic-buffer")]
+            dyn_state: None,
+        }
+    }
+
+    /// Create a pool-backed dynamic-buffer TCP socket.
+    ///
+    /// The socket's rx and tx buffers start at `config.rx_initial` /
+    /// `config.tx_initial` and grow on demand toward `config.rx_max` /
+    /// `config.tx_max` as the connection exercises pressure. On
+    /// `Closed` / abort / drop, the backing storage is released and any
+    /// pool reservation is refunded.
+    ///
+    /// The RFC 1323 window-scale option advertised on the SYN is sized for
+    /// `rx_max`, so the negotiated scale accommodates any future growth.
+    /// Initial advertised window collapses to zero when `rx_initial` is 0.
+    ///
+    /// If `pool` is `Some`, growth requests are gated by the shared budget
+    /// — exhaustion leaves the buffer at its current size, causing the
+    /// advertised window to stay small (sender backpressure) instead of
+    /// dropping accepted bytes.
+    ///
+    /// See [`MemoryPool`] and [`DynamicBufferConfig`].
+    #[cfg(feature = "socket-tcp-dynamic-buffer")]
+    pub fn new_dynamic(config: DynamicBufferConfig, pool: Option<MemoryPool>) -> Socket<'a> {
+        use alloc::boxed::Box;
+        use alloc::vec;
+
+        // The RFC 1323 effective-window cap is 2^30 (1 GiB) — enforce on
+        // BOTH directions, not just rx. Without this cap, callers passing
+        // a pathological tx_max could escape the per-direction ceiling,
+        // and on a 32-bit pointer target `(rx_initial + tx_initial)` could
+        // even overflow `usize`. The cap matches what the wire-level
+        // window-scale negotiation can express.
+        const PER_DIRECTION_CAP: usize = 1 << 30;
+        let rx_max = (config.rx_max as usize).min(PER_DIRECTION_CAP);
+        let tx_max = (config.tx_max as usize).min(PER_DIRECTION_CAP);
+        let rx_initial = (config.rx_initial as usize).min(rx_max);
+        let tx_initial = (config.tx_initial as usize).min(tx_max);
+
+        let mut state = dynbuf::DynBufState::new(
+            &DynamicBufferConfig {
+                rx_initial: rx_initial as u32,
+                rx_max: rx_max as u32,
+                tx_initial: tx_initial as u32,
+                tx_max: tx_max as u32,
+                grow_chunk: config.grow_chunk.max(1),
+            },
+            pool,
+        );
+
+        // Try to charge the initial reservation. If the pool refuses,
+        // fall back to zero-initial — growth attempts later will retry.
+        // At 2 × 2^30 = 2 GiB the sum fits in `usize` on every supported
+        // target (32-bit usize maxes at 2^32); saturating_add is
+        // defensive in case the per-direction caps above are ever
+        // loosened past the RFC limit.
+        let mut rx_capacity = rx_initial;
+        let mut tx_capacity = tx_initial;
+        let charge = rx_initial.saturating_add(tx_initial);
+        if !state.charge(charge) {
+            rx_capacity = 0;
+            tx_capacity = 0;
+        }
+
+        let rx_buffer = SocketBuffer::new(vec![0u8; rx_capacity]);
+        let tx_buffer = SocketBuffer::new(vec![0u8; tx_capacity]);
+
+        let mut sock = Socket::new(rx_buffer, tx_buffer);
+        // Override the window-scale shift: it must be sized for `rx_max`,
+        // not for the (possibly tiny) current capacity, because the SYN
+        // carries the scale and it is fixed for the connection's lifetime.
+        sock.remote_win_shift = Self::win_shift_for(rx_max);
+        sock.dyn_state = Some(Box::new(state));
+        sock
+    }
+
+    /// Window-scale shift sized for `rx_max`. Mirrors the unscaled
+    /// computation in [`Socket::new`] / [`Socket::reset`] but takes an
+    /// explicit cap so the SYN value reflects future growth potential.
+    #[cfg(feature = "socket-tcp-dynamic-buffer")]
+    fn win_shift_for(rx_max: usize) -> u8 {
+        if rx_max == 0 {
+            return 0;
+        }
+        let cap_log2 = mem::size_of::<usize>() * 8 - rx_max.leading_zeros() as usize;
+        cap_log2.saturating_sub(16) as u8
+    }
+
+    /// Returns the configured per-flow max receive capacity for a
+    /// dynamic-buffer socket, or the current fixed capacity otherwise.
+    #[cfg(feature = "socket-tcp-dynamic-buffer")]
+    pub fn recv_capacity_max(&self) -> usize {
+        match &self.dyn_state {
+            Some(s) => s.rx_max as usize,
+            None => self.rx_buffer.capacity(),
+        }
+    }
+
+    /// Returns the configured per-flow max send capacity for a
+    /// dynamic-buffer socket, or the current fixed capacity otherwise.
+    #[cfg(feature = "socket-tcp-dynamic-buffer")]
+    pub fn send_capacity_max(&self) -> usize {
+        match &self.dyn_state {
+            Some(s) => s.tx_max as usize,
+            None => self.tx_buffer.capacity(),
+        }
+    }
+
+    /// States in which growing the rx buffer is useful — i.e. the socket
+    /// can still legitimately advertise a receive window. This is the
+    /// same set as smoltcp's `may_recv()`: handshake states (peer may
+    /// be about to send) plus Established and the half-close states
+    /// FinWait1/FinWait2 (we sent FIN; peer may still be sending until
+    /// they send their FIN). Closed/Listen/CloseWait/TimeWait release
+    /// or never accept more rx data; growing there would waste pool
+    /// budget.
+    #[cfg(feature = "socket-tcp-dynamic-buffer")]
+    fn rx_growth_allowed(&self) -> bool {
+        matches!(
+            self.state,
+            State::SynSent
+                | State::SynReceived
+                | State::Established
+                | State::FinWait1
+                | State::FinWait2
+        )
+    }
+
+    /// Mirror of `rx_growth_allowed` for the send side. CloseWait is
+    /// included because we may still transmit after the peer FIN.
+    #[cfg(feature = "socket-tcp-dynamic-buffer")]
+    fn tx_growth_allowed(&self) -> bool {
+        matches!(
+            self.state,
+            State::SynSent | State::SynReceived | State::Established | State::CloseWait
+        )
+    }
+
+    /// Compute the next target capacity given the current size, the
+    /// per-flow max, and the chunk floor. Geometric (×2) growth amortizes
+    /// the O(len) memcpy across grow steps to O(total), matching how
+    /// Linux's `tcp_rcv_space_adjust` doubles `rcv_space.space` and how
+    /// `tcp_sndbuf_expand` derives `sndmem` from `cwnd × MSS × factor`.
+    ///
+    /// Under pool pressure we fall back to linear `+chunk` growth so a
+    /// single socket can't drain the global budget out from under others —
+    /// the smoltcp analogue of Linux suppressing autotuning when
+    /// `tcp_under_memory_pressure(sk)` is true.
+    #[cfg(feature = "socket-tcp-dynamic-buffer")]
+    fn next_capacity(cur: usize, chunk: usize, max: usize, pressure: bool) -> usize {
+        if cur >= max {
+            return cur;
+        }
+        let target = if pressure {
+            cur.saturating_add(chunk)
+        } else {
+            // Geometric: at least `cur + chunk`, but prefer doubling.
+            cur.saturating_add(chunk).max(cur.saturating_mul(2))
+        };
+        target.min(max)
+    }
+
+    /// Grow `buffer` one step toward `max`, charging the increment to the
+    /// shared pool via `state`. Shared by the rx and tx grow paths; the
+    /// only difference between them is which buffer and which cap.
+    ///
+    /// Returns `true` if any growth happened. Silent failure (pool
+    /// exhaustion, already at max, allocation refused) leaves the buffer
+    /// at its current size — the kernel-canonical "advertise zero / small
+    /// window (rx) or backpressure the writer (tx) on pressure" signal.
+    #[cfg(feature = "socket-tcp-dynamic-buffer")]
+    fn try_grow_buffer(
+        buffer: &mut SocketBuffer<'a>,
+        state: &mut dynbuf::DynBufState,
+        max: usize,
+    ) -> bool {
+        let pressure = state.pool.as_ref().is_some_and(|p| p.under_pressure());
+        let cur = buffer.capacity();
+        let want = Self::next_capacity(cur, state.grow_chunk as usize, max, pressure);
+        let Some(need) = want.checked_sub(cur).filter(|n| *n > 0) else {
+            return false;
+        };
+        if !state.charge(need) {
+            return false;
+        }
+        if !buffer.try_grow(want) {
+            // Allocation refused (e.g. Vec::try_reserve_exact failed).
+            // Refund what we just charged so accounting stays balanced.
+            state.refund(need);
+            return false;
+        }
+        true
+    }
+
+    /// Attempt to grow the rx buffer so the advertised window has room.
+    /// Called from `dispatch` before computing the advertised window.
+    /// `#[cold]`: the hot-path check at the dispatch entry decides whether
+    /// to dive in.
+    #[cfg(feature = "socket-tcp-dynamic-buffer")]
+    #[cold]
+    fn try_grow_rx(&mut self) -> bool {
+        let Some(state) = self.dyn_state.as_deref_mut() else {
+            return false;
+        };
+        let max = state.rx_max as usize;
+        Self::try_grow_buffer(&mut self.rx_buffer, state, max)
+    }
+
+    /// Attempt to grow the tx buffer for an upcoming write. Silent failure
+    /// becomes backpressure to the caller (their `send_slice` enqueue
+    /// copies fewer bytes and they retry).
+    #[cfg(feature = "socket-tcp-dynamic-buffer")]
+    #[cold]
+    fn try_grow_tx(&mut self) -> bool {
+        let Some(state) = self.dyn_state.as_deref_mut() else {
+            return false;
+        };
+        let max = state.tx_max as usize;
+        Self::try_grow_buffer(&mut self.tx_buffer, state, max)
+    }
+
+    /// Release the dynamic-buffer backing storage and refund the pool.
+    /// Called when transitioning to `Closed`/`Listen`, from `reset`, and
+    /// from `Drop`. Marked cold because lifecycle ends are rare relative
+    /// to dispatch frequency.
+    #[cfg(feature = "socket-tcp-dynamic-buffer")]
+    #[cold]
+    fn release_dyn_buffers(&mut self) {
+        if let Some(state) = self.dyn_state.as_mut() {
+            self.rx_buffer.release_owned();
+            self.tx_buffer.release_owned();
+            let charged = state.charged;
+            state.refund(charged);
         }
     }
 
@@ -735,7 +985,7 @@ impl<'a> Socket<'a> {
     ///
     /// See also the [set_nagle_enabled](#method.set_nagle_enabled) method.
     pub fn nagle_enabled(&self) -> bool {
-        self.nagle
+        self.flags.contains(Flags::NAGLE)
     }
 
     /// Pause sending of SYN|ACK packets.
@@ -745,7 +995,7 @@ impl<'a> Socket<'a> {
     /// proxy usecases.
     #[cfg(feature = "socket-tcp-pause-synack")]
     pub fn pause_synack(&mut self, pause: bool) {
-        self.synack_paused = pause;
+        self.flags.set(Flags::SYNACK_PAUSED, pause);
     }
 
     /// Return the current window field value, including scaling according to RFC 1323.
@@ -763,7 +1013,7 @@ impl<'a> Socket<'a> {
     /// advertised window length in octets.
     #[inline]
     fn remote_last_window_len(&self) -> usize {
-        if self.remote_last_win_unscaled {
+        if self.flags.contains(Flags::REMOTE_LAST_WIN_UNSCALED) {
             self.remote_last_win as usize
         } else {
             (self.remote_last_win as usize) << self.remote_win_shift
@@ -824,7 +1074,7 @@ impl<'a> Socket<'a> {
     /// at the cost of increased latency in some situations, particularly when the remote peer
     /// has ACK delay enabled.
     pub fn set_nagle_enabled(&mut self, enabled: bool) {
-        self.nagle = enabled
+        self.flags.set(Flags::NAGLE, enabled);
     }
 
     /// Return the keep-alive interval.
@@ -907,8 +1157,21 @@ impl<'a> Socket<'a> {
     }
 
     fn reset(&mut self) {
+        // For dynamic-buffer sockets, the window-scale must be sized for the
+        // per-flow maximum, not the (post-release, possibly zero) current
+        // capacity. The scale is fixed at SYN time, so it has to accommodate
+        // any future growth.
+        #[cfg(feature = "socket-tcp-dynamic-buffer")]
+        let cap_for_shift = self
+            .dyn_state
+            .as_ref()
+            .map(|s| s.rx_max as usize)
+            .unwrap_or_else(|| self.rx_buffer.capacity());
+        #[cfg(not(feature = "socket-tcp-dynamic-buffer"))]
+        let cap_for_shift = self.rx_buffer.capacity();
+
         let rx_cap_log2 =
-            mem::size_of::<usize>() * 8 - self.rx_buffer.capacity().leading_zeros() as usize;
+            mem::size_of::<usize>() * 8 - cap_for_shift.leading_zeros() as usize;
 
         self.state = State::Closed;
         self.timer = Timer::new();
@@ -916,7 +1179,13 @@ impl<'a> Socket<'a> {
         self.assembler = Assembler::new();
         self.tx_buffer.clear();
         self.rx_buffer.clear();
-        self.rx_fin_received = false;
+        self.flags.set(Flags::RX_FIN_RECEIVED, false);
+
+        // Release any pool-charged backing now that the connection is fully
+        // gone. Done before re-listen / re-connect so the next admission has
+        // budget available.
+        #[cfg(feature = "socket-tcp-dynamic-buffer")]
+        self.release_dyn_buffers();
         self.listen_endpoint = IpListenEndpoint::default();
         self.tuple = None;
         self.local_seq_no = TcpSeqNumber::default();
@@ -924,7 +1193,7 @@ impl<'a> Socket<'a> {
         self.remote_last_seq = TcpSeqNumber::default();
         self.remote_last_ack = None;
         self.remote_last_win = 0;
-        self.remote_last_win_unscaled = false;
+        self.flags.set(Flags::REMOTE_LAST_WIN_UNSCALED, false);
         self.remote_win_len = 0;
         self.remote_win_scale = None;
         self.remote_win_shift = rx_cap_log2.saturating_sub(16) as u8;
@@ -1250,6 +1519,22 @@ impl<'a> Socket<'a> {
             return Err(SendError::InvalidState);
         }
 
+        // Dynamic-buffer tx growth: if the caller is about to enqueue and
+        // the tx buffer is near-full, try to grow up to tx_max. One grow
+        // per call (geometric step) matches the kernel cadence — Linux's
+        // `tcp_sndbuf_expand` runs per ACK; XNU's auto-snd-grow fires once
+        // when sb_cc crosses 7/8 of sb_hiwat. Failure is silent: the
+        // enqueue copies fewer bytes and the caller sees backpressure via
+        // the returned `n`. Window check first (cheapest discriminating
+        // guard) so a non-full buffer short-circuits immediately.
+        #[cfg(feature = "socket-tcp-dynamic-buffer")]
+        if let Some(state) = self.dyn_state.as_ref()
+            && self.tx_buffer.window() < state.grow_chunk as usize
+            && self.tx_growth_allowed()
+        {
+            self.try_grow_tx();
+        }
+
         let old_length = self.tx_buffer.len();
         let (size, result) = f(&mut self.tx_buffer);
         if size > 0 {
@@ -1311,7 +1596,7 @@ impl<'a> Socket<'a> {
         // is fully open we must not dequeue any data, as it may be overwritten by e.g.
         // another (stale) SYN. (We do not support TCP Fast Open.)
         if !self.may_recv() {
-            if self.rx_fin_received {
+            if self.flags.contains(Flags::RX_FIN_RECEIVED) {
                 return Err(RecvError::Finished);
             }
             return Err(RecvError::InvalidState);
@@ -1416,6 +1701,30 @@ impl<'a> Socket<'a> {
 
         self.state = state;
 
+        // Dynamic-buffer: release backing storage on every transition
+        // that takes the socket out of the data-flow region of the state
+        // machine. Linux's `tcp_done()` returns `sk_forward_alloc` on
+        // Closed; we do the analogous refund here so a SYN-flood /
+        // connection-churn workload reclaims memory immediately, not
+        // after TIME-WAIT expiry.
+        //
+        //   - State::Closed:  abort / RST / explicit close from any state
+        //   - State::Listen:  SynReceived → Listen on RST against a listen
+        //                     socket (tcp.rs ~2162). Without releasing here
+        //                     the listen socket would accumulate one grow
+        //                     chunk per failed handshake, breaking the
+        //                     "idle ≈ 0 KiB" invariant FORK §14.6 documents.
+        //
+        // Safe in both cases: Closed sends only an RST (no payload),
+        // Listen has no peer until the next SYN arrives. Setting buffer
+        // capacity back to 0 is exactly the state a fresh `listen()`
+        // would produce; the next SYN's dispatch will grow rx again as
+        // usual via the dispatch-time hook.
+        #[cfg(feature = "socket-tcp-dynamic-buffer")]
+        if matches!(state, State::Closed | State::Listen) {
+            self.release_dyn_buffers();
+        }
+
         #[cfg(feature = "async")]
         {
             // Wake all tasks waiting. Even if we haven't received/sent data, this
@@ -1486,11 +1795,11 @@ impl<'a> Socket<'a> {
         // segments, is right-shifted by [advertised scale value] bits[...]
         reply_repr.window_len = self.scaled_window();
         self.remote_last_win = reply_repr.window_len;
-        self.remote_last_win_unscaled = false;
+        self.flags.set(Flags::REMOTE_LAST_WIN_UNSCALED, false);
 
         // If the remote supports selective acknowledgement, add the option to the outgoing
         // segment.
-        if self.remote_has_sack {
+        if self.flags.contains(Flags::REMOTE_HAS_SACK) {
             net_debug!("sending sACK option with current assembler ranges");
 
             // RFC 2018: The first SACK block (i.e., the one immediately following the kind and
@@ -1897,7 +2206,7 @@ impl<'a> Socket<'a> {
                 self.local_seq_no = Self::random_seq_no(cx);
                 self.remote_seq_no = repr.seq_number + 1;
                 self.remote_last_seq = self.local_seq_no;
-                self.remote_has_sack = repr.sack_permitted;
+                self.flags.set(Flags::REMOTE_HAS_SACK, repr.sack_permitted);
                 self.remote_win_scale = repr.window_scale;
                 // Remote doesn't support window scaling, don't do it.
                 if self.remote_win_scale.is_none() {
@@ -1922,7 +2231,7 @@ impl<'a> Socket<'a> {
             // 7th and 8th steps in the "SEGMENT ARRIVES" event describe this behavior.
             (State::SynReceived, TcpControl::Fin) => {
                 self.remote_seq_no += 1;
-                self.rx_fin_received = true;
+                self.flags.set(Flags::RX_FIN_RECEIVED, true);
                 self.set_state(State::CloseWait);
             }
 
@@ -1946,7 +2255,7 @@ impl<'a> Socket<'a> {
                 self.remote_seq_no = repr.seq_number + 1;
                 self.remote_last_seq = self.local_seq_no + 1;
                 self.remote_last_ack = Some(repr.seq_number);
-                self.remote_has_sack = repr.sack_permitted;
+                self.flags.set(Flags::REMOTE_HAS_SACK, repr.sack_permitted);
                 self.remote_win_scale = repr.window_scale;
                 // Remote doesn't support window scaling, don't do it.
                 if self.remote_win_scale.is_none() {
@@ -1970,7 +2279,7 @@ impl<'a> Socket<'a> {
             // FIN packets in ESTABLISHED state indicate the remote side has closed.
             (State::Established, TcpControl::Fin) => {
                 self.remote_seq_no += 1;
-                self.rx_fin_received = true;
+                self.flags.set(Flags::RX_FIN_RECEIVED, true);
                 self.set_state(State::CloseWait);
             }
 
@@ -1986,7 +2295,7 @@ impl<'a> Socket<'a> {
             // if they also acknowledge our FIN.
             (State::FinWait1, TcpControl::Fin) => {
                 self.remote_seq_no += 1;
-                self.rx_fin_received = true;
+                self.flags.set(Flags::RX_FIN_RECEIVED, true);
                 if ack_of_fin {
                     self.set_state(State::TimeWait);
                     self.timer.set_for_close(cx.now());
@@ -2000,7 +2309,7 @@ impl<'a> Socket<'a> {
             // FIN packets in FIN-WAIT-2 state change it to TIME-WAIT.
             (State::FinWait2, TcpControl::Fin) => {
                 self.remote_seq_no += 1;
-                self.rx_fin_received = true;
+                self.flags.set(Flags::RX_FIN_RECEIVED, true);
                 self.set_state(State::TimeWait);
                 self.timer.set_for_close(cx.now());
             }
@@ -2290,7 +2599,7 @@ impl<'a> Socket<'a> {
         // If the SYN|ACK is intentionally paused, do not ask the interface to
         // poll immediately: dispatch() will withhold the packet until unpaused.
         #[cfg(feature = "socket-tcp-pause-synack")]
-        if self.state == State::SynReceived && self.synack_paused {
+        if self.state == State::SynReceived && self.flags.contains(Flags::SYNACK_PAUSED) {
             return false;
         }
 
@@ -2330,7 +2639,7 @@ impl<'a> Socket<'a> {
         // * There's no data in flight
         // * We can send a full packet
         // * We have all the data we'll ever send (we're closing send)
-        if self.nagle && data_in_flight && !can_send_full && !want_fin {
+        if self.flags.contains(Flags::NAGLE) && data_in_flight && !can_send_full && !want_fin {
             can_send = false;
         }
 
@@ -2410,6 +2719,27 @@ impl<'a> Socket<'a> {
             return Ok(());
         }
 
+        // Dynamic-buffer rx growth: if our advertised window is about to be
+        // sub-MSS, and we have headroom up to rx_max, request more backing
+        // from the pool. Done before computing scaled_window() so the
+        // segment we're about to emit reflects the new capacity. One grow
+        // per dispatch matches the kernel autotune cadence (Linux's
+        // `tcp_rcv_space_adjust` runs per recvmsg / per RTT-cycle, not in
+        // a loop). Failure (pool exhausted, at max) silently collapses the
+        // advertised window — the kernel-canonical backpressure signal.
+        //
+        // Guard order is cheapest-discriminating-first: the window check is
+        // usually false (buffer has room) in steady state, so it
+        // short-circuits before the state-machine match in
+        // `rx_growth_allowed`.
+        #[cfg(feature = "socket-tcp-dynamic-buffer")]
+        if let Some(state) = self.dyn_state.as_ref()
+            && self.rx_buffer.window() < (state.grow_chunk as usize).max(self.remote_mss as usize)
+            && self.rx_growth_allowed()
+        {
+            self.try_grow_rx();
+        }
+
         // NOTE(unwrap): we check tuple is not None above.
         let tuple = self.tuple.unwrap();
 
@@ -2474,7 +2804,7 @@ impl<'a> Socket<'a> {
         }
 
         #[cfg(feature = "socket-tcp-pause-synack")]
-        if matches!(self.state, State::SynReceived) && self.synack_paused {
+        if matches!(self.state, State::SynReceived) && self.flags.contains(Flags::SYNACK_PAUSED) {
             return Ok(());
         }
 
@@ -2559,7 +2889,7 @@ impl<'a> Socket<'a> {
                     repr.window_scale = Some(self.remote_win_shift);
                     repr.sack_permitted = true;
                 } else {
-                    repr.sack_permitted = self.remote_has_sack;
+                    repr.sack_permitted = self.flags.contains(Flags::REMOTE_HAS_SACK);
                     repr.window_scale = self.remote_win_scale.map(|_| self.remote_win_shift);
                 }
             }
@@ -2706,18 +3036,26 @@ impl<'a> Socket<'a> {
         }
 
         // We've sent a packet successfully, so we can update the internal state now.
-        self.remote_last_seq = repr.seq_number + repr.segment_len();
-        self.remote_last_ack = repr.ack_number;
-        self.remote_last_win = repr.window_len;
-        self.remote_last_win_unscaled = repr.control == TcpControl::Syn;
+        // Snapshot every value we need off `repr` first — `repr.payload` borrows
+        // from `self.tx_buffer`, so any later `&mut self` setter would collide
+        // with the outstanding immutable borrow under NLL.
+        let seg_len = repr.segment_len();
+        let new_remote_last_seq = repr.seq_number + seg_len;
+        let new_remote_last_ack = repr.ack_number;
+        let new_remote_last_win = repr.window_len;
+        let new_remote_last_win_unscaled = repr.control == TcpControl::Syn;
 
-        if repr.segment_len() > 0 {
-            self.rtte
-                .on_send(cx.now(), repr.seq_number + repr.segment_len());
-            self.congestion_controller.post_transmit(cx.now(), repr.segment_len());
+        self.remote_last_seq = new_remote_last_seq;
+        self.remote_last_ack = new_remote_last_ack;
+        self.remote_last_win = new_remote_last_win;
+        self.flags.set(Flags::REMOTE_LAST_WIN_UNSCALED, new_remote_last_win_unscaled);
+
+        if seg_len > 0 {
+            self.rtte.on_send(cx.now(), new_remote_last_seq);
+            self.congestion_controller.post_transmit(cx.now(), seg_len);
         }
 
-        if repr.segment_len() > 0 && !self.timer.is_retransmit() {
+        if seg_len > 0 && !self.timer.is_retransmit() {
             // RFC 6298 (5.1) Every time a packet containing data is sent (including a
             // retransmission), if the timer is not running, start it running
             // so that it will expire after RTO seconds.
@@ -2793,6 +3131,15 @@ impl<'a> fmt::Write for Socket<'a> {
         }
     }
 }
+
+// Pool refund-on-drop lives on `DynBufState`, not on `Socket`. Putting it
+// on `Socket` would add drop glue to the enclosing `socket::Socket`
+// enum and cost ~3–5 % UDP throughput in workloads that never touch a
+// dynamic-buffer TCP socket. Hanging the Drop off the inner state lets
+// the compiler synthesize the outer drop calls only when `dyn_state` is
+// `Some`. Set_state(Closed)/reset() still call `refund_all` explicitly
+// so the pool is returned eagerly on close; the Drop path here just
+// guarantees correctness on `SocketSet::remove` and teardown.
 
 // TODO: TCP should work for all features. For now, we only test with the IP feature. We could do
 // it for other features as well with rstest, however, this means we have to modify a lot of the
@@ -3250,7 +3597,7 @@ mod test {
                 ..SEND_TEMPL
             }
         );
-        assert!(!s.remote_has_sack);
+        assert!(!s.flags.contains(Flags::REMOTE_HAS_SACK));
         recv!(
             s,
             [TcpRepr {
@@ -3273,7 +3620,7 @@ mod test {
                 ..SEND_TEMPL
             }
         );
-        assert!(s.remote_has_sack);
+        assert!(s.flags.contains(Flags::REMOTE_HAS_SACK));
         recv!(
             s,
             [TcpRepr {
@@ -4199,7 +4546,7 @@ mod test {
                 ..SEND_TEMPL
             }
         );
-        assert!(s.remote_has_sack);
+        assert!(s.flags.contains(Flags::REMOTE_HAS_SACK));
 
         let mut s = socket_syn_sent();
         recv!(
@@ -4226,7 +4573,7 @@ mod test {
                 ..SEND_TEMPL
             }
         );
-        assert!(!s.remote_has_sack);
+        assert!(!s.flags.contains(Flags::REMOTE_HAS_SACK));
     }
 
     #[test]
@@ -4421,7 +4768,7 @@ mod test {
         // RFC 2018: Assume the left window edge is 5000 and that the data transmitter sends [...]
         // segments, each containing 500 data bytes.
         let mut s = socket_established_with_buffer_sizes(4000, 4000);
-        s.remote_has_sack = true;
+        s.flags.set(Flags::REMOTE_HAS_SACK, true);
 
         // create a segment that is 500 bytes long
         let mut segment: Vec<u8> = Vec::with_capacity(500);
@@ -4516,7 +4863,7 @@ mod test {
     #[test]
     fn test_established_sack_no_overflow_on_near_max_seqnumber() {
         let mut s = socket_established();
-        s.remote_has_sack = true;
+        s.flags.set(Flags::REMOTE_HAS_SACK, true);
         s.remote_seq_no = TcpSeqNumber(-4);
         s.remote_last_ack = Some(TcpSeqNumber(-4));
 
@@ -9191,5 +9538,562 @@ mod test {
         s.send_slice(b"def").unwrap();
         recv_nothing!(s);
         assert_eq!(s.state, State::Closed);
+    }
+
+    // =========================================================================================//
+    // Dynamic-buffer / MemoryPool tests
+    // =========================================================================================//
+    //
+    // These verify the pool-backed lazy/resizable SocketBuffer added under
+    // the `socket-tcp-dynamic-buffer` feature. The legacy fixed-buffer API is
+    // unaffected — all existing tests above continue to pass without
+    // modification, exercising the `dyn_state == None` path bit-for-bit.
+
+    #[cfg(feature = "socket-tcp-dynamic-buffer")]
+    mod dyn_buf {
+        use super::*;
+
+        fn dyn_socket(cfg: DynamicBufferConfig, pool: Option<MemoryPool>) -> TestSocket {
+            let (iface, _, _) = crate::tests::setup(crate::phy::Medium::Ip);
+            let mut socket = Socket::new_dynamic(cfg, pool);
+            socket.set_ack_delay(None);
+            TestSocket {
+                socket,
+                cx: iface.inner,
+            }
+        }
+
+        fn dyn_socket_listen(cfg: DynamicBufferConfig, pool: Option<MemoryPool>) -> TestSocket {
+            let mut s = dyn_socket(cfg, pool);
+            s.state = State::Listen;
+            s.listen_endpoint = LISTEN_END;
+            s
+        }
+
+        // Bring the SYN-RECEIVED + Established path into a dynamic socket
+        // without going through the full handshake macros (which assume
+        // legacy buffer sizing). Mirrors socket_established_with_buffer_sizes.
+        fn dyn_socket_established(cfg: DynamicBufferConfig, pool: Option<MemoryPool>) -> TestSocket {
+            let mut s = dyn_socket(cfg, pool);
+            s.state = State::Established;
+            s.tuple = Some(TUPLE);
+            s.local_seq_no = LOCAL_SEQ + 1;
+            s.remote_seq_no = REMOTE_SEQ + 1;
+            s.remote_last_seq = LOCAL_SEQ + 1;
+            s.remote_last_ack = Some(REMOTE_SEQ + 1);
+            s.remote_win_len = 65535;
+            s.remote_last_win = s.scaled_window();
+            s
+        }
+
+        #[test]
+        fn idle_socket_zero_allocation() {
+            // rx_initial = tx_initial = 0 → no backing storage at all until
+            // pressure forces it.
+            let cfg = DynamicBufferConfig::symmetric(0, 64 * 1024, 4 * 1024);
+            let s = dyn_socket(cfg, None);
+            assert_eq!(s.rx_buffer.capacity(), 0);
+            assert_eq!(s.tx_buffer.capacity(), 0);
+            // Window-scale must still be sized for the *max*, since it's
+            // fixed at SYN time and the connection may later grow.
+            // 64 KiB = 2^16 → ceil(log2) = 17 → shift = 17 - 16 = 1.
+            assert_eq!(s.remote_win_shift, 1);
+        }
+
+        #[test]
+        fn idle_socket_with_pool_no_charge() {
+            // 1 MiB budget, 100 idle sockets at zero-initial → pool used == 0.
+            let pool = MemoryPool::new(1024 * 1024);
+            let cfg = DynamicBufferConfig::symmetric(0, 32 * 1024, 4 * 1024);
+            let mut sockets = std::vec::Vec::new();
+            for _ in 0..100 {
+                sockets.push(Socket::new_dynamic(cfg, Some(pool.clone())));
+            }
+            assert_eq!(pool.used(), 0);
+            // Dropping all sockets keeps pool clean.
+            drop(sockets);
+            assert_eq!(pool.used(), 0);
+        }
+
+        #[test]
+        fn nonzero_initial_charges_pool() {
+            let pool = MemoryPool::new(64 * 1024);
+            let cfg = DynamicBufferConfig::symmetric(4 * 1024, 32 * 1024, 4 * 1024);
+            let s = Socket::new_dynamic(cfg, Some(pool.clone()));
+            assert_eq!(s.rx_buffer.capacity(), 4 * 1024);
+            assert_eq!(s.tx_buffer.capacity(), 4 * 1024);
+            assert_eq!(pool.used(), 8 * 1024);
+            drop(s);
+            assert_eq!(pool.used(), 0);
+        }
+
+        #[test]
+        fn pool_overcommit_falls_back_to_zero() {
+            // Pool budget too small for the requested initial → constructor
+            // refuses the reservation and the socket comes up with zero
+            // capacity, not a partial allocation.
+            let pool = MemoryPool::new(1024);
+            let cfg = DynamicBufferConfig::symmetric(8 * 1024, 32 * 1024, 4 * 1024);
+            let s = Socket::new_dynamic(cfg, Some(pool.clone()));
+            assert_eq!(s.rx_buffer.capacity(), 0);
+            assert_eq!(s.tx_buffer.capacity(), 0);
+            assert_eq!(pool.used(), 0);
+        }
+
+        #[test]
+        fn win_shift_uses_max_not_current() {
+            // The negotiated window scale must accommodate any future
+            // growth, so it tracks rx_max, not the current (possibly tiny)
+            // capacity. The remote sees this in the SYN-ACK.
+            for (rx_max, expected_shift) in &[
+                (1024usize, 0u8),
+                (32 * 1024, 0),
+                (64 * 1024, 1),
+                (128 * 1024, 2),
+                (256 * 1024, 3),
+                (1024 * 1024, 5),
+            ] {
+                let cfg = DynamicBufferConfig {
+                    rx_initial: 0,
+                    rx_max: *rx_max as u32,
+                    tx_initial: 0,
+                    tx_max: *rx_max as u32,
+                    grow_chunk: 4 * 1024,
+                };
+                let s = Socket::new_dynamic(cfg, None);
+                assert_eq!(
+                    s.remote_win_shift, *expected_shift,
+                    "rx_max={rx_max}: expected shift={expected_shift}, got {}",
+                    s.remote_win_shift
+                );
+            }
+        }
+
+        #[test]
+        fn syn_advertises_unscaled_window_from_initial() {
+            // For a Listen → SYN-ACK exchange, the SYN-ACK carries an
+            // unscaled window field. With rx_initial = 0, the advertised
+            // window in the SYN-ACK is 0. Crucially, the window_scale
+            // option still carries the rx_max-derived shift.
+            let cfg = DynamicBufferConfig::symmetric(0, 128 * 1024, 8 * 1024);
+            let mut s = dyn_socket_listen(cfg, None);
+            // Capacity at this moment really is zero — no preallocation.
+            assert_eq!(s.rx_buffer.capacity(), 0);
+            send!(
+                s,
+                TcpRepr {
+                    control: TcpControl::Syn,
+                    seq_number: REMOTE_SEQ,
+                    ack_number: None,
+                    window_scale: Some(0),
+                    ..SEND_TEMPL
+                }
+            );
+            // After processing the SYN, dispatch() will run; the rx growth
+            // hook fires before scaled_window(), so we should see the
+            // advertised window reflect a newly-grown buffer.
+            recv!(
+                s,
+                Ok(TcpRepr {
+                    control: TcpControl::Syn,
+                    seq_number: LOCAL_SEQ,
+                    ack_number: Some(REMOTE_SEQ + 1),
+                    max_seg_size: Some(BASE_MSS),
+                    window_scale: Some(2), // 128 KiB → shift 2
+                    // Unscaled SYN window: should reflect the rx_buffer
+                    // capacity after the dispatch-time growth (8 KiB chunk).
+                    window_len: 8 * 1024,
+                    ..RECV_TEMPL
+                })
+            );
+            // After SYN-ACK, the buffer has been grown at least once.
+            assert!(s.rx_buffer.capacity() >= 8 * 1024);
+        }
+
+        #[test]
+        fn rx_grows_on_data_pressure() {
+            // Established connection with tiny initial rx. Peer sends a
+            // segment that fills the buffer; the next dispatch grows rx so
+            // we can advertise a larger window.
+            let cfg = DynamicBufferConfig::symmetric(4 * 1024, 32 * 1024, 4 * 1024);
+            let mut s = dyn_socket_established(cfg, None);
+
+            assert_eq!(s.rx_buffer.capacity(), 4 * 1024);
+            // Peer sends data that fills our buffer.
+            let payload = std::vec![b'x'; 4096];
+            send!(
+                s,
+                TcpRepr {
+                    seq_number: REMOTE_SEQ + 1,
+                    ack_number: Some(LOCAL_SEQ + 1),
+                    payload: &payload,
+                    ..SEND_TEMPL
+                }
+            );
+            // The dispatch path should grow rx so we can advertise some
+            // window again. The ACK we emit reflects the new capacity.
+            recv!(
+                s,
+                Ok(TcpRepr {
+                    seq_number: LOCAL_SEQ + 1,
+                    ack_number: Some(REMOTE_SEQ + 1 + 4096),
+                    // After growing by one 4 KiB chunk, window is 4 KiB.
+                    // The advertised value is scaled (shift = 0 here since
+                    // rx_max = 32 KiB).
+                    window_len: 4 * 1024,
+                    ..RECV_TEMPL
+                })
+            );
+            assert!(s.rx_buffer.capacity() > 4 * 1024);
+            assert!(s.rx_buffer.capacity() <= 32 * 1024);
+        }
+
+        #[test]
+        fn pool_exhaustion_collapses_window() {
+            // Budget = 4 KiB only. First socket takes it; second cannot
+            // grow at all. Second socket's advertised window stays 0.
+            let pool = MemoryPool::new(4 * 1024);
+            let cfg = DynamicBufferConfig::symmetric(0, 32 * 1024, 4 * 1024);
+            let _winner = {
+                // Force the winner to actually grow.
+                let mut s = dyn_socket_established(cfg, Some(pool.clone()));
+                let grew = s.try_grow_rx();
+                assert!(grew);
+                assert!(s.rx_buffer.capacity() >= 4 * 1024);
+                s
+            };
+            // Budget should now be fully consumed.
+            assert_eq!(pool.available(), 0);
+
+            // A second dynamic socket on the same pool can't grow at all.
+            let mut loser = dyn_socket_established(cfg, Some(pool.clone()));
+            assert!(!loser.try_grow_rx());
+            assert_eq!(loser.rx_buffer.capacity(), 0);
+
+            // And the scaled_window must therefore be 0 — backpressure.
+            assert_eq!(loser.scaled_window(), 0);
+        }
+
+        #[test]
+        fn pool_refunded_on_close() {
+            let pool = MemoryPool::new(64 * 1024);
+            let cfg = DynamicBufferConfig::symmetric(4 * 1024, 32 * 1024, 4 * 1024);
+            {
+                let mut s = dyn_socket_established(cfg, Some(pool.clone()));
+                // Force more growth so we have something nontrivial to refund.
+                while s.try_grow_rx() {}
+                while s.try_grow_tx() {}
+                assert!(pool.used() > 8 * 1024);
+                // Close via the public abort path → set_state(Closed) →
+                // release hook fires.
+                s.abort();
+            }
+            assert_eq!(pool.used(), 0);
+        }
+
+        #[test]
+        fn pool_refunded_on_drop() {
+            let pool = MemoryPool::new(64 * 1024);
+            let cfg = DynamicBufferConfig::symmetric(4 * 1024, 32 * 1024, 4 * 1024);
+            {
+                let _s = Socket::new_dynamic(cfg, Some(pool.clone()));
+                assert_eq!(pool.used(), 8 * 1024);
+            } // Drop fires here.
+            assert_eq!(pool.used(), 0);
+        }
+
+        #[test]
+        fn pool_refunded_on_reset() {
+            let pool = MemoryPool::new(64 * 1024);
+            let cfg = DynamicBufferConfig::symmetric(4 * 1024, 32 * 1024, 4 * 1024);
+            let mut s = Socket::new_dynamic(cfg, Some(pool.clone()));
+            assert_eq!(pool.used(), 8 * 1024);
+            // Internal reset (e.g. would happen at TIME-WAIT expiry).
+            s.reset();
+            assert_eq!(pool.used(), 0);
+            // Re-using the socket post-reset works: window scale recomputed
+            // from rx_max.
+            assert_eq!(s.remote_win_shift, 0); // 32 KiB → shift 0
+            assert_eq!(s.rx_buffer.capacity(), 0);
+        }
+
+        #[test]
+        fn send_data_survives_until_ack_with_dynamic_tx() {
+            // Standard correctness: pre-ACK tx data is not freed by growth.
+            let cfg = DynamicBufferConfig::symmetric(4 * 1024, 32 * 1024, 4 * 1024);
+            let mut s = dyn_socket_established(cfg, None);
+            assert_eq!(s.send_slice(b"hello").unwrap(), 5);
+            assert_eq!(s.tx_buffer.len(), 5);
+            // Force a growth (we have plenty of headroom in tx_max).
+            s.try_grow_tx();
+            // Data must still be present.
+            assert_eq!(s.tx_buffer.len(), 5);
+            let mut buf = std::vec![0u8; 5];
+            let copied = s.tx_buffer.read_allocated(0, &mut buf);
+            assert_eq!(copied, 5);
+            assert_eq!(&buf, b"hello");
+        }
+
+        #[test]
+        fn never_advertise_more_than_backing_capacity() {
+            // Capacity = ground truth for the advertised window. After any
+            // sequence of grows + len changes, scaled_window << shift never
+            // exceeds rx_buffer.window().
+            let cfg = DynamicBufferConfig::symmetric(0, 128 * 1024, 8 * 1024);
+            let mut s = dyn_socket_established(cfg, None);
+            for _ in 0..3 {
+                s.try_grow_rx();
+                let scaled = s.scaled_window() as usize;
+                let backed = s.rx_buffer.window();
+                assert!(
+                    scaled << s.remote_win_shift <= backed,
+                    "scaled={scaled} shift={} backed={backed}",
+                    s.remote_win_shift,
+                );
+            }
+        }
+
+        #[test]
+        fn growth_preserves_buffered_payload_ordering() {
+            // Critical correctness: RingBuffer::try_grow must preserve
+            // logical byte order even when read_at != 0 (wrapped state).
+            // Direct test on the storage primitive.
+            let mut ring: SocketBuffer = SocketBuffer::new(std::vec![0u8; 8]);
+            // Fill, then wrap by dequeuing 4 + enqueuing 4.
+            assert_eq!(ring.enqueue_slice(b"abcdefgh"), 8);
+            assert_eq!(ring.dequeue_many(4), b"abcd");
+            assert_eq!(ring.enqueue_slice(b"ijkl"), 4);
+            // Logical contents now "efghijkl", but read_at = 4, length = 8.
+            assert!(ring.try_grow(16));
+            assert_eq!(ring.capacity(), 16);
+            let mut out = std::vec![0u8; 8];
+            assert_eq!(ring.read_allocated(0, &mut out), 8);
+            assert_eq!(&out, b"efghijkl");
+        }
+
+        #[test]
+        fn pool_capacity_floor_300_sockets_24mib_budget() {
+            // The iOS target: ~300 sockets with 24 MiB total budget.
+            // With rx_initial = tx_initial = 0 and a 24 MiB pool, all
+            // sockets fit idle, and a subset can grow to a per-flow max.
+            let pool = MemoryPool::new(24 * 1024 * 1024);
+            let cfg = DynamicBufferConfig::symmetric(0, 64 * 1024, 8 * 1024);
+            let mut sockets = std::vec::Vec::new();
+            for _ in 0..300 {
+                sockets.push(Socket::new_dynamic(cfg, Some(pool.clone())));
+            }
+            assert_eq!(pool.used(), 0, "idle sockets should not reserve any pool memory");
+
+            // Now grow the first 50 to full rx_max + tx_max = 128 KiB each.
+            // 50 * 128 KiB = 6.4 MiB, well within 24 MiB budget.
+            for s in &mut sockets[..50] {
+                // Open with a tuple so the socket is in a state where
+                // growth makes sense. We just exercise the grow API.
+                while s.try_grow_rx() {}
+                while s.try_grow_tx() {}
+                assert_eq!(s.recv_capacity(), 64 * 1024);
+                assert_eq!(s.send_capacity(), 64 * 1024);
+            }
+            assert_eq!(pool.used(), 50 * 128 * 1024);
+
+            // Drop everything; pool should be fully refunded.
+            drop(sockets);
+            assert_eq!(pool.used(), 0);
+        }
+
+        #[test]
+        fn growth_is_geometric() {
+            // Without pool pressure, each grow at minimum doubles, so a
+            // buffer goes 0 → chunk → 2·chunk → 4·chunk → ... → rx_max in
+            // O(log) steps. The previous linear (`+chunk`) growth required
+            // rx_max / chunk steps, each copying len bytes (O(n²) total
+            // memcpy). Geometric matches Linux `tcp_rcv_space_adjust`
+            // (`copied << 1`) and XNU `tcp_sbrcv_grow` (×2 / ×4 of the
+            // RTT byte rate).
+            let cfg = DynamicBufferConfig::symmetric(0, 64 * 1024, 4 * 1024);
+            let mut s = dyn_socket_established(cfg, None);
+            let mut caps = std::vec::Vec::new();
+            while s.try_grow_rx() {
+                caps.push(s.rx_buffer.capacity());
+                if caps.len() > 32 {
+                    panic!("grow loop did not converge: {caps:?}");
+                }
+            }
+            // Expected geometric progression: 4K, 8K, 16K, 32K, 64K.
+            assert_eq!(
+                caps,
+                std::vec![4 * 1024, 8 * 1024, 16 * 1024, 32 * 1024, 64 * 1024]
+            );
+        }
+
+        #[test]
+        fn growth_throttles_under_pool_pressure() {
+            // When the pool is past 75% used, sockets fall back to linear
+            // `+chunk` growth so a single greedy socket can't drain the
+            // budget. Same conceptual gate as Linux's
+            // `tcp_under_memory_pressure(sk)`.
+            let pool = MemoryPool::new(64 * 1024);
+            // Pre-charge to 75% to put the pool immediately under pressure.
+            assert!(pool.try_charge(48 * 1024));
+            assert!(pool.under_pressure());
+
+            let cfg = DynamicBufferConfig::symmetric(0, 32 * 1024, 4 * 1024);
+            let mut s = dyn_socket_established(cfg, Some(pool.clone()));
+            // First grow: 0 → 4K (single chunk, geometric or linear same).
+            assert!(s.try_grow_rx());
+            assert_eq!(s.rx_buffer.capacity(), 4 * 1024);
+            // Second grow: under pressure → linear, so 4K → 8K, not 4K → 8K.
+            // (Both equal here; check the next step:)
+            assert!(s.try_grow_rx());
+            assert_eq!(s.rx_buffer.capacity(), 8 * 1024);
+            // Third: under pressure → +4K → 12K (NOT doubled to 16K).
+            assert!(s.try_grow_rx());
+            assert_eq!(
+                s.rx_buffer.capacity(),
+                12 * 1024,
+                "pressure should force linear growth, not geometric"
+            );
+        }
+
+        #[test]
+        fn next_capacity_math() {
+            // Geometric, no pressure.
+            assert_eq!(Socket::next_capacity(0, 4096, 65536, false), 4096);
+            assert_eq!(Socket::next_capacity(4096, 4096, 65536, false), 8192);
+            assert_eq!(Socket::next_capacity(8192, 4096, 65536, false), 16384);
+            assert_eq!(Socket::next_capacity(32768, 4096, 65536, false), 65536);
+            // At max → no grow.
+            assert_eq!(Socket::next_capacity(65536, 4096, 65536, false), 65536);
+            // Pressure throttle → linear.
+            assert_eq!(Socket::next_capacity(8192, 4096, 65536, true), 12288);
+            assert_eq!(Socket::next_capacity(32768, 4096, 65536, true), 36864);
+            // Clamp at max even with linear.
+            assert_eq!(Socket::next_capacity(60000, 4096, 65536, true), 64096);
+        }
+
+        #[test]
+        fn release_is_idempotent() {
+            // Defensive: calling release twice (via abort then drop, or
+            // via close-then-reset, etc.) must not double-refund the pool.
+            let pool = MemoryPool::new(64 * 1024);
+            let cfg = DynamicBufferConfig::symmetric(4 * 1024, 32 * 1024, 4 * 1024);
+            let mut s = Socket::new_dynamic(cfg, Some(pool.clone()));
+            assert_eq!(pool.used(), 8 * 1024);
+            // Force more growth.
+            while s.try_grow_rx() {}
+            let charged = pool.used();
+            assert!(charged > 8 * 1024);
+            // First release via abort.
+            s.abort();
+            assert_eq!(pool.used(), 0);
+            // Re-set the state to simulate stale-state code paths.
+            s.set_state(State::Closed);
+            assert_eq!(pool.used(), 0);
+            // And Drop.
+            drop(s);
+            assert_eq!(pool.used(), 0);
+        }
+
+        #[test]
+        fn pool_accounting_survives_u32_max_caps() {
+            // Regression for the `charged: u32` + uncapped `tx_max` bug
+            // (independent review #1). With charged widened to `usize` and
+            // both per-direction caps clamped to RFC 1323's 2^30 ceiling,
+            // pool accounting must reach 2 × 2^30 = 2 GiB without
+            // saturation or truncation loss.
+            //
+            // We use the public DynamicBufferConfig fields (which are
+            // `u32`); the constructor clamps both to 1<<30 internally.
+            let cfg = DynamicBufferConfig {
+                rx_initial: 0,
+                rx_max: u32::MAX, // larger than the 2^30 cap; should clamp.
+                tx_initial: 0,
+                tx_max: u32::MAX, // ditto — the *bug* was this not clamping.
+                grow_chunk: 4 * 1024,
+            };
+            let s = Socket::new_dynamic(cfg, None);
+            // recv_capacity_max / send_capacity_max should both report
+            // the clamped value, not the original u32::MAX.
+            assert_eq!(s.recv_capacity_max(), 1 << 30);
+            assert_eq!(s.send_capacity_max(), 1 << 30);
+        }
+
+        #[test]
+        fn pool_accounting_no_truncation_on_initial_charge() {
+            // The bug was: `state.charge(charge as u32)` truncated when
+            // rx_initial + tx_initial exceeded u32::MAX, but the Vec
+            // allocations were full-size. Pool would undercount; physical
+            // memory could exceed budget. Fixed by widening charge to
+            // usize and using checked_add.
+            //
+            // Use a 2 GiB pool, request 768 MiB rx + 768 MiB tx (1.5 GiB),
+            // and verify pool.used() matches exactly.
+            //
+            // (We can't actually request u32::MAX bytes — that would try to
+            // allocate 4 GiB of zero-filled Vec each, OOMing on most test
+            // hosts. The unit-level invariant we're checking is the
+            // accounting arithmetic, not the alloc itself.)
+            let pool = MemoryPool::new(2 * 1024 * 1024 * 1024);
+            let cfg = DynamicBufferConfig {
+                rx_initial: 768 * 1024 * 1024,
+                rx_max: 768 * 1024 * 1024,
+                tx_initial: 768 * 1024 * 1024,
+                tx_max: 768 * 1024 * 1024,
+                grow_chunk: 8 * 1024,
+            };
+            let s = Socket::new_dynamic(cfg, Some(pool.clone()));
+            // Both buffers should have allocated to the requested initial.
+            assert_eq!(s.rx_buffer.capacity(), 768 * 1024 * 1024);
+            assert_eq!(s.tx_buffer.capacity(), 768 * 1024 * 1024);
+            // Pool should record exactly 1.5 GiB charged.
+            assert_eq!(pool.used(), 2 * 768 * 1024 * 1024);
+            // And drop refunds fully.
+            drop(s);
+            assert_eq!(pool.used(), 0);
+        }
+
+        #[test]
+        fn syn_received_rst_to_listen_releases_pool_charge() {
+            // Regression for the listen-server pool-leak bug (independent
+            // review #2). When a listen socket transitions through
+            // SynReceived and then receives RST, smoltcp moves it back to
+            // Listen (tcp.rs handler ~line 2162). Before the fix this
+            // path skipped release_dyn_buffers, leaking pool charge on
+            // every failed handshake.
+            let pool = MemoryPool::new(64 * 1024);
+            let cfg = DynamicBufferConfig::symmetric(0, 32 * 1024, 8 * 1024);
+            let mut s = dyn_socket_listen(cfg, Some(pool.clone()));
+
+            // Verify the baseline: pool is empty while listening.
+            assert_eq!(pool.used(), 0);
+
+            // Push the socket into SynReceived and grow its buffers (which
+            // is what a real SYN-ACK dispatch would do).
+            s.state = State::SynReceived;
+            s.tuple = Some(TUPLE);
+            s.local_seq_no = LOCAL_SEQ;
+            s.remote_seq_no = REMOTE_SEQ + 1;
+            s.remote_last_seq = LOCAL_SEQ;
+            assert!(s.try_grow_rx());
+            let charged = pool.used();
+            assert!(charged > 0, "rx grow should have charged the pool");
+
+            // Now simulate the smoltcp handler's response to RST in
+            // SynReceived for a listen socket: return to Listen.
+            s.tuple = None;
+            s.set_state(State::Listen);
+
+            // The fix: this transition now releases the dynamic buffers
+            // so the listen socket goes back to the zero-charge state
+            // it had before the SYN arrived.
+            assert_eq!(
+                pool.used(),
+                0,
+                "SynReceived → Listen on RST must refund the pool charge"
+            );
+            assert_eq!(s.rx_buffer.capacity(), 0);
+            assert_eq!(s.tx_buffer.capacity(), 0);
+            assert_eq!(s.state, State::Listen);
+        }
     }
 }

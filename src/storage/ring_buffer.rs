@@ -407,6 +407,68 @@ impl<'a, T: 'a> From<ManagedSlice<'a, T>> for RingBuffer<'a, T> {
     }
 }
 
+/// Dynamic-storage operations. Only meaningful when the underlying storage is
+/// `ManagedSlice::Owned(Vec<T>)`; with `Borrowed` storage they are no-ops and
+/// return `false`, so static/`no_std` users are unaffected.
+#[cfg(feature = "alloc")]
+impl<'a, T: 'a + Copy + Default> RingBuffer<'a, T> {
+    /// Grow the backing storage to `new_capacity`, preserving the buffered
+    /// contents and their order. Returns `true` if the growth was applied.
+    ///
+    /// `false` is returned if storage is borrowed, if `new_capacity` does not
+    /// strictly exceed the current capacity, or if allocation fails (via
+    /// `Vec::try_reserve_exact`). The latter matters on hosts with strict
+    /// memory accounting (Darwin); on overcommit hosts (Linux) and jetsam-
+    /// style hosts (iOS) malloc rarely returns NULL but we still surface
+    /// failure instead of panicking.
+    pub fn try_grow(&mut self, new_capacity: usize) -> bool {
+        use alloc::vec::Vec;
+
+        let old_capacity = self.capacity();
+        if new_capacity <= old_capacity {
+            return false;
+        }
+        let owned = match &mut self.storage {
+            ManagedSlice::Owned(v) => v,
+            _ => return false,
+        };
+
+        let mut new_vec: Vec<T> = Vec::new();
+        if new_vec.try_reserve_exact(new_capacity).is_err() {
+            return false;
+        }
+        new_vec.resize(new_capacity, T::default());
+
+        let len = self.length;
+        let read_at = self.read_at;
+        if len > 0 && old_capacity > 0 {
+            if read_at + len <= old_capacity {
+                new_vec[..len].copy_from_slice(&owned[read_at..read_at + len]);
+            } else {
+                let head = old_capacity - read_at;
+                new_vec[..head].copy_from_slice(&owned[read_at..old_capacity]);
+                new_vec[head..len].copy_from_slice(&owned[..len - head]);
+            }
+        }
+
+        *owned = new_vec;
+        self.read_at = 0;
+        true
+    }
+
+    /// Release any owned storage (drops the backing `Vec`).
+    ///
+    /// The ring becomes empty and zero-capacity. No-op for borrowed storage.
+    /// After release, the ring can be re-grown via `try_grow`.
+    pub fn release_owned(&mut self) {
+        if let ManagedSlice::Owned(v) = &mut self.storage {
+            *v = alloc::vec::Vec::new();
+        }
+        self.read_at = 0;
+        self.length = 0;
+    }
+}
+
 #[cfg(test)]
 mod test {
     use super::*;
