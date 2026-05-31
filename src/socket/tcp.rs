@@ -799,85 +799,77 @@ impl<'a> Socket<'a> {
         target.min(max)
     }
 
-    /// Attempt to grow the rx buffer so the advertised window has room.
-    /// Called from `dispatch` before computing the advertised window.
+    /// Grow `buffer` one step toward `max`, charging the increment to the
+    /// shared pool via `state`. Shared by the rx and tx grow paths; the
+    /// only difference between them is which buffer and which cap.
     ///
     /// Returns `true` if any growth happened. Silent failure (pool
-    /// exhaustion, already at max, allocation refused) just leaves the
-    /// advertised window at its current value — the kernel-canonical
-    /// "advertise zero / small window on pressure" backpressure signal.
-    ///
-    /// `#[cold]` so the slow path doesn't bloat the calling context; the
-    /// hot-path check at the dispatch entry decides whether to dive in.
+    /// exhaustion, already at max, allocation refused) leaves the buffer
+    /// at its current size — the kernel-canonical "advertise zero / small
+    /// window (rx) or backpressure the writer (tx) on pressure" signal.
+    #[cfg(feature = "socket-tcp-dynamic-buffer")]
+    fn try_grow_buffer(
+        buffer: &mut SocketBuffer<'a>,
+        state: &mut dynbuf::DynBufState,
+        max: usize,
+    ) -> bool {
+        let pressure = state.pool.as_ref().is_some_and(|p| p.under_pressure());
+        let cur = buffer.capacity();
+        let want = Self::next_capacity(cur, state.grow_chunk as usize, max, pressure);
+        let Some(need) = want.checked_sub(cur).filter(|n| *n > 0) else {
+            return false;
+        };
+        if !state.charge(need) {
+            return false;
+        }
+        if !buffer.try_grow(want) {
+            // Allocation refused (e.g. Vec::try_reserve_exact failed).
+            // Refund what we just charged so accounting stays balanced.
+            state.refund(need);
+            return false;
+        }
+        true
+    }
+
+    /// Attempt to grow the rx buffer so the advertised window has room.
+    /// Called from `dispatch` before computing the advertised window.
+    /// `#[cold]`: the hot-path check at the dispatch entry decides whether
+    /// to dive in.
     #[cfg(feature = "socket-tcp-dynamic-buffer")]
     #[cold]
     fn try_grow_rx(&mut self) -> bool {
-        let Some(state) = self.dyn_state.as_mut() else {
+        let Some(state) = self.dyn_state.as_deref_mut() else {
             return false;
         };
-        let pressure = state.pool.as_ref().is_some_and(|p| p.under_pressure());
-        let want = Self::next_capacity(
-            self.rx_buffer.capacity(),
-            state.grow_chunk as usize,
-            state.rx_max as usize,
-            pressure,
-        );
-        let cur = self.rx_buffer.capacity();
-        let Some(need) = want.checked_sub(cur).filter(|n| *n > 0) else {
-            return false;
-        };
-        if !state.charge(need) {
-            return false;
-        }
-        if !self.rx_buffer.try_grow(want) {
-            // Allocation refused (e.g. Vec::try_reserve_exact failed).
-            // Refund what we just charged so accounting stays balanced.
-            state.refund_partial(need);
-            return false;
-        }
-        true
+        let max = state.rx_max as usize;
+        Self::try_grow_buffer(&mut self.rx_buffer, state, max)
     }
 
-    /// Attempt to grow the tx buffer for an upcoming write. Same shape as
-    /// `try_grow_rx`; silent failure becomes backpressure to the caller
-    /// (their `send_slice` enqueue copies fewer bytes and they retry).
+    /// Attempt to grow the tx buffer for an upcoming write. Silent failure
+    /// becomes backpressure to the caller (their `send_slice` enqueue
+    /// copies fewer bytes and they retry).
     #[cfg(feature = "socket-tcp-dynamic-buffer")]
     #[cold]
     fn try_grow_tx(&mut self) -> bool {
-        let Some(state) = self.dyn_state.as_mut() else {
+        let Some(state) = self.dyn_state.as_deref_mut() else {
             return false;
         };
-        let pressure = state.pool.as_ref().is_some_and(|p| p.under_pressure());
-        let want = Self::next_capacity(
-            self.tx_buffer.capacity(),
-            state.grow_chunk as usize,
-            state.tx_max as usize,
-            pressure,
-        );
-        let cur = self.tx_buffer.capacity();
-        let Some(need) = want.checked_sub(cur).filter(|n| *n > 0) else {
-            return false;
-        };
-        if !state.charge(need) {
-            return false;
-        }
-        if !self.tx_buffer.try_grow(want) {
-            state.refund_partial(need);
-            return false;
-        }
-        true
+        let max = state.tx_max as usize;
+        Self::try_grow_buffer(&mut self.tx_buffer, state, max)
     }
 
     /// Release the dynamic-buffer backing storage and refund the pool.
-    /// Called when transitioning to `Closed` and from `Drop`. Marked cold
-    /// because lifecycle ends are rare relative to dispatch frequency.
+    /// Called when transitioning to `Closed`/`Listen`, from `reset`, and
+    /// from `Drop`. Marked cold because lifecycle ends are rare relative
+    /// to dispatch frequency.
     #[cfg(feature = "socket-tcp-dynamic-buffer")]
     #[cold]
     fn release_dyn_buffers(&mut self) {
         if let Some(state) = self.dyn_state.as_mut() {
             self.rx_buffer.release_owned();
             self.tx_buffer.release_owned();
-            state.refund_all();
+            let charged = state.charged;
+            state.refund(charged);
         }
     }
 
@@ -1533,11 +1525,12 @@ impl<'a> Socket<'a> {
         // `tcp_sndbuf_expand` runs per ACK; XNU's auto-snd-grow fires once
         // when sb_cc crosses 7/8 of sb_hiwat. Failure is silent: the
         // enqueue copies fewer bytes and the caller sees backpressure via
-        // the returned `n`.
+        // the returned `n`. Window check first (cheapest discriminating
+        // guard) so a non-full buffer short-circuits immediately.
         #[cfg(feature = "socket-tcp-dynamic-buffer")]
         if let Some(state) = self.dyn_state.as_ref()
-            && self.tx_growth_allowed()
             && self.tx_buffer.window() < state.grow_chunk as usize
+            && self.tx_growth_allowed()
         {
             self.try_grow_tx();
         }
@@ -2734,10 +2727,15 @@ impl<'a> Socket<'a> {
         // `tcp_rcv_space_adjust` runs per recvmsg / per RTT-cycle, not in
         // a loop). Failure (pool exhausted, at max) silently collapses the
         // advertised window — the kernel-canonical backpressure signal.
+        //
+        // Guard order is cheapest-discriminating-first: the window check is
+        // usually false (buffer has room) in steady state, so it
+        // short-circuits before the state-machine match in
+        // `rx_growth_allowed`.
         #[cfg(feature = "socket-tcp-dynamic-buffer")]
         if let Some(state) = self.dyn_state.as_ref()
-            && self.rx_growth_allowed()
             && self.rx_buffer.window() < (state.grow_chunk as usize).max(self.remote_mss as usize)
+            && self.rx_growth_allowed()
         {
             self.try_grow_rx();
         }

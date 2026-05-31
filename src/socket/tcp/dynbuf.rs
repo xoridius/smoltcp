@@ -300,34 +300,31 @@ impl DynBufState {
         true
     }
 
-    /// Refund all of this socket's outstanding charge to the pool.
-    pub(super) fn refund_all(&mut self) {
-        if let Some(pool) = &self.pool
-            && self.charged > 0
-        {
-            pool.refund(self.charged);
+    /// Refund `bytes` of this socket's outstanding charge to the pool,
+    /// clamped to what is actually charged. Used both for full release
+    /// (`refund(self.charged)` on close/reset/drop) and for the
+    /// grow-failure rollback path (`refund(need)` when `try_grow`
+    /// rejects the freshly-charged increment).
+    pub(super) fn refund(&mut self, bytes: usize) {
+        let bytes = bytes.min(self.charged);
+        if bytes == 0 {
+            return;
         }
-        self.charged = 0;
-    }
-
-    /// Refund a partial amount (used on the grow-failure rollback path
-    /// where `try_grow` rejects the freshly-charged increment).
-    pub(super) fn refund_partial(&mut self, bytes: usize) {
-        self.charged = self.charged.saturating_sub(bytes);
         if let Some(pool) = &self.pool {
             pool.refund(bytes);
         }
+        self.charged -= bytes;
     }
 }
 
 /// Refund the pool when the per-socket state is dropped — covers
 /// `SocketSet::remove`, SocketSet teardown, and any other path where a
 /// `Socket` is dropped without first going through `set_state(Closed)`
-/// or `reset()`. Idempotent: explicit close paths already call
-/// `refund_all` and leave `charged == 0` here.
+/// or `reset()`. Idempotent: explicit close paths already refund and
+/// leave `charged == 0` here.
 impl Drop for DynBufState {
     fn drop(&mut self) {
-        self.refund_all();
+        self.refund(self.charged);
     }
 }
 

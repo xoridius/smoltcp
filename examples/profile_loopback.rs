@@ -653,6 +653,30 @@ fn make_endpoint(
     }
 }
 
+/// Build a back-to-back server/client `Endpoint` pair joined by two
+/// `Lane`s, with the server at `base.0.0.1` and the client at
+/// `base.0.0.2`. Shared by the multi-flow / churn / idle_hot shapes,
+/// which only ever need the two endpoints (the lanes live inside the
+/// `PairedDevice`s and are not referenced afterward).
+fn setup_paired_endpoints(
+    base: u8,
+    mtu: usize,
+    queue_depth: usize,
+    offload: bool,
+) -> (Endpoint<'static>, Endpoint<'static>) {
+    let lane_a: LaneRc = Rc::new(RefCell::new(Lane::new(mtu, queue_depth)));
+    let lane_b: LaneRc = Rc::new(RefCell::new(Lane::new(mtu, queue_depth)));
+    let server = make_endpoint(
+        IpAddress::v4(base, 0, 0, 1),
+        mtu,
+        lane_a.clone(),
+        lane_b.clone(),
+        offload,
+    );
+    let client = make_endpoint(IpAddress::v4(base, 0, 0, 2), mtu, lane_b, lane_a, offload);
+    (server, client)
+}
+
 fn add_tcp_socket(ep: &mut Endpoint<'static>, buf_size: usize) -> smoltcp::iface::SocketHandle {
     let rx = tcp::SocketBuffer::new(vec![0u8; buf_size]);
     let tx = tcp::SocketBuffer::new(vec![0u8; buf_size]);
@@ -1778,25 +1802,10 @@ fn shape_multi_tcp(seconds: u64, n_threads: usize, flows_per_thread: usize, offl
         let barrier = barrier.clone();
         handles.push(thread::spawn(move || {
             let qd = (flows_per_thread * 16).clamp(1024, 16384);
-            let lane_a: LaneRc = Rc::new(RefCell::new(Lane::new(1500, qd)));
-            let lane_b: LaneRc = Rc::new(RefCell::new(Lane::new(1500, qd)));
-            // Use distinct addresses per thread so server/client tuples don't
+            // Distinct base address per thread so server/client tuples don't
             // clash if anything inspects them (they won't — lanes are isolated).
             let base = 10 + tid as u8;
-            let mut server = make_endpoint(
-                IpAddress::v4(base, 0, 0, 1),
-                1500,
-                lane_a.clone(),
-                lane_b.clone(),
-                offload,
-            );
-            let mut client = make_endpoint(
-                IpAddress::v4(base, 0, 0, 2),
-                1500,
-                lane_b.clone(),
-                lane_a.clone(),
-                offload,
-            );
+            let (mut server, mut client) = setup_paired_endpoints(base, 1500, qd, offload);
 
             let mut srv_handles = Vec::with_capacity(flows_per_thread);
             let mut cli_handles = Vec::with_capacity(flows_per_thread);
@@ -2000,25 +2009,10 @@ fn shape_churn(seconds: u64, target_conn_per_sec: usize, offload: bool) {
     const PAYLOAD: usize = 128;
 
     let qd = (SLOTS * 16).clamp(1024, 16384);
-    let lane_a: LaneRc = Rc::new(RefCell::new(Lane::new(1500, qd)));
-    let lane_b: LaneRc = Rc::new(RefCell::new(Lane::new(1500, qd)));
     let pool_bytes: usize = SLOTS * 2 * MAX_BUF as usize;
     let pool = tcp::MemoryPool::new(pool_bytes);
 
-    let mut server = make_endpoint(
-        IpAddress::v4(10, 0, 0, 1),
-        1500,
-        lane_a.clone(),
-        lane_b.clone(),
-        offload,
-    );
-    let mut client = make_endpoint(
-        IpAddress::v4(10, 0, 0, 2),
-        1500,
-        lane_b.clone(),
-        lane_a.clone(),
-        offload,
-    );
+    let (mut server, mut client) = setup_paired_endpoints(10, 1500, qd, offload);
 
     // Pre-allocate a ring of socket handles. Each "churn slot" is a pair
     // we cycle through; once a pair is fully torn down we recycle the slot.
@@ -2156,25 +2150,10 @@ fn shape_idle_hot(seconds: u64, n_idle: usize, n_active: usize, offload: bool) {
     const PAYLOAD: usize = 1024;
     let total = n_idle + n_active;
     let qd = (total * 16).clamp(1024, 16384);
-    let lane_a: LaneRc = Rc::new(RefCell::new(Lane::new(1500, qd)));
-    let lane_b: LaneRc = Rc::new(RefCell::new(Lane::new(1500, qd)));
     let pool_bytes: usize = (n_active * 2 + 1) * MAX_BUF as usize * 2;
     let pool = tcp::MemoryPool::new(pool_bytes);
 
-    let mut server = make_endpoint(
-        IpAddress::v4(10, 0, 0, 1),
-        1500,
-        lane_a.clone(),
-        lane_b.clone(),
-        offload,
-    );
-    let mut client = make_endpoint(
-        IpAddress::v4(10, 0, 0, 2),
-        1500,
-        lane_b.clone(),
-        lane_a.clone(),
-        offload,
-    );
+    let (mut server, mut client) = setup_paired_endpoints(10, 1500, qd, offload);
 
     // Active flows: open & connect.
     let mut srv_active: Vec<smoltcp::iface::SocketHandle> = Vec::with_capacity(n_active);
