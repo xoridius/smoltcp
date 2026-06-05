@@ -8,15 +8,112 @@ use log::{Level, LevelFilter, trace};
 use std::env;
 use std::fs::File;
 use std::io::{self, Write};
+#[cfg(all(
+    feature = "phy-tuntap_interface",
+    not(any(target_os = "linux", target_os = "android"))
+))]
+use std::os::fd::{AsRawFd, RawFd};
 use std::process;
 use std::str::{self, FromStr};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-#[cfg(feature = "phy-tuntap_interface")]
+#[cfg(all(
+    feature = "phy-tuntap_interface",
+    not(any(target_os = "linux", target_os = "android"))
+))]
+use smoltcp::phy::DeviceCapabilities;
+#[cfg(all(
+    feature = "phy-tuntap_interface",
+    any(target_os = "linux", target_os = "android")
+))]
 use smoltcp::phy::TunTapInterface;
 use smoltcp::phy::{Device, FaultInjector, Medium, Tracer};
 use smoltcp::phy::{PcapMode, PcapWriter};
 use smoltcp::time::{Duration, Instant};
+
+#[cfg(all(
+    feature = "phy-tuntap_interface",
+    not(any(target_os = "linux", target_os = "android"))
+))]
+#[derive(Debug)]
+pub struct TunTapInterface;
+
+#[cfg(all(
+    feature = "phy-tuntap_interface",
+    not(any(target_os = "linux", target_os = "android"))
+))]
+impl AsRawFd for TunTapInterface {
+    fn as_raw_fd(&self) -> RawFd {
+        panic!("TUN/TAP examples require Linux or Android")
+    }
+}
+
+#[cfg(all(
+    feature = "phy-tuntap_interface",
+    not(any(target_os = "linux", target_os = "android"))
+))]
+impl Device for TunTapInterface {
+    type RxToken<'a>
+        = UnsupportedTunTapRxToken
+    where
+        Self: 'a;
+    type TxToken<'a>
+        = UnsupportedTunTapTxToken
+    where
+        Self: 'a;
+
+    fn receive(&mut self, _timestamp: Instant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
+        panic!("TUN/TAP examples require Linux or Android")
+    }
+
+    fn transmit(&mut self, _timestamp: Instant) -> Option<Self::TxToken<'_>> {
+        panic!("TUN/TAP examples require Linux or Android")
+    }
+
+    fn capabilities(&self) -> DeviceCapabilities {
+        let mut caps = DeviceCapabilities::default();
+        caps.medium = Medium::Ethernet;
+        caps
+    }
+}
+
+#[cfg(all(
+    feature = "phy-tuntap_interface",
+    not(any(target_os = "linux", target_os = "android"))
+))]
+pub struct UnsupportedTunTapRxToken;
+
+#[cfg(all(
+    feature = "phy-tuntap_interface",
+    not(any(target_os = "linux", target_os = "android"))
+))]
+impl smoltcp::phy::RxToken for UnsupportedTunTapRxToken {
+    fn consume<R, F>(self, _f: F) -> R
+    where
+        F: FnOnce(&[u8]) -> R,
+    {
+        panic!("TUN/TAP examples require Linux or Android")
+    }
+}
+
+#[cfg(all(
+    feature = "phy-tuntap_interface",
+    not(any(target_os = "linux", target_os = "android"))
+))]
+pub struct UnsupportedTunTapTxToken;
+
+#[cfg(all(
+    feature = "phy-tuntap_interface",
+    not(any(target_os = "linux", target_os = "android"))
+))]
+impl smoltcp::phy::TxToken for UnsupportedTunTapTxToken {
+    fn consume<R, F>(self, _len: usize, _f: F) -> R
+    where
+        F: FnOnce(&mut [u8]) -> R,
+    {
+        panic!("TUN/TAP examples require Linux or Android")
+    }
+}
 
 #[cfg(feature = "log")]
 pub fn setup_logging_with_clock<F>(filter: &str, since_startup: F)
@@ -98,12 +195,21 @@ pub fn add_tuntap_options(opts: &mut Options, _free: &mut [&str]) {
 
 #[cfg(feature = "phy-tuntap_interface")]
 pub fn parse_tuntap_options(matches: &mut Matches) -> TunTapInterface {
-    let tun = matches.opt_str("tun");
-    let tap = matches.opt_str("tap");
-    match (tun, tap) {
-        (Some(tun), None) => TunTapInterface::new(&tun, Medium::Ip).unwrap(),
-        (None, Some(tap)) => TunTapInterface::new(&tap, Medium::Ethernet).unwrap(),
-        _ => panic!("You must specify exactly one of --tun or --tap"),
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    {
+        let _ = matches;
+        panic!("TUN/TAP examples require Linux or Android")
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        let tun = matches.opt_str("tun");
+        let tap = matches.opt_str("tap");
+        match (tun, tap) {
+            (Some(tun), None) => TunTapInterface::new(&tun, Medium::Ip).unwrap(),
+            (None, Some(tap)) => TunTapInterface::new(&tap, Medium::Ethernet).unwrap(),
+            _ => panic!("You must specify exactly one of --tun or --tap"),
+        }
     }
 }
 

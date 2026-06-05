@@ -142,10 +142,7 @@ where
         },
     );
 
-    let device = Tracer::new(device, |_timestamp, _printer| {
-        #[cfg(feature = "log")]
-        trace!("{}", _printer);
-    });
+    let device = Tracer::new(device, |_timestamp, _printer| {});
     let mut device = FaultInjector::new(device, seed);
     device.set_drop_chance(drop_chance);
     device.set_corrupt_chance(corrupt_chance);

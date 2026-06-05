@@ -971,20 +971,14 @@ pub mod checksum {
                 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 15, 16, 17, 31, 32, 33, 63, 64, 65, 127, 128, 129,
                 255, 256, 511, 512, 576, 1023, 1024, 1500, 1501, 4096, 4097, 9000, 65535,
             ];
-            let patterns: [&dyn Fn(usize) -> u8; 4] = [
-                &|_| 0,
-                &|_| 0xff,
-                &|i| (i & 0xff) as u8,
-                &|i| ((i * 31 + 7) & 0xff) as u8,
-            ];
+            let patterns: [&dyn Fn(usize) -> u8; 4] =
+                [&|_| 0, &|_| 0xff, &|i| (i & 0xff) as u8, &|i| {
+                    ((i * 31 + 7) & 0xff) as u8
+                }];
             for &size in &sizes {
                 for pat in &patterns {
                     let buf: alloc::vec::Vec<u8> = (0..size).map(pat).collect();
-                    assert_eq!(
-                        data(&buf),
-                        data_reference(&buf),
-                        "mismatch at size={size}"
-                    );
+                    assert_eq!(data(&buf), data_reference(&buf), "mismatch at size={size}");
                 }
             }
         }

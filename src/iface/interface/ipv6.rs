@@ -211,8 +211,7 @@ impl InterfaceInner {
         };
 
         if !self.has_ip_addr(ipv6_repr.dst_addr)
-            && !(ipv6_repr.dst_addr.is_multicast()
-                && self.has_multicast_group(ipv6_repr.dst_addr))
+            && !(ipv6_repr.dst_addr.is_multicast() && self.has_multicast_group(ipv6_repr.dst_addr))
         {
             if !ipv6_repr.dst_addr.x_is_unicast() {
                 net_trace!(

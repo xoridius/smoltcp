@@ -60,9 +60,7 @@ impl Controller for Reno {
         // RFC 6928 IW = min(10*MSS, max(2*MSS, 14600)). Called when the peer's
         // MSS is learned (on SYN) so we open at this size before any data
         // segments. mss fits in 16 bits so 10*mss never overflows u32.
-        self.cwnd = self
-            .cwnd
-            .max((10 * mss).min((2 * mss).max(14_600)));
+        self.cwnd = self.cwnd.max((10 * mss).min((2 * mss).max(14_600)));
     }
 
     fn set_remote_window(&mut self, remote_window: usize) {

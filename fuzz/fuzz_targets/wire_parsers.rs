@@ -38,13 +38,11 @@ fuzz_target!(|data: &[u8]| {
             }
         }
         4 => {
-            #[cfg(feature = "proto-ipsec-ah")]
             if let Ok(pkt) = IpSecAuthHeaderPacket::new_checked(body) {
                 let _ = IpSecAuthHeaderRepr::parse(&pkt);
             }
         }
         5 => {
-            #[cfg(feature = "proto-sixlowpan")]
             if let Ok(pkt) = SixlowpanExtHeaderPacket::new_checked(body) {
                 let _ = SixlowpanExtHeaderRepr::parse(&pkt);
             }

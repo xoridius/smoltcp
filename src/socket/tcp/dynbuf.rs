@@ -30,11 +30,12 @@
 //!   negotiated, the scale cannot change, so it must accommodate any future
 //!   growth.
 //!
-//! * `rx_buffer.capacity()` is monotonically non-decreasing during a
-//!   connection's lifetime. We only shrink (release) when the socket
-//!   transitions into the `Closed` state — by which point any peer
-//!   already-in-flight bytes will arrive at a buffer that's about to drop
-//!   them anyway.
+//! * `rx_buffer.capacity()` is monotonically non-decreasing while a live peer
+//!   can still deliver bytes into the receive half. We release only after the
+//!   state machine no longer needs queued bytes to compute sequence numbers or
+//!   acknowledgments: failed passive handshakes returning to `Listen`, aborts
+//!   after the RST is emitted, final `LastAck`, terminal `TimeWait`, reset, and
+//!   drop.
 //!
 //! * The advertised window is always `capacity() - len()`; the pool only
 //!   gates *growing* capacity, never the in-flight `len()`. The wire layer

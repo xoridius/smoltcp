@@ -1,6 +1,6 @@
 #![no_main]
 use libfuzzer_sys::fuzz_target;
-use smoltcp::iface::{InterfaceBuilder, NeighborCache};
+use smoltcp::iface::{Config, Interface, SocketSet};
 use smoltcp::phy::{Loopback, Medium};
 use smoltcp::socket::tcp;
 use smoltcp::time::{Duration, Instant};
@@ -8,16 +8,12 @@ use smoltcp::wire::{EthernetAddress, EthernetFrame, EthernetProtocol};
 use smoltcp::wire::{IpAddress, IpCidr, Ipv4Packet, Ipv6Packet, TcpPacket};
 use std::cmp;
 
-#[path = "../utils.rs"]
-mod utils;
-
 mod mock {
     use smoltcp::time::{Duration, Instant};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     #[derive(Debug, Clone)]
-    #[cfg_attr(feature = "defmt", derive(defmt::Format))]
     pub struct Clock(Arc<AtomicU64>);
 
     impl Clock {
@@ -112,29 +108,19 @@ impl smoltcp::phy::Fuzzer for EmptyFuzzer {
 fuzz_target!(|data: &[u8]| {
     let clock = mock::Clock::new();
 
-    let device = {
-        let (mut opts, mut free) = utils::create_options();
-        utils::add_middleware_options(&mut opts, &mut free);
+    let mut device = smoltcp::phy::FuzzInjector::new(
+        Loopback::new(Medium::Ethernet),
+        EmptyFuzzer(),
+        TcpHeaderFuzzer::new(data),
+    );
 
-        let mut matches = utils::parse_options(&opts, free);
-        let device = utils::parse_middleware_options(
-            &mut matches,
-            Loopback::new(Medium::Ethernet),
-            /*loopback=*/ true,
-        );
-
-        smoltcp::phy::FuzzInjector::new(device, EmptyFuzzer(), TcpHeaderFuzzer::new(data))
-    };
-
-    let mut neighbor_cache_entries = [None; 8];
-    let neighbor_cache = NeighborCache::new(&mut neighbor_cache_entries[..]);
-
-    let ip_addrs = [IpCidr::new(IpAddress::v4(127, 0, 0, 1), 8)];
-    let mut iface = InterfaceBuilder::new()
-        .ethernet_addr(EthernetAddress::default())
-        .neighbor_cache(neighbor_cache)
-        .ip_addrs(ip_addrs)
-        .finalize(&mut device);
+    let config = Config::new(EthernetAddress::default().into());
+    let mut iface = Interface::new(config, &mut device, clock.elapsed());
+    iface.update_ip_addrs(|ip_addrs| {
+        ip_addrs
+            .push(IpCidr::new(IpAddress::v4(127, 0, 0, 1), 8))
+            .unwrap();
+    });
 
     let server_socket = {
         // It is not strictly necessary to use a `static mut` and unsafe code here, but
@@ -165,10 +151,10 @@ fuzz_target!(|data: &[u8]| {
     let mut did_connect = false;
     let mut done = false;
     while !done && clock.elapsed() < Instant::from_millis(4_000) {
-        let _ = iface.poll(&mut socket_set, clock.elapsed());
+        let _ = iface.poll(clock.elapsed(), &mut device, &mut socket_set);
 
         {
-            let mut socket = socket_set.get::<tcp::Socket>(server_handle);
+            let socket = socket_set.get_mut::<tcp::Socket>(server_handle);
             if !socket.is_active() && !socket.is_listening() {
                 if !did_listen {
                     socket.listen(1234).unwrap();
@@ -183,14 +169,12 @@ fuzz_target!(|data: &[u8]| {
         }
 
         {
-            let mut socket = socket_set.get::<tcp::Socket>(client_handle);
+            let socket = socket_set.get_mut::<tcp::Socket>(client_handle);
             if !socket.is_open() {
                 if !did_connect {
+                    let cx = iface.context();
                     socket
-                        .connect(
-                            (IpAddress::v4(127, 0, 0, 1), 1234),
-                            (IpAddress::Unspecified, 65000),
-                        )
+                        .connect(cx, (IpAddress::v4(127, 0, 0, 1), 1234), 65000)
                         .unwrap();
                     did_connect = true;
                 }
@@ -204,7 +188,7 @@ fuzz_target!(|data: &[u8]| {
             }
         }
 
-        match iface.poll_delay(&socket_set, clock.elapsed()) {
+        match iface.poll_delay(clock.elapsed(), &socket_set) {
             Some(Duration::ZERO) => {}
             Some(delay) => clock.advance(delay),
             None => clock.advance(Duration::from_millis(1)),

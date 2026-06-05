@@ -119,9 +119,7 @@ impl Controller for Cubic {
         // RFC 6928 IW = min(10*MSS, max(2*MSS, 14600)). Called when the peer's
         // MSS is learned (on SYN) so we open at this size before any data
         // segments. mss fits in 16 bits so 10*mss never overflows u32.
-        self.cwnd = self
-            .cwnd
-            .max((10 * mss).min((2 * mss).max(14_600)));
+        self.cwnd = self.cwnd.max((10 * mss).min((2 * mss).max(14_600)));
     }
 }
 
@@ -338,11 +336,7 @@ mod test {
         cubic.set_remote_window(64 * 1024);
         cubic.set_remote_window(4 * 1024);
         cubic.set_mss(1460);
-        cubic.on_ack(
-            Instant::from_millis(0),
-            100_000,
-            &RttEstimator::default(),
-        );
+        cubic.on_ack(Instant::from_millis(0), 100_000, &RttEstimator::default());
         assert!(cubic.window() <= 4 * 1024);
     }
 }

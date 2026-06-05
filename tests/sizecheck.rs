@@ -10,9 +10,11 @@ fn print_sizes() {
     use smoltcp::storage::*;
     use smoltcp::wire::*;
 
-    macro_rules! row { ($t:ty) => {
-        println!("  {:>5}  {}", size_of::<$t>(), stringify!($t));
-    }; }
+    macro_rules! row {
+        ($t:ty) => {
+            println!("  {:>5}  {}", size_of::<$t>(), stringify!($t));
+        };
+    }
 
     println!("\n--- smoltcp footprint ---");
     row!(socket::tcp::Socket<'static>);
