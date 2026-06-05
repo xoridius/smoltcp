@@ -7,7 +7,7 @@
 //!   * throughput (Gbps app, Gbps wire, Mpps)
 //!   * per-poll latency: mean / p50 / p90 / p99 / max
 //!   * allocation count + bytes allocated (instrumented allocator)
-//!   * RSS peak (from /proc/self/status)
+//!   * RSS / footprint (Linux `/proc`; macOS Mach task info)
 //!   * smoltcp Socket footprint of relevant sockets
 //!   * `cycles_estimate` per packet from a 2.4 GHz reference
 //!
@@ -15,18 +15,23 @@
 //! `heaptrack` with no external setup.
 //!
 //! Usage:
-//!   cargo run --release --example profile_loopback -- [shape] [seconds] [opts...]
+//!   cargo run --release --example profile_loopback -- [--mode bench|trace] [shape] [seconds] [opts...]
 //!
 //! Shapes:
 //!   udp           - 1400B UDP packet forwarding (default; tunnel analogue)
 //!   small         - many small TCP segments, measures per-packet overhead
 //!   pingpong      - 128B request/response, latency-bound
 //!   firehose      - one-way TCP bulk transfer (cwnd-limited)
-//!   many_tcp      - N concurrent TCP echo flows; verifies per-flow fairness +
-//!                   memory growth bounds. Usage:
+//!   many_tcp      - N concurrent TCP echo flows; stresses throughput,
+//!                   memory growth, and starvation. Usage:
 //!                     profile_loopback many_tcp 5 200 [offload]
+//!   many_tcp_fair - N concurrent TCP flows with deterministic per-flow
+//!                   scheduling. Usage:
+//!                     profile_loopback many_tcp_fair 5 200 [offload]
 //!   many_udp      - N concurrent UDP flows; same fairness + memory metrics.
 //!                     profile_loopback many_udp 5 200 [offload]
+//!   multi_tcp     - dynamic-buffer multi-thread TCP echo workload.
+//!   multi_tcp_sink - dynamic-buffer multi-thread one-way TCP sink workload.
 //!   all           - runs udp + small + pingpong back-to-back
 //!
 //! Recommended profiling recipes:
@@ -43,6 +48,40 @@ use std::env;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant as StdInstant;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RunMode {
+    Bench,
+    Trace,
+}
+
+impl RunMode {
+    fn parse(value: &str) -> Self {
+        match value {
+            "bench" => Self::Bench,
+            "trace" => Self::Trace,
+            other => {
+                eprintln!("unknown --mode '{other}', expected bench|trace");
+                std::process::exit(2);
+            }
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Bench => "bench",
+            Self::Trace => "trace",
+        }
+    }
+
+    fn sample_memory(self) -> bool {
+        matches!(self, Self::Bench)
+    }
+
+    fn strict_lane_pool(self) -> bool {
+        matches!(self, Self::Trace)
+    }
+}
 
 /// Tracks every allocation routed through the global allocator. We only count
 /// counter atomics (Relaxed), so the overhead is two adds per alloc/free.
@@ -75,41 +114,114 @@ static A: CountingAlloc = CountingAlloc;
 #[global_allocator]
 static A: dhat::Alloc = dhat::Alloc;
 
-/// Read VmRSS (kB) from /proc/self/status, returning bytes. Returns 0 on
-/// non-Linux platforms.
+/// Read process resident memory in bytes.
 fn rss_bytes() -> u64 {
-    let s = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
-    for line in s.lines() {
-        if let Some(rest) = line.strip_prefix("VmRSS:") {
-            let kib: u64 = rest
-                .split_whitespace()
-                .next()
-                .and_then(|n| n.parse().ok())
-                .unwrap_or(0);
-            return kib * 1024;
+    #[cfg(target_os = "linux")]
+    {
+        let s = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
+        for line in s.lines() {
+            if let Some(rest) = line.strip_prefix("VmRSS:") {
+                let kib: u64 = rest
+                    .split_whitespace()
+                    .next()
+                    .and_then(|n| n.parse().ok())
+                    .unwrap_or(0);
+                return kib * 1024;
+            }
         }
+        0
     }
-    0
+    #[cfg(target_os = "macos")]
+    {
+        macos_phys_footprint_bytes().unwrap_or(0)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        0
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct TaskVmInfo {
+    virtual_size: u64,
+    region_count: i32,
+    page_size: i32,
+    resident_size: u64,
+    resident_size_peak: u64,
+    device: u64,
+    device_peak: u64,
+    internal: u64,
+    internal_peak: u64,
+    external: u64,
+    external_peak: u64,
+    reusable: u64,
+    reusable_peak: u64,
+    purgeable_volatile_pmap: u64,
+    purgeable_volatile_resident: u64,
+    purgeable_volatile_virtual: u64,
+    compressed: u64,
+    compressed_peak: u64,
+    compressed_lifetime: u64,
+    phys_footprint: u64,
+}
+
+#[cfg(target_os = "macos")]
+unsafe extern "C" {
+    fn mach_task_self() -> u32;
+    fn task_info(task: u32, flavor: i32, info: *mut i32, count: *mut u32) -> i32;
+}
+
+#[cfg(target_os = "macos")]
+fn macos_phys_footprint_bytes() -> Option<u64> {
+    const KERN_SUCCESS: i32 = 0;
+    const TASK_VM_INFO: i32 = 22;
+
+    let mut info = TaskVmInfo::default();
+    let mut count = (core::mem::size_of::<TaskVmInfo>() / core::mem::size_of::<i32>()) as u32;
+    let kr = unsafe {
+        task_info(
+            mach_task_self(),
+            TASK_VM_INFO,
+            (&mut info as *mut TaskVmInfo).cast::<i32>(),
+            &mut count,
+        )
+    };
+    if kr == KERN_SUCCESS {
+        Some(info.phys_footprint.max(info.resident_size))
+    } else {
+        None
+    }
 }
 
 /// Read voluntary + involuntary context-switch counts from
-/// /proc/self/status. Returns `(voluntary, nonvoluntary)`.
+/// /proc/self/status on Linux. macOS users should use Instruments System
+/// Trace for per-thread context-switch analysis.
+/// Returns `(voluntary, nonvoluntary)`.
 /// Voluntary = process blocked / yielded (rare in our spin loops);
 /// nonvoluntary = preempted by the scheduler. Multi-thread shapes
 /// expect a small voluntary count and a nonvoluntary count proportional
 /// to N_threads × wall_time / time_slice.
 fn ctxsw_counts() -> (u64, u64) {
-    let s = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
-    let mut vol = 0u64;
-    let mut nvol = 0u64;
-    for line in s.lines() {
-        if let Some(rest) = line.strip_prefix("voluntary_ctxt_switches:") {
-            vol = rest.trim().parse().unwrap_or(0);
-        } else if let Some(rest) = line.strip_prefix("nonvoluntary_ctxt_switches:") {
-            nvol = rest.trim().parse().unwrap_or(0);
+    #[cfg(target_os = "linux")]
+    {
+        let s = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
+        let mut vol = 0u64;
+        let mut nvol = 0u64;
+        for line in s.lines() {
+            if let Some(rest) = line.strip_prefix("voluntary_ctxt_switches:") {
+                vol = rest.trim().parse().unwrap_or(0);
+            } else if let Some(rest) = line.strip_prefix("nonvoluntary_ctxt_switches:") {
+                nvol = rest.trim().parse().unwrap_or(0);
+            }
         }
+        (vol, nvol)
     }
-    (vol, nvol)
+    #[cfg(not(target_os = "linux"))]
+    {
+        (0, 0)
+    }
 }
 
 /// Log-linear latency histogram: each power-of-two range [2^k, 2^(k+1)) is
@@ -399,7 +511,10 @@ impl MemTrace {
         }
         println!();
         println!("  memory trace (snapshot every ~250 ms):");
-        println!("    {:>8}   {:>10}   {:>10}", "t_ms", "rss_bytes", "alloc_delta");
+        println!(
+            "    {:>8}   {:>10}   {:>10}",
+            "t_ms", "rss_bytes", "alloc_delta"
+        );
         for (t, rss, alloc) in &self.samples {
             println!("    {:>8}   {:>10}   {:>10}", t, rss, alloc);
         }
@@ -479,6 +594,23 @@ impl Packet {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+struct LaneStats {
+    fallback_allocs: u64,
+    pool_misses: u64,
+    max_queue_depth: usize,
+    max_pool_depth: usize,
+}
+
+impl LaneStats {
+    fn merge(&mut self, other: Self) {
+        self.fallback_allocs += other.fallback_allocs;
+        self.pool_misses += other.pool_misses;
+        self.max_queue_depth = self.max_queue_depth.max(other.max_queue_depth);
+        self.max_pool_depth = self.max_pool_depth.max(other.max_pool_depth);
+    }
+}
+
 /// One direction of the paired link.
 ///
 /// `queue` holds packets in flight (FIFO). `pool` holds empty buffers we
@@ -486,32 +618,80 @@ impl Packet {
 struct Lane {
     queue: VecDeque<Packet>,
     pool: Vec<Packet>,
+    stats: LaneStats,
+    strict_pool: bool,
 }
 
 impl Lane {
-    fn new(mtu: usize, depth: usize) -> Self {
+    fn new(mtu: usize, depth: usize, mode: RunMode) -> Self {
         let mut pool = Vec::with_capacity(depth);
         for _ in 0..depth {
             pool.push(Packet::with_capacity(mtu));
         }
+        let stats = LaneStats {
+            max_pool_depth: pool.len(),
+            ..LaneStats::default()
+        };
         Self {
             queue: VecDeque::with_capacity(depth),
             pool,
+            stats,
+            strict_pool: mode.strict_lane_pool(),
         }
     }
 
     /// Borrow an empty buffer (allocating only if the pool runs dry).
     fn take_pkt(&mut self, mtu: usize) -> Packet {
-        self.pool.pop().unwrap_or_else(|| Packet::with_capacity(mtu))
+        if let Some(pkt) = self.pool.pop() {
+            return pkt;
+        }
+
+        self.stats.pool_misses += 1;
+        if self.strict_pool {
+            panic!(
+                "trace-mode packet pool exhausted: mtu={mtu}, queued={}, pool_misses={}",
+                self.queue.len(),
+                self.stats.pool_misses
+            );
+        }
+        self.stats.fallback_allocs += 1;
+        Packet::with_capacity(mtu)
+    }
+
+    fn queue_pkt(&mut self, pkt: Packet) {
+        self.queue.push_back(pkt);
+        self.stats.max_queue_depth = self.stats.max_queue_depth.max(self.queue.len());
     }
 
     fn return_pkt(&mut self, mut pkt: Packet) {
         pkt.len = 0;
         self.pool.push(pkt);
+        self.stats.max_pool_depth = self.stats.max_pool_depth.max(self.pool.len());
+    }
+
+    fn stats(&self) -> LaneStats {
+        self.stats
     }
 }
 
 type LaneRc = Rc<RefCell<Lane>>;
+
+fn collect_lane_stats(lanes: &[&LaneRc]) -> LaneStats {
+    let mut stats = LaneStats::default();
+    for lane in lanes {
+        stats.merge(lane.borrow().stats());
+    }
+    stats
+}
+
+fn print_lane_stats(label: &str, stats: LaneStats) {
+    println!();
+    println!("  lane stats ({label}):");
+    println!("    fallback allocs:      {}", stats.fallback_allocs);
+    println!("    pool misses:          {}", stats.pool_misses);
+    println!("    max queue depth:      {}", stats.max_queue_depth);
+    println!("    max pool depth:       {}", stats.max_pool_depth);
+}
 
 /// A `Device` that sends to one queue and receives from another. Two of these
 /// (with the queues swapped) form a paired link between two `Interface`s.
@@ -621,7 +801,7 @@ impl<'a> phy::TxToken for PairedTx<'a> {
         pkt.len = len;
         *self.tx_bytes += len as u64;
         *self.tx_packets += 1;
-        self.tx.borrow_mut().queue.push_back(pkt);
+        self.tx.borrow_mut().queue_pkt(pkt);
         r
     }
 }
@@ -655,17 +835,18 @@ fn make_endpoint(
 
 /// Build a back-to-back server/client `Endpoint` pair joined by two
 /// `Lane`s, with the server at `base.0.0.1` and the client at
-/// `base.0.0.2`. Shared by the multi-flow / churn / idle_hot shapes,
-/// which only ever need the two endpoints (the lanes live inside the
-/// `PairedDevice`s and are not referenced afterward).
+/// `base.0.0.2`. The returned lane handles let callers report whether the
+/// harness packet pool had to allocate outside its prebuilt buffers.
+#[cfg_attr(not(feature = "socket-tcp-dynamic-buffer"), allow(dead_code))]
 fn setup_paired_endpoints(
     base: u8,
     mtu: usize,
     queue_depth: usize,
     offload: bool,
-) -> (Endpoint<'static>, Endpoint<'static>) {
-    let lane_a: LaneRc = Rc::new(RefCell::new(Lane::new(mtu, queue_depth)));
-    let lane_b: LaneRc = Rc::new(RefCell::new(Lane::new(mtu, queue_depth)));
+    mode: RunMode,
+) -> (Endpoint<'static>, Endpoint<'static>, LaneRc, LaneRc) {
+    let lane_a: LaneRc = Rc::new(RefCell::new(Lane::new(mtu, queue_depth, mode)));
+    let lane_b: LaneRc = Rc::new(RefCell::new(Lane::new(mtu, queue_depth, mode)));
     let server = make_endpoint(
         IpAddress::v4(base, 0, 0, 1),
         mtu,
@@ -673,8 +854,14 @@ fn setup_paired_endpoints(
         lane_b.clone(),
         offload,
     );
-    let client = make_endpoint(IpAddress::v4(base, 0, 0, 2), mtu, lane_b, lane_a, offload);
-    (server, client)
+    let client = make_endpoint(
+        IpAddress::v4(base, 0, 0, 2),
+        mtu,
+        lane_b.clone(),
+        lane_a.clone(),
+        offload,
+    );
+    (server, client, lane_a, lane_b)
 }
 
 fn add_tcp_socket(ep: &mut Endpoint<'static>, buf_size: usize) -> smoltcp::iface::SocketHandle {
@@ -842,9 +1029,7 @@ impl<'a> Report<'a> {
             "  throughput (wire):      {bw_wire:>8.3} Gbps  ({:.1} MB/s)",
             self.wire_bytes as f64 / self.elapsed / 1e6
         );
-        println!(
-            "  packet rate:            {mpps:>8.3} Mpps     (avg {avg_pkt:.1} bytes/pkt)"
-        );
+        println!("  packet rate:            {mpps:>8.3} Mpps     (avg {avg_pkt:.1} bytes/pkt)");
         println!(
             "  per-packet:             {ns_per_pkt:>8.1} ns   (~{:.0} cycles @ {} GHz)",
             cyc_per_pkt, REF_CPU_GHZ
@@ -914,7 +1099,10 @@ impl<'a> Report<'a> {
         // (cycles/sec) and report cycles-per-packet alongside the
         // wall-clock ns/packet number. Cachegrind already has the
         // instruction count; combining the two yields IPC.
-        let cpu_ns = self.alloc_after.cpu_ns.saturating_sub(self.alloc_before.cpu_ns);
+        let cpu_ns = self
+            .alloc_after
+            .cpu_ns
+            .saturating_sub(self.alloc_before.cpu_ns);
         let tsc_d = self.alloc_after.tsc.saturating_sub(self.alloc_before.tsc);
         if cpu_ns > 0 && tsc_d > 0 {
             let eff_ghz = tsc_d as f64 / cpu_ns as f64;
@@ -938,10 +1126,10 @@ impl<'a> Report<'a> {
     }
 }
 
-fn shape_firehose(seconds: u64, offload: bool) {
+fn shape_firehose(seconds: u64, offload: bool, mode: RunMode) {
     const BUF: usize = 256 * 1024;
-    let lane_a: LaneRc = Rc::new(RefCell::new(Lane::new(1500, 256)));
-    let lane_b: LaneRc = Rc::new(RefCell::new(Lane::new(1500, 256)));
+    let lane_a: LaneRc = Rc::new(RefCell::new(Lane::new(1500, 256, mode)));
+    let lane_b: LaneRc = Rc::new(RefCell::new(Lane::new(1500, 256, mode)));
 
     let mut server = make_endpoint(
         IpAddress::v4(10, 0, 0, 1),
@@ -991,8 +1179,12 @@ fn shape_firehose(seconds: u64, offload: bool) {
     // Pump until ESTABLISHED.
     for _ in 0..1000 {
         let n = now_smol();
-        server.iface.poll(n, &mut server.device, &mut server.sockets);
-        client.iface.poll(n, &mut client.device, &mut client.sockets);
+        server
+            .iface
+            .poll(n, &mut server.device, &mut server.sockets);
+        client
+            .iface
+            .poll(n, &mut client.device, &mut client.sockets);
         if client.sockets.get::<tcp::Socket>(cli_h).may_send()
             && server.sockets.get::<tcp::Socket>(srv_h).may_recv()
         {
@@ -1057,7 +1249,8 @@ fn shape_firehose(seconds: u64, offload: bool) {
             recvd_this_round += r as u64;
         }
 
-        if sent_this_round == 0 && recvd_this_round == 0
+        if sent_this_round == 0
+            && recvd_this_round == 0
             && matches!(cli_state, smoltcp::iface::PollResult::None)
             && matches!(srv_state, smoltcp::iface::PollResult::None)
         {
@@ -1081,33 +1274,58 @@ fn shape_firehose(seconds: u64, offload: bool) {
         unit_label: "idle-spins",
     }
     .print();
+    print_lane_stats("firehose", collect_lane_stats(&[&lane_a, &lane_b]));
 }
 
-fn shape_small(seconds: u64, offload: bool) {
+fn shape_small(seconds: u64, offload: bool, mode: RunMode) {
     // Force tiny segments by limiting the socket buffer; with a 1500 MTU the
     // client never fills more than a single small write at a time.
     const BUF: usize = 4 * 1024;
-    let lane_a: LaneRc = Rc::new(RefCell::new(Lane::new(1500, 256)));
-    let lane_b: LaneRc = Rc::new(RefCell::new(Lane::new(1500, 256)));
+    let lane_a: LaneRc = Rc::new(RefCell::new(Lane::new(1500, 256, mode)));
+    let lane_b: LaneRc = Rc::new(RefCell::new(Lane::new(1500, 256, mode)));
 
-    let mut server = make_endpoint(IpAddress::v4(10, 0, 0, 1), 1500, lane_a.clone(), lane_b.clone(), offload);
-    let mut client = make_endpoint(IpAddress::v4(10, 0, 0, 2), 1500, lane_b.clone(), lane_a.clone(), offload);
+    let mut server = make_endpoint(
+        IpAddress::v4(10, 0, 0, 1),
+        1500,
+        lane_a.clone(),
+        lane_b.clone(),
+        offload,
+    );
+    let mut client = make_endpoint(
+        IpAddress::v4(10, 0, 0, 2),
+        1500,
+        lane_b.clone(),
+        lane_a.clone(),
+        offload,
+    );
 
     let srv_h = add_tcp_socket(&mut server, BUF);
     let cli_h = add_tcp_socket(&mut client, BUF);
 
-    server.sockets.get_mut::<tcp::Socket>(srv_h).listen(1234).unwrap();
+    server
+        .sockets
+        .get_mut::<tcp::Socket>(srv_h)
+        .listen(1234)
+        .unwrap();
     client
         .sockets
         .get_mut::<tcp::Socket>(cli_h)
-        .connect(client.iface.context(), (IpAddress::v4(10, 0, 0, 1), 1234), 49152)
+        .connect(
+            client.iface.context(),
+            (IpAddress::v4(10, 0, 0, 1), 1234),
+            49152,
+        )
         .unwrap();
 
     let mut t_ms: i64 = 0;
     for _ in 0..200 {
         let n = Instant::from_millis(t_ms);
-        server.iface.poll(n, &mut server.device, &mut server.sockets);
-        client.iface.poll(n, &mut client.device, &mut client.sockets);
+        server
+            .iface
+            .poll(n, &mut server.device, &mut server.sockets);
+        client
+            .iface
+            .poll(n, &mut client.device, &mut client.sockets);
         if client.sockets.get::<tcp::Socket>(cli_h).may_send() {
             break;
         }
@@ -1132,12 +1350,17 @@ fn shape_small(seconds: u64, offload: bool) {
         let cs = client.sockets.get_mut::<tcp::Socket>(cli_h);
         if cs.can_send()
             && let Ok(w) = cs.send_slice(&payload)
-                && w > 0 {
-                    sent += w as u64;
-                }
+            && w > 0
+        {
+            sent += w as u64;
+        }
         poll_lat.measure(|| {
-            client.iface.poll(n, &mut client.device, &mut client.sockets);
-            server.iface.poll(n, &mut server.device, &mut server.sockets);
+            client
+                .iface
+                .poll(n, &mut client.device, &mut client.sockets);
+            server
+                .iface
+                .poll(n, &mut server.device, &mut server.sockets);
         });
 
         let ss = server.sockets.get_mut::<tcp::Socket>(srv_h);
@@ -1166,31 +1389,56 @@ fn shape_small(seconds: u64, offload: bool) {
         unit_label: "bytes",
     }
     .print();
+    print_lane_stats("small", collect_lane_stats(&[&lane_a, &lane_b]));
 }
 
-fn shape_pingpong(seconds: u64, offload: bool) {
+fn shape_pingpong(seconds: u64, offload: bool, mode: RunMode) {
     const BUF: usize = 16 * 1024;
-    let lane_a: LaneRc = Rc::new(RefCell::new(Lane::new(1500, 256)));
-    let lane_b: LaneRc = Rc::new(RefCell::new(Lane::new(1500, 256)));
+    let lane_a: LaneRc = Rc::new(RefCell::new(Lane::new(1500, 256, mode)));
+    let lane_b: LaneRc = Rc::new(RefCell::new(Lane::new(1500, 256, mode)));
 
-    let mut server = make_endpoint(IpAddress::v4(10, 0, 0, 1), 1500, lane_a.clone(), lane_b.clone(), offload);
-    let mut client = make_endpoint(IpAddress::v4(10, 0, 0, 2), 1500, lane_b.clone(), lane_a.clone(), offload);
+    let mut server = make_endpoint(
+        IpAddress::v4(10, 0, 0, 1),
+        1500,
+        lane_a.clone(),
+        lane_b.clone(),
+        offload,
+    );
+    let mut client = make_endpoint(
+        IpAddress::v4(10, 0, 0, 2),
+        1500,
+        lane_b.clone(),
+        lane_a.clone(),
+        offload,
+    );
 
     let srv_h = add_tcp_socket(&mut server, BUF);
     let cli_h = add_tcp_socket(&mut client, BUF);
 
-    server.sockets.get_mut::<tcp::Socket>(srv_h).listen(1234).unwrap();
+    server
+        .sockets
+        .get_mut::<tcp::Socket>(srv_h)
+        .listen(1234)
+        .unwrap();
     client
         .sockets
         .get_mut::<tcp::Socket>(cli_h)
-        .connect(client.iface.context(), (IpAddress::v4(10, 0, 0, 1), 1234), 49152)
+        .connect(
+            client.iface.context(),
+            (IpAddress::v4(10, 0, 0, 1), 1234),
+            49152,
+        )
         .unwrap();
 
     let mut t_ms: i64 = 0;
     for _ in 0..200 {
         let n = Instant::from_millis(t_ms);
-        server.iface.poll(n, &mut server.device, &mut server.sockets);
-        client.iface.poll(n, &mut client.device, &mut client.sockets);
+        server
+            .iface
+            .poll(n, &mut server.device, &mut server.sockets);
+        client
+            .iface
+            .poll(n, &mut client.device, &mut client.sockets);
         if client.sockets.get::<tcp::Socket>(cli_h).may_send() {
             break;
         }
@@ -1217,8 +1465,12 @@ fn shape_pingpong(seconds: u64, offload: bool) {
             let _ = cs.send_slice(&msg);
         }
         poll_lat.measure(|| {
-            client.iface.poll(n, &mut client.device, &mut client.sockets);
-            server.iface.poll(n, &mut server.device, &mut server.sockets);
+            client
+                .iface
+                .poll(n, &mut client.device, &mut client.sockets);
+            server
+                .iface
+                .poll(n, &mut server.device, &mut server.sockets);
         });
 
         // Server echoes.
@@ -1226,21 +1478,28 @@ fn shape_pingpong(seconds: u64, offload: bool) {
         let mut sink = [0u8; 128];
         if ss.can_recv()
             && let Ok(r) = ss.recv_slice(&mut sink)
-                && r > 0 && ss.can_send() {
-                    let _ = ss.send_slice(&sink[..r]);
-                }
+            && r > 0
+            && ss.can_send()
+        {
+            let _ = ss.send_slice(&sink[..r]);
+        }
         poll_lat.measure(|| {
-            server.iface.poll(n, &mut server.device, &mut server.sockets);
-            client.iface.poll(n, &mut client.device, &mut client.sockets);
+            server
+                .iface
+                .poll(n, &mut server.device, &mut server.sockets);
+            client
+                .iface
+                .poll(n, &mut client.device, &mut client.sockets);
         });
 
         // Client receives echo.
         let cs = client.sockets.get_mut::<tcp::Socket>(cli_h);
         if cs.can_recv()
             && let Ok(r) = cs.recv_slice(&mut sink)
-                && r > 0 {
-                    roundtrips += 1;
-                }
+            && r > 0
+        {
+            roundtrips += 1;
+        }
         t_ms += 1;
     }
     let alloc_after = AllocSnap::now();
@@ -1260,19 +1519,32 @@ fn shape_pingpong(seconds: u64, offload: bool) {
         unit_label: "roundtrips",
     }
     .print();
+    print_lane_stats("pingpong", collect_lane_stats(&[&lane_a, &lane_b]));
 }
 
-fn shape_udp_firehose(seconds: u64, offload: bool) {
+fn shape_udp_firehose(seconds: u64, offload: bool, mode: RunMode) {
     // Pure packet forwarding — no flow control, no cwnd. This is the closest
     // analogue to a tunnel forwarding fully-formed packets between two peers
     // (which is what tunnel-lib-rust wraps smoltcp for).
     const PAYLOAD: usize = 1400;
     const META_SLOTS: usize = 256;
-    let lane_a: LaneRc = Rc::new(RefCell::new(Lane::new(1500, 256)));
-    let lane_b: LaneRc = Rc::new(RefCell::new(Lane::new(1500, 256)));
+    let lane_a: LaneRc = Rc::new(RefCell::new(Lane::new(1500, 256, mode)));
+    let lane_b: LaneRc = Rc::new(RefCell::new(Lane::new(1500, 256, mode)));
 
-    let mut server = make_endpoint(IpAddress::v4(10, 0, 0, 1), 1500, lane_a.clone(), lane_b.clone(), offload);
-    let mut client = make_endpoint(IpAddress::v4(10, 0, 0, 2), 1500, lane_b.clone(), lane_a.clone(), offload);
+    let mut server = make_endpoint(
+        IpAddress::v4(10, 0, 0, 1),
+        1500,
+        lane_a.clone(),
+        lane_b.clone(),
+        offload,
+    );
+    let mut client = make_endpoint(
+        IpAddress::v4(10, 0, 0, 2),
+        1500,
+        lane_b.clone(),
+        lane_a.clone(),
+        offload,
+    );
 
     let mk_buf = || -> (udp::PacketBuffer<'static>, udp::PacketBuffer<'static>) {
         let rx_meta = vec![udp::PacketMetadata::EMPTY; META_SLOTS];
@@ -1290,8 +1562,16 @@ fn shape_udp_firehose(seconds: u64, offload: bool) {
     let (cli_rx, cli_tx) = mk_buf();
     let cli_h = client.sockets.add(udp::Socket::new(cli_rx, cli_tx));
 
-    server.sockets.get_mut::<udp::Socket>(srv_h).bind(2000).unwrap();
-    client.sockets.get_mut::<udp::Socket>(cli_h).bind(2001).unwrap();
+    server
+        .sockets
+        .get_mut::<udp::Socket>(srv_h)
+        .bind(2000)
+        .unwrap();
+    client
+        .sockets
+        .get_mut::<udp::Socket>(cli_h)
+        .bind(2001)
+        .unwrap();
 
     let dest_meta: udp::UdpMetadata = (IpAddress::v4(10, 0, 0, 1), 2000).into();
     let payload = vec![0xa5u8; PAYLOAD];
@@ -1320,8 +1600,12 @@ fn shape_udp_firehose(seconds: u64, offload: bool) {
             sent += PAYLOAD as u64;
         }
         poll_lat.measure(|| {
-            client.iface.poll(n, &mut client.device, &mut client.sockets);
-            server.iface.poll(n, &mut server.device, &mut server.sockets);
+            client
+                .iface
+                .poll(n, &mut client.device, &mut client.sockets);
+            server
+                .iface
+                .poll(n, &mut server.device, &mut server.sockets);
         });
 
         let ss = server.sockets.get_mut::<udp::Socket>(srv_h);
@@ -1351,6 +1635,7 @@ fn shape_udp_firehose(seconds: u64, offload: bool) {
         unit_label: "pkts-recvd",
     }
     .print();
+    print_lane_stats("udp", collect_lane_stats(&[&lane_a, &lane_b]));
 }
 
 /// `n` concurrent TCP echo flows between two smoltcp endpoints. Each flow has
@@ -1359,7 +1644,7 @@ fn shape_udp_firehose(seconds: u64, offload: bool) {
 /// Verifies two properties:
 ///   * memory stays bounded (RSS trace + net heap delta)
 ///   * no flow is starved (Jain index + per-flow percentiles)
-fn shape_many_tcp(seconds: u64, n: usize, offload: bool) {
+fn shape_many_tcp(seconds: u64, n: usize, offload: bool, mode: RunMode) {
     // Per-flow buffer sized small enough to keep total memory reasonable
     // even at N=1000: 1000 flows × 2 (rx+tx) × 4 KiB × 2 (server+client) ≈ 16 MiB.
     const BUF: usize = 4 * 1024;
@@ -1369,8 +1654,8 @@ fn shape_many_tcp(seconds: u64, n: usize, offload: bool) {
     // iteration order get systematically starved.
     let qd = (n * 16).clamp(1024, 16384);
 
-    let lane_a: LaneRc = Rc::new(RefCell::new(Lane::new(1500, qd)));
-    let lane_b: LaneRc = Rc::new(RefCell::new(Lane::new(1500, qd)));
+    let lane_a: LaneRc = Rc::new(RefCell::new(Lane::new(1500, qd, mode)));
+    let lane_b: LaneRc = Rc::new(RefCell::new(Lane::new(1500, qd, mode)));
 
     let mut server = make_endpoint(
         IpAddress::v4(10, 0, 0, 1),
@@ -1433,8 +1718,12 @@ fn shape_many_tcp(seconds: u64, n: usize, offload: bool) {
     let connect_deadline = StdInstant::now() + std::time::Duration::from_secs(seconds.min(5));
     loop {
         let now = smol_now();
-        server.iface.poll(now, &mut server.device, &mut server.sockets);
-        client.iface.poll(now, &mut client.device, &mut client.sockets);
+        server
+            .iface
+            .poll(now, &mut server.device, &mut server.sockets);
+        client
+            .iface
+            .poll(now, &mut client.device, &mut client.sockets);
         let all_ready = cli_handles
             .iter()
             .zip(srv_handles.iter())
@@ -1484,14 +1773,19 @@ fn shape_many_tcp(seconds: u64, n: usize, offload: bool) {
         for (i, &h) in cli_handles.iter().enumerate() {
             let cs = client.sockets.get_mut::<tcp::Socket>(h);
             if cs.can_send()
-                && let Ok(w) = cs.send_slice(&payload) {
-                    sent[i] += w as u64;
-                }
+                && let Ok(w) = cs.send_slice(&payload)
+            {
+                sent[i] += w as u64;
+            }
         }
 
         poll_lat.measure(|| {
-            client.iface.poll(now, &mut client.device, &mut client.sockets);
-            server.iface.poll(now, &mut server.device, &mut server.sockets);
+            client
+                .iface
+                .poll(now, &mut client.device, &mut client.sockets);
+            server
+                .iface
+                .poll(now, &mut server.device, &mut server.sockets);
         });
 
         // Server: drain RX completely, then echo as much as TX has room for.
@@ -1515,8 +1809,12 @@ fn shape_many_tcp(seconds: u64, n: usize, offload: bool) {
         }
 
         poll_lat.measure(|| {
-            server.iface.poll(now, &mut server.device, &mut server.sockets);
-            client.iface.poll(now, &mut client.device, &mut client.sockets);
+            server
+                .iface
+                .poll(now, &mut server.device, &mut server.sockets);
+            client
+                .iface
+                .poll(now, &mut client.device, &mut client.sockets);
         });
 
         // Client: drain echo completely on every flow.
@@ -1533,7 +1831,9 @@ fn shape_many_tcp(seconds: u64, n: usize, offload: bool) {
         iters = iters.wrapping_add(1);
         // ~4x/sec — cheap enough not to perturb throughput, dense enough to
         // see RSS trajectory.
-        mem_trace.maybe_sample(250);
+        if mode.sample_memory() {
+            mem_trace.maybe_sample(250);
+        }
     }
     let alloc_after = AllocSnap::now();
     let elapsed = start.elapsed().as_secs_f64();
@@ -1592,6 +1892,7 @@ fn shape_many_tcp(seconds: u64, n: usize, offload: bool) {
     }
 
     mem_trace.print();
+    print_lane_stats("many_tcp", collect_lane_stats(&[&lane_a, &lane_b]));
 
     // Per-flow socket footprint estimate. Useful for sizing per-flow
     // budgets in downstream consumers that admit many concurrent flows.
@@ -1613,18 +1914,256 @@ fn shape_many_tcp(seconds: u64, n: usize, offload: bool) {
     );
 }
 
+/// Deterministic fairness variant for TCP flows. Each round gives every flow
+/// one bounded client send and server drain opportunity, then rotates the
+/// start index so flow 0 does not always go first.
+fn shape_many_tcp_fair(seconds: u64, n: usize, offload: bool, mode: RunMode) {
+    const BUF: usize = 4 * 1024;
+    const PAYLOAD: usize = 256;
+    let qd = (n * 16).clamp(1024, 16384);
+
+    let lane_a: LaneRc = Rc::new(RefCell::new(Lane::new(1500, qd, mode)));
+    let lane_b: LaneRc = Rc::new(RefCell::new(Lane::new(1500, qd, mode)));
+
+    let mut server = make_endpoint(
+        IpAddress::v4(10, 0, 0, 1),
+        1500,
+        lane_a.clone(),
+        lane_b.clone(),
+        offload,
+    );
+    let mut client = make_endpoint(
+        IpAddress::v4(10, 0, 0, 2),
+        1500,
+        lane_b.clone(),
+        lane_a.clone(),
+        offload,
+    );
+
+    let mut srv_handles = Vec::with_capacity(n);
+    let mut cli_handles = Vec::with_capacity(n);
+    for i in 0..n {
+        let h_srv = add_tcp_socket(&mut server, BUF);
+        let h_cli = add_tcp_socket(&mut client, BUF);
+        let dst_port: u16 = 10_000u16.wrapping_add(i as u16);
+        let src_port: u16 = 30_000u16.wrapping_add(i as u16);
+
+        {
+            let s = server.sockets.get_mut::<tcp::Socket>(h_srv);
+            s.set_ack_delay(None);
+            s.set_nagle_enabled(false);
+            s.listen(dst_port).unwrap();
+        }
+        {
+            let c = client.sockets.get_mut::<tcp::Socket>(h_cli);
+            c.set_ack_delay(None);
+            c.set_nagle_enabled(false);
+        }
+        client
+            .sockets
+            .get_mut::<tcp::Socket>(h_cli)
+            .connect(
+                client.iface.context(),
+                (IpAddress::v4(10, 0, 0, 1), dst_port),
+                src_port,
+            )
+            .unwrap();
+
+        srv_handles.push(h_srv);
+        cli_handles.push(h_cli);
+    }
+
+    let wall0 = StdInstant::now();
+    let smol_now = || Instant::from_micros(wall0.elapsed().as_micros() as i64);
+    let connect_deadline = StdInstant::now() + std::time::Duration::from_secs(seconds.min(5));
+    loop {
+        let now = smol_now();
+        server
+            .iface
+            .poll(now, &mut server.device, &mut server.sockets);
+        client
+            .iface
+            .poll(now, &mut client.device, &mut client.sockets);
+        let all_ready = cli_handles
+            .iter()
+            .zip(srv_handles.iter())
+            .all(|(&hc, &hs)| {
+                client.sockets.get::<tcp::Socket>(hc).may_send()
+                    && server.sockets.get::<tcp::Socket>(hs).may_recv()
+            });
+        if all_ready || StdInstant::now() >= connect_deadline {
+            break;
+        }
+    }
+
+    let established = cli_handles
+        .iter()
+        .zip(srv_handles.iter())
+        .filter(|&(&hc, &hs)| {
+            client.sockets.get::<tcp::Socket>(hc).may_send()
+                && server.sockets.get::<tcp::Socket>(hs).may_recv()
+        })
+        .count();
+    if established < n {
+        eprintln!(
+            "warning: only {established}/{n} flows established within {} s",
+            seconds.min(5)
+        );
+    }
+
+    let payload = [0x42u8; PAYLOAD];
+    let mut sink = [0u8; PAYLOAD];
+    let mut sent = vec![0u64; n];
+    let mut recvd = vec![0u64; n];
+
+    let deadline = StdInstant::now() + std::time::Duration::from_secs(seconds);
+    let start = StdInstant::now();
+    let alloc_before = AllocSnap::now();
+    let mut poll_lat = SampledTimer::new();
+    let mut mem_trace = MemTrace::start();
+    let mut start_flow = 0usize;
+    let mut rounds = 0u64;
+    let poll_budget = n.saturating_mul(6).clamp(16, 1024);
+
+    while StdInstant::now() < deadline {
+        for offset in 0..n {
+            let i = (start_flow + offset) % n;
+
+            let cs = client.sockets.get_mut::<tcp::Socket>(cli_handles[i]);
+            if sent[i].saturating_sub(recvd[i]) < PAYLOAD as u64
+                && cs.can_send()
+                && let Ok(w) = cs.send_slice(&payload)
+            {
+                sent[i] += w as u64;
+            }
+
+            for _ in 0..poll_budget {
+                let now = smol_now();
+                poll_lat.measure(|| {
+                    client
+                        .iface
+                        .poll(now, &mut client.device, &mut client.sockets);
+                    server
+                        .iface
+                        .poll(now, &mut server.device, &mut server.sockets);
+                });
+                if server.sockets.get::<tcp::Socket>(srv_handles[i]).can_recv() {
+                    break;
+                }
+            }
+
+            let ss = server.sockets.get_mut::<tcp::Socket>(srv_handles[i]);
+            if ss.can_recv() {
+                match ss.recv_slice(&mut sink) {
+                    Ok(r) if r > 0 => recvd[i] += r as u64,
+                    _ => {}
+                }
+            }
+
+            // Return ACK/window updates to the sender before the next bounded
+            // opportunity for this flow.
+            let now = smol_now();
+            poll_lat.measure(|| {
+                server
+                    .iface
+                    .poll(now, &mut server.device, &mut server.sockets);
+                client
+                    .iface
+                    .poll(now, &mut client.device, &mut client.sockets);
+            });
+        }
+
+        start_flow = (start_flow + 1) % n;
+        rounds = rounds.wrapping_add(1);
+        if mode.sample_memory() {
+            mem_trace.maybe_sample(250);
+        }
+    }
+    let alloc_after = AllocSnap::now();
+    let elapsed = start.elapsed().as_secs_f64();
+
+    Report {
+        name: "many_tcp_fair",
+        elapsed,
+        app_bytes_sent: sent.iter().sum(),
+        app_bytes_recvd: recvd.iter().sum(),
+        wire_packets: client.device.tx_packets + server.device.tx_packets,
+        wire_bytes: client.device.tx_bytes + server.device.tx_bytes,
+        poll_lat: poll_lat.histo,
+        alloc_before,
+        alloc_after,
+        work_units: rounds,
+        unit_label: "rounds",
+    }
+    .print();
+
+    let sent_stats = Fairness::from(&sent);
+    let recvd_stats = Fairness::from(&recvd);
+    sent_stats.print("sent");
+    recvd_stats.print("recvd");
+
+    if recvd_stats.zero_flows > 0 || recvd_stats.starved > 0 {
+        let dump = |label: &str, idx: usize| {
+            let cs = client.sockets.get::<tcp::Socket>(cli_handles[idx]);
+            let ss = server.sockets.get::<tcp::Socket>(srv_handles[idx]);
+            println!(
+                "  {label} flow #{idx:<4}  client.state={:?}/{:?}  server.state={:?}/{:?}",
+                cs.state(),
+                (cs.may_send(), cs.may_recv()),
+                ss.state(),
+                (ss.may_send(), ss.may_recv()),
+            );
+            println!(
+                "                  client.send_q={:>5}  client.recv_q={:>5}  server.send_q={:>5}  server.recv_q={:>5}",
+                cs.send_queue(),
+                cs.recv_queue(),
+                ss.send_queue(),
+                ss.recv_queue(),
+            );
+            println!(
+                "                  bytes sent={:>10}  bytes recvd={:>10}",
+                sent[idx], recvd[idx]
+            );
+        };
+        println!();
+        println!("  flow-state diagnostic (compare starved vs healthy):");
+        dump("starved", recvd_stats.min_flow);
+        dump("healthy", recvd_stats.max_flow);
+    }
+
+    mem_trace.print();
+    print_lane_stats("many_tcp_fair", collect_lane_stats(&[&lane_a, &lane_b]));
+
+    let tcp_socket_bytes = core::mem::size_of::<tcp::Socket>();
+    let per_flow_bytes = tcp_socket_bytes + 2 * BUF;
+    let total_bytes = 2 * n * per_flow_bytes;
+    println!();
+    println!("  socket-state footprint (without lane pool):");
+    println!(
+        "    per-flow:           {} bytes (Socket {} + 2 x {} KiB buf)",
+        per_flow_bytes,
+        tcp_socket_bytes,
+        BUF / 1024,
+    );
+    println!(
+        "    total (both peers): {} bytes  ({:.2} MiB)",
+        total_bytes,
+        total_bytes as f64 / (1024.0 * 1024.0)
+    );
+}
+
 /// `n` concurrent UDP echo flows. Same metrics as `many_tcp`. UDP has no
 /// flow control or cwnd so per-flow throughput is bounded only by the rate
 /// at which the runner pumps bytes through.
-fn shape_many_udp(seconds: u64, n: usize, offload: bool) {
+fn shape_many_udp(seconds: u64, n: usize, offload: bool, mode: RunMode) {
     const PAYLOAD: usize = 256;
     // Per-flow UDP socket buffer: a small ring with ~32 metadata slots is
     // enough to keep the pipe full without ballooning memory.
     const META_SLOTS: usize = 32;
     let qd = (n * 4).clamp(256, 8192);
 
-    let lane_a: LaneRc = Rc::new(RefCell::new(Lane::new(1500, qd)));
-    let lane_b: LaneRc = Rc::new(RefCell::new(Lane::new(1500, qd)));
+    let lane_a: LaneRc = Rc::new(RefCell::new(Lane::new(1500, qd, mode)));
+    let lane_b: LaneRc = Rc::new(RefCell::new(Lane::new(1500, qd, mode)));
 
     let mut server = make_endpoint(
         IpAddress::v4(10, 0, 0, 1),
@@ -1713,8 +2252,12 @@ fn shape_many_udp(seconds: u64, n: usize, offload: bool) {
         }
 
         poll_lat.measure(|| {
-            client.iface.poll(now, &mut client.device, &mut client.sockets);
-            server.iface.poll(now, &mut server.device, &mut server.sockets);
+            client
+                .iface
+                .poll(now, &mut client.device, &mut client.sockets);
+            server
+                .iface
+                .poll(now, &mut server.device, &mut server.sockets);
         });
 
         // Drain every server flow.
@@ -1729,7 +2272,9 @@ fn shape_many_udp(seconds: u64, n: usize, offload: bool) {
         }
 
         iters = iters.wrapping_add(1);
-        mem_trace.maybe_sample(250);
+        if mode.sample_memory() {
+            mem_trace.maybe_sample(250);
+        }
     }
     let alloc_after = AllocSnap::now();
     let elapsed = start.elapsed().as_secs_f64();
@@ -1752,6 +2297,7 @@ fn shape_many_udp(seconds: u64, n: usize, offload: bool) {
     Fairness::from(&sent).print("sent");
     Fairness::from(&recvd).print("recvd");
     mem_trace.print();
+    print_lane_stats("many_udp", collect_lane_stats(&[&lane_a, &lane_b]));
 
     let udp_socket_bytes = core::mem::size_of::<udp::Socket>();
     let per_flow_bytes = udp_socket_bytes + 2 * (META_SLOTS * PAYLOAD) + 2 * META_SLOTS * 24; // approx
@@ -1779,7 +2325,67 @@ fn shape_many_udp(seconds: u64, n: usize, offload: bool) {
 /// created via `new_dynamic` so the pool is exercised. Threads start
 /// in lockstep via a barrier so the contention window aligns.
 #[cfg(feature = "socket-tcp-dynamic-buffer")]
-fn shape_multi_tcp(seconds: u64, n_threads: usize, flows_per_thread: usize, offload: bool) {
+#[derive(Clone, Copy)]
+enum MultiTcpWorkload {
+    Echo,
+    Sink,
+}
+
+#[cfg(feature = "socket-tcp-dynamic-buffer")]
+impl MultiTcpWorkload {
+    fn shape_name(self) -> &'static str {
+        match self {
+            Self::Echo => "multi_tcp",
+            Self::Sink => "multi_tcp_sink",
+        }
+    }
+}
+
+#[cfg(feature = "socket-tcp-dynamic-buffer")]
+fn shape_multi_tcp(
+    seconds: u64,
+    n_threads: usize,
+    flows_per_thread: usize,
+    offload: bool,
+    mode: RunMode,
+) {
+    shape_multi_tcp_impl(
+        seconds,
+        n_threads,
+        flows_per_thread,
+        offload,
+        mode,
+        MultiTcpWorkload::Echo,
+    );
+}
+
+#[cfg(feature = "socket-tcp-dynamic-buffer")]
+fn shape_multi_tcp_sink(
+    seconds: u64,
+    n_threads: usize,
+    flows_per_thread: usize,
+    offload: bool,
+    mode: RunMode,
+) {
+    shape_multi_tcp_impl(
+        seconds,
+        n_threads,
+        flows_per_thread,
+        offload,
+        mode,
+        MultiTcpWorkload::Sink,
+    );
+}
+
+#[cfg(feature = "socket-tcp-dynamic-buffer")]
+fn shape_multi_tcp_impl(
+    seconds: u64,
+    n_threads: usize,
+    flows_per_thread: usize,
+    offload: bool,
+    mode: RunMode,
+    workload: MultiTcpWorkload,
+) {
     use std::sync::{Arc, Barrier};
     use std::thread;
     use std::time::Instant as StdInstant;
@@ -1794,9 +2400,8 @@ fn shape_multi_tcp(seconds: u64, n_threads: usize, flows_per_thread: usize, offl
 
     let barrier = Arc::new(Barrier::new(n_threads));
     let (vol_before, nvol_before) = ctxsw_counts();
-    let start_wall = StdInstant::now();
-
-    let mut handles: Vec<thread::JoinHandle<(u64, u64, u64)>> = Vec::with_capacity(n_threads);
+    let mut handles: Vec<thread::JoinHandle<(u64, u64, u64, LaneStats)>> =
+        Vec::with_capacity(n_threads);
     for tid in 0..n_threads {
         let pool = pool.clone();
         let barrier = barrier.clone();
@@ -1805,7 +2410,8 @@ fn shape_multi_tcp(seconds: u64, n_threads: usize, flows_per_thread: usize, offl
             // Distinct base address per thread so server/client tuples don't
             // clash if anything inspects them (they won't — lanes are isolated).
             let base = 10 + tid as u8;
-            let (mut server, mut client) = setup_paired_endpoints(base, 1500, qd, offload);
+            let (mut server, mut client, lane_a, lane_b) =
+                setup_paired_endpoints(base, 1500, qd, offload, mode);
 
             let mut srv_handles = Vec::with_capacity(flows_per_thread);
             let mut cli_handles = Vec::with_capacity(flows_per_thread);
@@ -1844,8 +2450,12 @@ fn shape_multi_tcp(seconds: u64, n_threads: usize, flows_per_thread: usize, offl
             let connect_deadline = w0 + std::time::Duration::from_secs(seconds.min(5));
             loop {
                 let now = smol_now(w0);
-                server.iface.poll(now, &mut server.device, &mut server.sockets);
-                client.iface.poll(now, &mut client.device, &mut client.sockets);
+                server
+                    .iface
+                    .poll(now, &mut server.device, &mut server.sockets);
+                client
+                    .iface
+                    .poll(now, &mut client.device, &mut client.sockets);
                 let all_ready = cli_handles
                     .iter()
                     .zip(srv_handles.iter())
@@ -1860,77 +2470,140 @@ fn shape_multi_tcp(seconds: u64, n_threads: usize, flows_per_thread: usize, offl
 
             // Synchronize the steady-state start across threads.
             barrier.wait();
+            let steady_start = StdInstant::now();
 
             let mut sent: u64 = 0;
             let mut recvd: u64 = 0;
             let payload = vec![0xa5u8; PAYLOAD];
             let mut sink = vec![0u8; PAYLOAD];
-            let deadline = StdInstant::now() + std::time::Duration::from_secs(seconds);
-            while StdInstant::now() < deadline {
-                let now = smol_now(w0);
-                // Client: send chunks. Don't gate on can_send — for dynamic
-                // buffers, tx_buffer starts at 0 capacity and grows inside
-                // send_impl; can_send() returns false until the first grow.
-                for &h in &cli_handles {
-                    let s = client.sockets.get_mut::<tcp::Socket>(h);
-                    if s.may_send()
-                        && let Ok(n) = s.send_slice(&payload)
-                    {
-                        sent += n as u64;
-                    }
-                }
-                // Push client TX onto wire, let server receive.
-                client.iface.poll(now, &mut client.device, &mut client.sockets);
-                server.iface.poll(now, &mut server.device, &mut server.sockets);
-                // Server: drain and echo so the client's tx_buffer frees up
-                // (otherwise it stalls at the dynamic-buffer cap).
-                for &h in &srv_handles {
-                    let s = server.sockets.get_mut::<tcp::Socket>(h);
-                    while s.can_recv() {
-                        match s.recv_slice(&mut sink) {
-                            Ok(r) if r > 0 => {
-                                recvd += r as u64;
-                                if s.may_send() {
-                                    let _ = s.send_slice(&sink[..r]);
+            let deadline = steady_start + std::time::Duration::from_secs(seconds);
+            match workload {
+                MultiTcpWorkload::Echo => {
+                    while StdInstant::now() < deadline {
+                        let now = smol_now(w0);
+                        for &h in &cli_handles {
+                            let s = client.sockets.get_mut::<tcp::Socket>(h);
+                            if s.can_send()
+                                && let Ok(n) = s.send_slice(&payload)
+                            {
+                                sent += n as u64;
+                            }
+                        }
+                        client
+                            .iface
+                            .poll(now, &mut client.device, &mut client.sockets);
+                        server
+                            .iface
+                            .poll(now, &mut server.device, &mut server.sockets);
+                        for &h in &srv_handles {
+                            let s = server.sockets.get_mut::<tcp::Socket>(h);
+                            while s.can_recv() {
+                                match s.recv_slice(&mut sink) {
+                                    Ok(r) if r > 0 => {
+                                        recvd += r as u64;
+                                        if s.can_send() {
+                                            let _ = s.send_slice(&sink[..r]);
+                                        }
+                                    }
+                                    _ => break,
                                 }
                             }
-                            _ => break,
+                        }
+                        server
+                            .iface
+                            .poll(now, &mut server.device, &mut server.sockets);
+                        client
+                            .iface
+                            .poll(now, &mut client.device, &mut client.sockets);
+                        for &h in &cli_handles {
+                            let s = client.sockets.get_mut::<tcp::Socket>(h);
+                            while s.can_recv() {
+                                match s.recv_slice(&mut sink) {
+                                    Ok(r) if r > 0 => {}
+                                    _ => break,
+                                }
+                            }
                         }
                     }
                 }
-                // Push server ACKs / echo back to client.
-                server.iface.poll(now, &mut server.device, &mut server.sockets);
-                client.iface.poll(now, &mut client.device, &mut client.sockets);
-                // Drain client RX (we don't count it; the recvd above
-                // measures the server-side bytes which is the workload signal).
-                for &h in &cli_handles {
-                    let s = client.sockets.get_mut::<tcp::Socket>(h);
-                    while s.can_recv() {
-                        match s.recv_slice(&mut sink) {
-                            Ok(r) if r > 0 => {}
-                            _ => break,
+                MultiTcpWorkload::Sink => {
+                    while StdInstant::now() < deadline {
+                        let now = smol_now(w0);
+                        for &h in &cli_handles {
+                            let s = client.sockets.get_mut::<tcp::Socket>(h);
+                            if s.can_send() {
+                                let wrote = s
+                                    .send(|buf| {
+                                        let n = buf.len().min(PAYLOAD);
+                                        buf[..n].fill(0xa5);
+                                        (n, n)
+                                    })
+                                    .unwrap_or(0);
+                                sent += wrote as u64;
+                            }
                         }
+                        client
+                            .iface
+                            .poll(now, &mut client.device, &mut client.sockets);
+                        server
+                            .iface
+                            .poll(now, &mut server.device, &mut server.sockets);
+                        for &h in &srv_handles {
+                            let s = server.sockets.get_mut::<tcp::Socket>(h);
+                            while s.can_recv() {
+                                match s.recv(|buf| {
+                                    let n = buf.len();
+                                    (n, n)
+                                }) {
+                                    Ok(r) if r > 0 => recvd += r as u64,
+                                    _ => break,
+                                }
+                            }
+                        }
+                        server
+                            .iface
+                            .poll(now, &mut server.device, &mut server.sockets);
+                        client
+                            .iface
+                            .poll(now, &mut client.device, &mut client.sockets);
                     }
                 }
             }
-            let elapsed_us = w0.elapsed().as_micros() as u64;
-            (sent, recvd, elapsed_us)
+            let elapsed_us = steady_start.elapsed().as_micros() as u64;
+            let lane_stats = collect_lane_stats(&[&lane_a, &lane_b]);
+            (sent, recvd, elapsed_us, lane_stats)
         }));
     }
 
     let results: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
-    let total_secs = start_wall.elapsed().as_secs_f64();
+    let total_elapsed_us = results
+        .iter()
+        .map(|(_, _, elapsed_us, _)| *elapsed_us)
+        .max()
+        .unwrap_or(1)
+        .max(1);
+    let total_secs = total_elapsed_us as f64 / 1_000_000.0;
     let (vol_after, nvol_after) = ctxsw_counts();
     let vol_delta = vol_after - vol_before;
     let nvol_delta = nvol_after - nvol_before;
-    let agg_sent: u64 = results.iter().map(|(s, _, _)| s).sum();
-    let agg_recvd: u64 = results.iter().map(|(_, r, _)| r).sum();
+    let agg_sent: u64 = results.iter().map(|(s, _, _, _)| s).sum();
+    let agg_recvd: u64 = results.iter().map(|(_, r, _, _)| r).sum();
     let agg_gbps = (agg_recvd as f64 * 8.0) / total_secs / 1e9;
     let per_thread_gbps: Vec<f64> = results
         .iter()
-        .map(|(_, r, _)| (*r as f64 * 8.0) / total_secs / 1e9)
+        .map(|(_, r, elapsed_us, _)| {
+            let elapsed_us = (*elapsed_us).max(1);
+            (*r as f64 * 8.0) / (elapsed_us as f64 / 1_000_000.0) / 1e9
+        })
         .collect();
-    let min = per_thread_gbps.iter().cloned().fold(f64::INFINITY, f64::min);
+    let mut lane_stats = LaneStats::default();
+    for (_, _, _, stats) in &results {
+        lane_stats.merge(*stats);
+    }
+    let min = per_thread_gbps
+        .iter()
+        .cloned()
+        .fold(f64::INFINITY, f64::min);
     let max = per_thread_gbps.iter().cloned().fold(0f64, f64::max);
     let mean = agg_gbps / n_threads as f64;
     let cv = if mean > 0.0 {
@@ -1952,7 +2625,8 @@ fn shape_multi_tcp(seconds: u64, n_threads: usize, flows_per_thread: usize, offl
         0.0
     };
 
-    println!("\n========== shape: multi_tcp ==========");
+    let shape_name = workload.shape_name();
+    println!("\n========== shape: {shape_name} ==========");
     println!(
         "  threads:                {n_threads}   flows/thread: {flows_per_thread}   total flows: {total_flows}"
     );
@@ -1994,6 +2668,7 @@ fn shape_multi_tcp(seconds: u64, n_threads: usize, flows_per_thread: usize, offl
         "  pool CAS retries:       {cas_retries}  ({:.1} retries/thread/s)",
         cas_retries as f64 / n_threads as f64 / total_secs
     );
+    print_lane_stats(shape_name, lane_stats);
 }
 
 /// Connection-churn shape. Repeatedly opens and tears down TCP flows at
@@ -2002,7 +2677,7 @@ fn shape_multi_tcp(seconds: u64, n_threads: usize, flows_per_thread: usize, offl
 /// under load; verifies that pool refunds keep up with admissions and
 /// the connection cap doesn't drift.
 #[cfg(feature = "socket-tcp-dynamic-buffer")]
-fn shape_churn(seconds: u64, target_conn_per_sec: usize, offload: bool) {
+fn shape_churn(seconds: u64, target_conn_per_sec: usize, offload: bool, mode: RunMode) {
     use std::time::Instant as StdInstant;
     const MAX_BUF: u32 = 32 * 1024;
     const SLOTS: usize = 256;
@@ -2012,12 +2687,16 @@ fn shape_churn(seconds: u64, target_conn_per_sec: usize, offload: bool) {
     let pool_bytes: usize = SLOTS * 2 * MAX_BUF as usize;
     let pool = tcp::MemoryPool::new(pool_bytes);
 
-    let (mut server, mut client) = setup_paired_endpoints(10, 1500, qd, offload);
+    let (mut server, mut client, lane_a, lane_b) =
+        setup_paired_endpoints(10, 1500, qd, offload, mode);
 
     // Pre-allocate a ring of socket handles. Each "churn slot" is a pair
     // we cycle through; once a pair is fully torn down we recycle the slot.
-    let mut slots: Vec<(smoltcp::iface::SocketHandle, smoltcp::iface::SocketHandle, u16)> =
-        Vec::with_capacity(SLOTS);
+    let mut slots: Vec<(
+        smoltcp::iface::SocketHandle,
+        smoltcp::iface::SocketHandle,
+        u16,
+    )> = Vec::with_capacity(SLOTS);
     for i in 0..SLOTS {
         let h_srv = add_tcp_socket_dyn(&mut server, MAX_BUF, &pool);
         let h_cli = add_tcp_socket_dyn(&mut client, MAX_BUF, &pool);
@@ -2083,16 +2762,18 @@ fn shape_churn(seconds: u64, target_conn_per_sec: usize, offload: bool) {
 
         let now = smol_now(start);
 
-        // Client: push payload on every Established flow (no can_send gate
-        // — dynamic tx buffer grows on first send_impl call).
         for &(_h_srv, h_cli, _) in &slots {
             let cs = client.sockets.get_mut::<tcp::Socket>(h_cli);
-            if cs.may_send() {
+            if cs.can_send() {
                 let _ = cs.send_slice(&payload);
             }
         }
-        client.iface.poll(now, &mut client.device, &mut client.sockets);
-        server.iface.poll(now, &mut server.device, &mut server.sockets);
+        client
+            .iface
+            .poll(now, &mut client.device, &mut client.sockets);
+        server
+            .iface
+            .poll(now, &mut server.device, &mut server.sockets);
 
         // Server: drain. After receiving payload, abort the connection
         // (skips TIME_WAIT so the slot recycles immediately). Client
@@ -2108,9 +2789,15 @@ fn shape_churn(seconds: u64, target_conn_per_sec: usize, offload: bool) {
                 closed += 1;
             }
         }
-        server.iface.poll(now, &mut server.device, &mut server.sockets);
-        client.iface.poll(now, &mut client.device, &mut client.sockets);
-        mem_trace.maybe_sample(250);
+        server
+            .iface
+            .poll(now, &mut server.device, &mut server.sockets);
+        client
+            .iface
+            .poll(now, &mut client.device, &mut client.sockets);
+        if mode.sample_memory() {
+            mem_trace.maybe_sample(250);
+        }
     }
 
     let elapsed = start.elapsed().as_secs_f64();
@@ -2132,9 +2819,13 @@ fn shape_churn(seconds: u64, target_conn_per_sec: usize, offload: bool) {
     println!("  pool budget:            {} KiB", pool_bytes / 1024);
     println!("  bytes allocated:        {alloc_bytes}");
     println!("  bytes freed:            {free_bytes}");
-    println!("  net heap delta:         {}", alloc_bytes as i64 - free_bytes as i64);
+    println!(
+        "  net heap delta:         {}",
+        alloc_bytes as i64 - free_bytes as i64
+    );
     println!("  allocation count:       {alloc_count}");
     mem_trace.print();
+    print_lane_stats("churn", collect_lane_stats(&[&lane_a, &lane_b]));
 }
 
 /// Mixed idle + active shape. Creates `n_idle` TCP sockets that never see
@@ -2143,17 +2834,22 @@ fn shape_churn(seconds: u64, target_conn_per_sec: usize, offload: bool) {
 /// allocation keeps idle-flow memory at ~0 while active flows still hit
 /// full throughput.
 #[cfg(feature = "socket-tcp-dynamic-buffer")]
-fn shape_idle_hot(seconds: u64, n_idle: usize, n_active: usize, offload: bool) {
+fn shape_idle_hot(seconds: u64, n_idle: usize, n_active: usize, offload: bool, mode: RunMode) {
     use std::time::Instant as StdInstant;
 
     const MAX_BUF: u32 = 32 * 1024;
     const PAYLOAD: usize = 1024;
     let total = n_idle + n_active;
     let qd = (total * 16).clamp(1024, 16384);
-    let pool_bytes: usize = (n_active * 2 + 1) * MAX_BUF as usize * 2;
+    let active_socket_count = n_active * 2; // client + server
+    let expected_steady_bytes = active_socket_count * 2 * MAX_BUF as usize; // rx + tx per socket
+    let pool_bytes: usize = expected_steady_bytes
+        .saturating_add(2 * MAX_BUF as usize)
+        .max(2 * MAX_BUF as usize);
     let pool = tcp::MemoryPool::new(pool_bytes);
 
-    let (mut server, mut client) = setup_paired_endpoints(10, 1500, qd, offload);
+    let (mut server, mut client, lane_a, lane_b) =
+        setup_paired_endpoints(10, 1500, qd, offload, mode);
 
     // Active flows: open & connect.
     let mut srv_active: Vec<smoltcp::iface::SocketHandle> = Vec::with_capacity(n_active);
@@ -2197,24 +2893,23 @@ fn shape_idle_hot(seconds: u64, n_idle: usize, n_active: usize, offload: bool) {
     let rss_after_create = rss_bytes();
     let pool_after_create = pool.used();
 
-    let alloc_before = AllocSnap::now();
-    let start = StdInstant::now();
-    let mut mem_trace = MemTrace::start();
+    let clock_start = StdInstant::now();
     let smol_now = |w0: StdInstant| Instant::from_micros(w0.elapsed().as_micros() as i64);
 
     // Establish active flows.
-    let connect_deadline = start + std::time::Duration::from_secs(seconds.min(5));
+    let connect_deadline = clock_start + std::time::Duration::from_secs(seconds.min(5));
     loop {
-        let now = smol_now(start);
-        server.iface.poll(now, &mut server.device, &mut server.sockets);
-        client.iface.poll(now, &mut client.device, &mut client.sockets);
-        let ready = cli_active
-            .iter()
-            .zip(srv_active.iter())
-            .all(|(&hc, &hs)| {
-                client.sockets.get::<tcp::Socket>(hc).may_send()
-                    && server.sockets.get::<tcp::Socket>(hs).may_recv()
-            });
+        let now = smol_now(clock_start);
+        server
+            .iface
+            .poll(now, &mut server.device, &mut server.sockets);
+        client
+            .iface
+            .poll(now, &mut client.device, &mut client.sockets);
+        let ready = cli_active.iter().zip(srv_active.iter()).all(|(&hc, &hs)| {
+            client.sockets.get::<tcp::Socket>(hc).may_send()
+                && server.sockets.get::<tcp::Socket>(hs).may_recv()
+        });
         if ready || StdInstant::now() >= connect_deadline {
             if !ready && n_active > 0 {
                 let est = cli_active
@@ -2244,26 +2939,33 @@ fn shape_idle_hot(seconds: u64, n_idle: usize, n_active: usize, offload: bool) {
     let mut recvd: u64 = 0;
     let payload = vec![0xa5u8; PAYLOAD];
     let mut sink = vec![0u8; PAYLOAD];
-    let deadline = start + std::time::Duration::from_secs(seconds);
+    let steady_start = StdInstant::now();
+    let deadline = steady_start + std::time::Duration::from_secs(seconds);
+    let alloc_before = AllocSnap::now();
+    let mut mem_trace = MemTrace::start();
     while StdInstant::now() < deadline {
-        let now = smol_now(start);
+        let now = smol_now(clock_start);
         for &h in &cli_active {
             let s = client.sockets.get_mut::<tcp::Socket>(h);
-            if s.may_send()
+            if s.can_send()
                 && let Ok(n) = s.send_slice(&payload)
             {
                 sent += n as u64;
             }
         }
-        client.iface.poll(now, &mut client.device, &mut client.sockets);
-        server.iface.poll(now, &mut server.device, &mut server.sockets);
+        client
+            .iface
+            .poll(now, &mut client.device, &mut client.sockets);
+        server
+            .iface
+            .poll(now, &mut server.device, &mut server.sockets);
         for &h in &srv_active {
             let s = server.sockets.get_mut::<tcp::Socket>(h);
             while s.can_recv() {
                 match s.recv_slice(&mut sink) {
                     Ok(r) if r > 0 => {
                         recvd += r as u64;
-                        if s.may_send() {
+                        if s.can_send() {
                             let _ = s.send_slice(&sink[..r]);
                         }
                     }
@@ -2271,8 +2973,12 @@ fn shape_idle_hot(seconds: u64, n_idle: usize, n_active: usize, offload: bool) {
                 }
             }
         }
-        server.iface.poll(now, &mut server.device, &mut server.sockets);
-        client.iface.poll(now, &mut client.device, &mut client.sockets);
+        server
+            .iface
+            .poll(now, &mut server.device, &mut server.sockets);
+        client
+            .iface
+            .poll(now, &mut client.device, &mut client.sockets);
         for &h in &cli_active {
             let s = client.sockets.get_mut::<tcp::Socket>(h);
             while s.can_recv() {
@@ -2282,9 +2988,11 @@ fn shape_idle_hot(seconds: u64, n_idle: usize, n_active: usize, offload: bool) {
                 break;
             }
         }
-        mem_trace.maybe_sample(250);
+        if mode.sample_memory() {
+            mem_trace.maybe_sample(250);
+        }
     }
-    let elapsed = start.elapsed().as_secs_f64();
+    let elapsed = steady_start.elapsed().as_secs_f64();
     let alloc_after = AllocSnap::now();
     let pool_steady = pool.used();
     let rss_end = rss_bytes();
@@ -2298,12 +3006,12 @@ fn shape_idle_hot(seconds: u64, n_idle: usize, n_active: usize, offload: bool) {
         MAX_BUF / 1024,
         MAX_BUF / 1024,
     );
-    println!(
-        "  pool budget:            {} KiB",
-        pool_bytes / 1024
-    );
+    println!("  pool budget:            {} KiB", pool_bytes / 1024);
     println!("  RSS post-create:        {} KiB", rss_after_create / 1024);
-    println!("  pool used post-create:  {} KiB  (expect ~0)", pool_after_create / 1024);
+    println!(
+        "  pool used post-create:  {} KiB  (expect ~0)",
+        pool_after_create / 1024
+    );
     println!("  elapsed:                {elapsed:.3}s");
     println!("  app sent / recvd:       {} / {}", sent, recvd);
     println!("  active throughput:      {gbps:.3} Gbps");
@@ -2313,13 +3021,17 @@ fn shape_idle_hot(seconds: u64, n_idle: usize, n_active: usize, offload: bool) {
     let free_bytes = alloc_after.free_bytes - alloc_before.free_bytes;
     let alloc_count = alloc_after.alloc_count - alloc_before.alloc_count;
     println!("  bytes allocated:        {alloc_bytes}");
-    println!("  net heap delta:         {}", alloc_bytes as i64 - free_bytes as i64);
+    println!(
+        "  net heap delta:         {}",
+        alloc_bytes as i64 - free_bytes as i64
+    );
     println!("  allocation count:       {alloc_count}");
     println!(
-        "  expected: idle pool charge ≈ 0 KiB; steady should equal {} KiB (active flows × per-flow grown peak)",
-        (n_active * 2 * MAX_BUF as usize) / 1024
+        "  expected: idle pool charge ~= 0 KiB; steady upper bound is {} KiB (active client/server sockets x rx/tx max)",
+        expected_steady_bytes / 1024
     );
     mem_trace.print();
+    print_lane_stats("idle_hot", collect_lane_stats(&[&lane_a, &lane_b]));
 }
 
 fn print_socket_sizes() {
@@ -2327,11 +3039,26 @@ fn print_socket_sizes() {
     use smoltcp::socket;
     use smoltcp::storage::*;
     println!("\n========== smoltcp footprint (bytes) ==========");
-    println!("  TCP socket:             {:>6}", size_of::<socket::tcp::Socket>());
-    println!("  UDP socket:             {:>6}", size_of::<socket::udp::Socket>());
-    println!("  ICMP socket:            {:>6}", size_of::<socket::icmp::Socket>());
-    println!("  Raw socket:             {:>6}", size_of::<socket::raw::Socket>());
-    println!("  RingBuffer<u8>:         {:>6}", size_of::<RingBuffer<u8>>());
+    println!(
+        "  TCP socket:             {:>6}",
+        size_of::<socket::tcp::Socket>()
+    );
+    println!(
+        "  UDP socket:             {:>6}",
+        size_of::<socket::udp::Socket>()
+    );
+    println!(
+        "  ICMP socket:            {:>6}",
+        size_of::<socket::icmp::Socket>()
+    );
+    println!(
+        "  Raw socket:             {:>6}",
+        size_of::<socket::raw::Socket>()
+    );
+    println!(
+        "  RingBuffer<u8>:         {:>6}",
+        size_of::<RingBuffer<u8>>()
+    );
     println!("  Assembler:              {:>6}", size_of::<Assembler>());
     println!(
         "  IpRepr / TcpRepr:       {:>3} / {:>3}",
@@ -2342,39 +3069,63 @@ fn print_socket_sizes() {
 
 fn main() {
     // Args:
+    //   [--mode bench|trace]
     //   <shape> [seconds] [offload]                     for single-flow shapes
     //   many_tcp|many_udp [seconds] [n_flows] [offload] for many-flow shapes
     //
     //   offload: "offload" | "1" | "true" -> Device advertises checksum
     //            offload (mimics a hardware NIC or iOS NEPacketTunnelFlow).
     #[cfg(feature = "dhat-heap")]
-    let _profiler = dhat::Profiler::builder().file_name("dhat-heap.json").build();
-    let args: Vec<String> = env::args().collect();
-    let shape = args.get(1).map(String::as_str).unwrap_or("all");
-    let seconds: u64 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(3);
+    let _profiler = dhat::Profiler::builder()
+        .file_name("dhat-heap.json")
+        .build();
+    let raw_args: Vec<String> = env::args().skip(1).collect();
+    let mut mode = RunMode::Bench;
+    let mut args: Vec<String> = Vec::with_capacity(raw_args.len());
+    let mut i = 0usize;
+    while i < raw_args.len() {
+        let arg = raw_args[i].as_str();
+        if let Some(value) = arg.strip_prefix("--mode=") {
+            mode = RunMode::parse(value);
+        } else if arg == "--mode" {
+            i += 1;
+            let value = raw_args.get(i).map(String::as_str).unwrap_or_else(|| {
+                eprintln!("missing value for --mode, expected bench|trace");
+                std::process::exit(2);
+            });
+            mode = RunMode::parse(value);
+        } else {
+            args.push(raw_args[i].clone());
+        }
+        i += 1;
+    }
+
+    let shape = args.first().map(String::as_str).unwrap_or("all");
+    let seconds: u64 = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(3);
 
     let is_offload = |s: Option<&str>| matches!(s, Some("offload") | Some("1") | Some("true"));
 
-    // Many-flow shapes interpret args[3] as the flow count and args[4] as the
-    // offload flag; single-flow shapes interpret args[3] directly as offload.
-    // Pool-aware shapes (multi_tcp, churn, idle_hot) use args[3]/args[4]
+    // Many-flow shapes interpret args[2] as the flow count and args[3] as the
+    // offload flag; single-flow shapes interpret args[2] directly as offload.
+    // Pool-aware shapes use args[2]/args[3]
     // for their own knobs; offload is interpreted positionally per shape.
     let (n_flows, offload) = if shape.starts_with("many_") {
         let n: usize = args
-            .get(3)
+            .get(2)
             .and_then(|s| s.parse().ok())
             .unwrap_or(100)
             .max(1);
-        (Some(n), is_offload(args.get(4).map(String::as_str)))
-    } else if matches!(shape, "multi_tcp" | "churn" | "idle_hot") {
-        // For these shapes, offload is the 5th arg position.
-        (None, is_offload(args.get(5).map(String::as_str)))
+        (Some(n), is_offload(args.get(3).map(String::as_str)))
+    } else if matches!(shape, "multi_tcp" | "multi_tcp_sink" | "churn" | "idle_hot") {
+        // For these shapes, offload is the 5th positional argument.
+        (None, is_offload(args.get(4).map(String::as_str)))
     } else {
-        (None, is_offload(args.get(3).map(String::as_str)))
+        (None, is_offload(args.get(2).map(String::as_str)))
     };
 
     println!(
-        "config: {} checksums ({}{})",
+        "config: mode={} | {} checksums ({}{})",
+        mode.label(),
         if offload {
             "device-offloaded"
         } else {
@@ -2393,38 +3144,57 @@ fn main() {
     print_socket_sizes();
 
     match shape {
-        "firehose" => shape_firehose(seconds, offload),
-        "pingpong" => shape_pingpong(seconds, offload),
-        "small" => shape_small(seconds, offload),
-        "udp" => shape_udp_firehose(seconds, offload),
+        "firehose" => shape_firehose(seconds, offload, mode),
+        "pingpong" => shape_pingpong(seconds, offload, mode),
+        "small" => shape_small(seconds, offload, mode),
+        "udp" => shape_udp_firehose(seconds, offload, mode),
         "all" => {
-            shape_udp_firehose(seconds, offload);
-            shape_small(seconds, offload);
-            shape_pingpong(seconds, offload);
+            shape_udp_firehose(seconds, offload, mode);
+            shape_small(seconds, offload, mode);
+            shape_pingpong(seconds, offload, mode);
         }
-        "many_tcp" => shape_many_tcp(seconds, n_flows.unwrap(), offload),
-        "many_udp" => shape_many_udp(seconds, n_flows.unwrap(), offload),
+        "many_tcp" => shape_many_tcp(seconds, n_flows.unwrap(), offload, mode),
+        "many_tcp_fair" => shape_many_tcp_fair(seconds, n_flows.unwrap(), offload, mode),
+        "many_udp" => shape_many_udp(seconds, n_flows.unwrap(), offload, mode),
         #[cfg(feature = "socket-tcp-dynamic-buffer")]
         "multi_tcp" => {
-            let n_threads: usize = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(2).max(1);
-            let flows: usize = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(50).max(1);
-            shape_multi_tcp(seconds, n_threads, flows, offload);
+            let n_threads: usize = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(2).max(1);
+            let flows: usize = args
+                .get(3)
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(50)
+                .max(1);
+            shape_multi_tcp(seconds, n_threads, flows, offload, mode);
+        }
+        #[cfg(feature = "socket-tcp-dynamic-buffer")]
+        "multi_tcp_sink" => {
+            let n_threads: usize = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(2).max(1);
+            let flows: usize = args
+                .get(3)
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(50)
+                .max(1);
+            shape_multi_tcp_sink(seconds, n_threads, flows, offload, mode);
         }
         #[cfg(feature = "socket-tcp-dynamic-buffer")]
         "churn" => {
-            let rate: usize = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(500).max(1);
-            shape_churn(seconds, rate, offload);
+            let rate: usize = args
+                .get(2)
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(500)
+                .max(1);
+            shape_churn(seconds, rate, offload, mode);
         }
         #[cfg(feature = "socket-tcp-dynamic-buffer")]
         "idle_hot" => {
-            let n_idle: usize = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(500).max(0);
-            let n_active: usize = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(10).max(1);
-            shape_idle_hot(seconds, n_idle, n_active, offload);
+            let n_idle: usize = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(500);
+            let n_active: usize = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(10);
+            shape_idle_hot(seconds, n_idle, n_active, offload, mode);
         }
         _ => {
             eprintln!(
-                "unknown shape '{shape}'. expected udp|small|pingpong|firehose|all|many_tcp|many_udp\
-                 |multi_tcp|churn|idle_hot (last three need --features socket-tcp-dynamic-buffer)"
+                "unknown shape '{shape}'. expected udp|small|pingpong|firehose|all|many_tcp|many_tcp_fair|many_udp\
+                 |multi_tcp|multi_tcp_sink|churn|idle_hot (dynamic-buffer shapes need --features socket-tcp-dynamic-buffer)"
             );
             std::process::exit(2);
         }

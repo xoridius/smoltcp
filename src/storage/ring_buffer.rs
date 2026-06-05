@@ -421,7 +421,8 @@ impl<'a, T: 'a + Copy + Default> RingBuffer<'a, T> {
     /// memory accounting (Darwin); on overcommit hosts (Linux) and jetsam-
     /// style hosts (iOS) malloc rarely returns NULL but we still surface
     /// failure instead of panicking.
-    pub fn try_grow(&mut self, new_capacity: usize) -> bool {
+    #[cfg_attr(not(feature = "socket-tcp-dynamic-buffer"), allow(dead_code))]
+    pub(crate) fn try_grow(&mut self, new_capacity: usize) -> bool {
         use alloc::vec::Vec;
 
         let old_capacity = self.capacity();
@@ -460,10 +461,12 @@ impl<'a, T: 'a + Copy + Default> RingBuffer<'a, T> {
     ///
     /// The ring becomes empty and zero-capacity. No-op for borrowed storage.
     /// After release, the ring can be re-grown via `try_grow`.
-    pub fn release_owned(&mut self) {
-        if let ManagedSlice::Owned(v) = &mut self.storage {
-            *v = alloc::vec::Vec::new();
-        }
+    #[cfg_attr(not(feature = "socket-tcp-dynamic-buffer"), allow(dead_code))]
+    pub(crate) fn release_owned(&mut self) {
+        let ManagedSlice::Owned(v) = &mut self.storage else {
+            return;
+        };
+        *v = alloc::vec::Vec::new();
         self.read_at = 0;
         self.length = 0;
     }
@@ -557,6 +560,22 @@ mod test {
         }
         assert_eq!(ring.dequeue_one(), Err(Empty));
         assert!(ring.is_empty());
+    }
+
+    #[cfg(feature = "alloc")]
+    #[test]
+    fn test_release_owned_is_noop_for_borrowed_storage() {
+        let mut storage = [0u8; 4];
+        let mut ring = RingBuffer::new(&mut storage[..]);
+
+        assert_eq!(ring.enqueue_slice(b"ab"), 2);
+        ring.release_owned();
+
+        assert_eq!(ring.len(), 2);
+        assert_eq!(ring.capacity(), 4);
+        let mut out = [0u8; 2];
+        assert_eq!(ring.read_allocated(0, &mut out), 2);
+        assert_eq!(&out, b"ab");
     }
 
     #[test]

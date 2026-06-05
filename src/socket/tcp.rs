@@ -565,8 +565,9 @@ bitflags::bitflags! {
     /// ~8 bytes of inter-field padding the compiler would otherwise emit
     /// between scattered `bool` fields (`rx_fin_received`,
     /// `remote_last_win_unscaled`, `remote_has_sack`, `nagle`,
-    /// `synack_paused`). Matches the same `bitflags!`-based packing
-    /// style used by `wire::dns::Flags`, `wire::dhcpv4::Flags`, etc.
+    /// `synack_paused`, `rx_window_update_dirty`). This matches the same
+    /// `bitflags!`-based packing style used by `wire::dns::Flags`,
+    /// `wire::dhcpv4::Flags`, etc.
     struct Flags: u8 {
         const RX_FIN_RECEIVED        = 1 << 0;
         const REMOTE_LAST_WIN_UNSCALED = 1 << 1;
@@ -574,7 +575,20 @@ bitflags::bitflags! {
         const NAGLE                  = 1 << 3;
         #[cfg(feature = "socket-tcp-pause-synack")]
         const SYNACK_PAUSED          = 1 << 4;
+        const RX_WINDOW_DIRTY        = 1 << 5;
     }
+}
+
+#[derive(Clone, Copy)]
+enum WindowUpdateInterest {
+    Unknown,
+    Ready,
+}
+
+#[derive(Clone, Copy)]
+struct EgressInterest {
+    seq_candidate: bool,
+    window_update: WindowUpdateInterest,
 }
 
 impl<'a> Socket<'a> {
@@ -775,6 +789,29 @@ impl<'a> Socket<'a> {
         )
     }
 
+    #[cfg(feature = "socket-tcp-dynamic-buffer")]
+    fn can_grow_tx_now(&self) -> bool {
+        let Some(state) = self.dyn_state.as_ref() else {
+            return false;
+        };
+        if !self.tx_growth_allowed() {
+            return false;
+        }
+
+        let cur = self.tx_buffer.capacity();
+        let max = state.tx_max as usize;
+        if cur >= max {
+            return false;
+        }
+
+        let pressure = state.pool.as_ref().is_some_and(|p| p.under_pressure());
+        let want = Self::next_capacity(cur, state.grow_chunk as usize, max, pressure);
+        let Some(need) = want.checked_sub(cur).filter(|n| *n > 0) else {
+            return false;
+        };
+        state.pool.as_ref().is_none_or(|p| p.available() >= need)
+    }
+
     /// Compute the next target capacity given the current size, the
     /// per-flow max, and the chunk floor. Geometric (×2) growth amortizes
     /// the O(len) memcpy across grow steps to O(total), matching how
@@ -858,10 +895,36 @@ impl<'a> Socket<'a> {
         Self::try_grow_buffer(&mut self.tx_buffer, state, max)
     }
 
+    #[cfg(feature = "socket-tcp-dynamic-buffer")]
+    #[cold]
+    fn restore_dyn_initial_buffers(&mut self) {
+        let Some(state) = self.dyn_state.as_mut() else {
+            return;
+        };
+        let rx_initial = state.rx_initial as usize;
+        let tx_initial = state.tx_initial as usize;
+        let charge = rx_initial.saturating_add(tx_initial);
+        if charge == 0 {
+            return;
+        }
+        if !state.charge(charge) {
+            return;
+        }
+
+        let rx_ok = rx_initial == 0 || self.rx_buffer.try_grow(rx_initial);
+        let tx_ok = tx_initial == 0 || self.tx_buffer.try_grow(tx_initial);
+        if !(rx_ok && tx_ok) {
+            self.rx_buffer.release_owned();
+            self.tx_buffer.release_owned();
+            state.refund(charge);
+        }
+    }
+
     /// Release the dynamic-buffer backing storage and refund the pool.
-    /// Called when transitioning to `Closed`/`Listen`, from `reset`, and
-    /// from `Drop`. Marked cold because lifecycle ends are rare relative
-    /// to dispatch frequency.
+    /// Called only once the current state no longer needs queued rx/tx
+    /// bytes to compute outgoing sequence numbers, acknowledgments, or
+    /// retransmissions. Marked cold because lifecycle ends are rare
+    /// relative to dispatch frequency.
     #[cfg(feature = "socket-tcp-dynamic-buffer")]
     #[cold]
     fn release_dyn_buffers(&mut self) {
@@ -870,6 +933,25 @@ impl<'a> Socket<'a> {
             self.tx_buffer.release_owned();
             let charged = state.charged;
             state.refund(charged);
+        }
+    }
+
+    #[cfg(feature = "socket-tcp-dynamic-buffer")]
+    #[cold]
+    fn release_dyn_buffers_if_closed_and_detached(&mut self) {
+        if self.state == State::Closed && self.tuple.is_none() {
+            self.release_dyn_buffers();
+        }
+    }
+
+    #[cfg(feature = "socket-tcp-dynamic-buffer")]
+    #[cold]
+    fn release_dyn_buffers_if_terminal_empty(&mut self) {
+        if matches!(self.state, State::LastAck | State::TimeWait)
+            && self.rx_buffer.is_empty()
+            && self.tx_buffer.is_empty()
+        {
+            self.release_dyn_buffers();
         }
     }
 
@@ -996,6 +1078,16 @@ impl<'a> Socket<'a> {
     #[cfg(feature = "socket-tcp-pause-synack")]
     pub fn pause_synack(&mut self, pause: bool) {
         self.flags.set(Flags::SYNACK_PAUSED, pause);
+    }
+
+    #[inline]
+    fn rx_window_update_dirty(&self) -> bool {
+        self.flags.contains(Flags::RX_WINDOW_DIRTY)
+    }
+
+    #[inline]
+    fn clear_rx_window_update_dirty(&mut self) {
+        self.flags.remove(Flags::RX_WINDOW_DIRTY);
     }
 
     /// Return the current window field value, including scaling according to RFC 1323.
@@ -1170,8 +1262,7 @@ impl<'a> Socket<'a> {
         #[cfg(not(feature = "socket-tcp-dynamic-buffer"))]
         let cap_for_shift = self.rx_buffer.capacity();
 
-        let rx_cap_log2 =
-            mem::size_of::<usize>() * 8 - cap_for_shift.leading_zeros() as usize;
+        let rx_cap_log2 = mem::size_of::<usize>() * 8 - cap_for_shift.leading_zeros() as usize;
 
         self.state = State::Closed;
         self.timer = Timer::new();
@@ -1180,6 +1271,7 @@ impl<'a> Socket<'a> {
         self.tx_buffer.clear();
         self.rx_buffer.clear();
         self.flags.set(Flags::RX_FIN_RECEIVED, false);
+        self.clear_rx_window_update_dirty();
 
         // Release any pool-charged backing now that the connection is fully
         // gone. Done before re-listen / re-connect so the next admission has
@@ -1241,6 +1333,8 @@ impl<'a> Socket<'a> {
         }
 
         self.reset();
+        #[cfg(feature = "socket-tcp-dynamic-buffer")]
+        self.restore_dyn_initial_buffers();
         self.listen_endpoint = local_endpoint;
         self.tuple = None;
         self.set_state(State::Listen);
@@ -1330,6 +1424,8 @@ impl<'a> Socket<'a> {
         }
 
         self.reset();
+        #[cfg(feature = "socket-tcp-dynamic-buffer")]
+        self.restore_dyn_initial_buffers();
         self.tuple = Some(Tuple {
             local: local_endpoint,
             remote: remote_endpoint,
@@ -1378,6 +1474,10 @@ impl<'a> Socket<'a> {
             | State::LastAck
             | State::Closed => (),
         }
+        #[cfg(feature = "socket-tcp-dynamic-buffer")]
+        self.release_dyn_buffers_if_closed_and_detached();
+        #[cfg(feature = "socket-tcp-dynamic-buffer")]
+        self.release_dyn_buffers_if_terminal_empty();
     }
 
     /// Aborts the connection, if any.
@@ -1389,6 +1489,8 @@ impl<'a> Socket<'a> {
     /// the `CLOSED` state.
     pub fn abort(&mut self) {
         self.set_state(State::Closed);
+        #[cfg(feature = "socket-tcp-dynamic-buffer")]
+        self.release_dyn_buffers_if_closed_and_detached();
     }
 
     /// Return whether the socket is passively listening for incoming connections.
@@ -1490,7 +1592,18 @@ impl<'a> Socket<'a> {
             return false;
         }
 
-        !self.tx_buffer.is_full()
+        if !self.tx_buffer.is_full() {
+            return true;
+        }
+
+        #[cfg(feature = "socket-tcp-dynamic-buffer")]
+        {
+            self.can_grow_tx_now()
+        }
+        #[cfg(not(feature = "socket-tcp-dynamic-buffer"))]
+        {
+            false
+        }
     }
 
     /// Return the maximum number of bytes inside the recv buffer.
@@ -1615,6 +1728,7 @@ impl<'a> Socket<'a> {
         let (size, result) = f(&mut self.rx_buffer);
         self.remote_seq_no += size;
         if size > 0 {
+            self.flags.insert(Flags::RX_WINDOW_DIRTY);
             #[cfg(any(test, feature = "verbose"))]
             tcp_trace!(
                 "rx buffer: dequeueing {} octets (now {})",
@@ -1649,10 +1763,13 @@ impl<'a> Socket<'a> {
     ///
     /// See also [recv](#method.recv).
     pub fn recv_slice(&mut self, data: &mut [u8]) -> Result<usize, RecvError> {
-        self.recv_impl(|rx_buffer| {
+        let result = self.recv_impl(|rx_buffer| {
             let size = rx_buffer.dequeue_slice(data);
             (size, size)
-        })
+        });
+        #[cfg(feature = "socket-tcp-dynamic-buffer")]
+        self.release_dyn_buffers_if_terminal_empty();
+        result
     }
 
     /// Peek at a sequence of received octets without removing them from
@@ -1695,33 +1812,22 @@ impl<'a> Socket<'a> {
     }
 
     fn set_state(&mut self, state: State) {
-        if self.state != state {
-            tcp_trace!("state={}=>{}", self.state, state);
+        let old_state = self.state;
+        if old_state != state {
+            tcp_trace!("state={}=>{}", old_state, state);
         }
 
         self.state = state;
 
-        // Dynamic-buffer: release backing storage on every transition
-        // that takes the socket out of the data-flow region of the state
-        // machine. Linux's `tcp_done()` returns `sk_forward_alloc` on
-        // Closed; we do the analogous refund here so a SYN-flood /
-        // connection-churn workload reclaims memory immediately, not
-        // after TIME-WAIT expiry.
-        //
-        //   - State::Closed:  abort / RST / explicit close from any state
-        //   - State::Listen:  SynReceived → Listen on RST against a listen
-        //                     socket (tcp.rs ~2162). Without releasing here
-        //                     the listen socket would accumulate one grow
-        //                     chunk per failed handshake, breaking the
-        //                     "idle ≈ 0 KiB" invariant FORK §14.6 documents.
-        //
-        // Safe in both cases: Closed sends only an RST (no payload),
-        // Listen has no peer until the next SYN arrives. Setting buffer
-        // capacity back to 0 is exactly the state a fresh `listen()`
-        // would produce; the next SYN's dispatch will grow rx again as
-        // usual via the dispatch-time hook.
+        // Dynamic-buffer: keep the state setter from eagerly clearing
+        // buffers in `Closed`. Some callers still need the queued lengths
+        // after the transition, e.g. to build an outbound RST ACK or to
+        // dequeue a final ACK in LAST-ACK. The one safe transition here is
+        // a failed passive handshake returning SynReceived -> Listen: no
+        // packet will be emitted for that peer, and the listen socket must
+        // go back to its lazy idle footprint.
         #[cfg(feature = "socket-tcp-dynamic-buffer")]
-        if matches!(state, State::Closed | State::Listen) {
+        if state == State::Listen && old_state == State::SynReceived {
             self.release_dyn_buffers();
         }
 
@@ -1796,6 +1902,7 @@ impl<'a> Socket<'a> {
         reply_repr.window_len = self.scaled_window();
         self.remote_last_win = reply_repr.window_len;
         self.flags.set(Flags::REMOTE_LAST_WIN_UNSCALED, false);
+        self.clear_rx_window_update_dirty();
 
         // If the remote supports selective acknowledgement, add the option to the outgoing
         // segment.
@@ -2145,7 +2252,8 @@ impl<'a> Socket<'a> {
             }
 
             self.rtte.on_ack(cx.now(), ack_number);
-            self.congestion_controller.on_ack(cx.now(), ack_len, &self.rtte);
+            self.congestion_controller
+                .on_ack(cx.now(), ack_len, &self.rtte);
         }
 
         // Disregard control flags we don't care about or shouldn't act on yet.
@@ -2184,6 +2292,8 @@ impl<'a> Socket<'a> {
                 tcp_trace!("received RST");
                 self.set_state(State::Closed);
                 self.tuple = None;
+                #[cfg(feature = "socket-tcp-dynamic-buffer")]
+                self.release_dyn_buffers_if_closed_and_detached();
                 return None;
             }
 
@@ -2359,7 +2469,8 @@ impl<'a> Socket<'a> {
         let is_window_update = new_remote_win_len != self.remote_win_len;
         self.remote_win_len = new_remote_win_len;
 
-        self.congestion_controller.set_remote_window(new_remote_win_len as usize);
+        self.congestion_controller
+            .set_remote_window(new_remote_win_len as usize);
 
         if ack_len > 0 {
             // Dequeue acknowledged octets.
@@ -2483,6 +2594,8 @@ impl<'a> Socket<'a> {
 
         let payload_len = payload.len();
         if payload_len == 0 {
+            #[cfg(feature = "socket-tcp-dynamic-buffer")]
+            self.release_dyn_buffers_if_closed_and_detached();
             return None;
         }
 
@@ -2608,8 +2721,8 @@ impl<'a> Socket<'a> {
         }
 
         // max sequence number we can send.
-        let max_send_seq = self.local_seq_no
-            + core::cmp::min(self.remote_win_len as usize, self.tx_buffer.len());
+        let max_send_seq =
+            self.local_seq_no + core::cmp::min(self.remote_win_len as usize, self.tx_buffer.len());
 
         // Max amount of octets we can send.
         let max_send = if max_send_seq >= self.remote_last_seq {
@@ -2652,6 +2765,67 @@ impl<'a> Socket<'a> {
         can_send || can_fin
     }
 
+    #[inline]
+    fn has_unsent_or_control_to_transmit(&self) -> bool {
+        match self.state {
+            State::SynSent | State::SynReceived => self.remote_last_seq == self.local_seq_no,
+            State::Established | State::CloseWait => {
+                self.remote_last_seq < self.local_seq_no + self.tx_buffer.len()
+            }
+            State::FinWait1 | State::Closing | State::LastAck => {
+                self.remote_last_seq <= self.local_seq_no + self.tx_buffer.len()
+            }
+            _ => false,
+        }
+    }
+
+    #[inline]
+    fn egress_interest(&self, timestamp: Instant) -> Option<EgressInterest> {
+        self.tuple?;
+
+        if self.remote_last_ts.is_none() || self.state == State::Closed {
+            return Some(EgressInterest {
+                seq_candidate: self.has_unsent_or_control_to_transmit(),
+                window_update: WindowUpdateInterest::Unknown,
+            });
+        }
+
+        if self.timed_out(timestamp)
+            || self.timer.should_retransmit(timestamp)
+            || self.timer.should_keep_alive(timestamp)
+            || self.timer.should_zero_window_probe(timestamp)
+            || self.timer.should_close(timestamp)
+        {
+            return Some(EgressInterest {
+                seq_candidate: self.has_unsent_or_control_to_transmit(),
+                window_update: WindowUpdateInterest::Unknown,
+            });
+        }
+
+        #[cfg(feature = "socket-tcp-pause-synack")]
+        if matches!(self.state, State::SynReceived) && self.flags.contains(Flags::SYNACK_PAUSED) {
+            return None;
+        }
+
+        let seq_candidate = self.has_unsent_or_control_to_transmit();
+        if seq_candidate || (self.ack_to_transmit() && self.delayed_ack_expired(timestamp)) {
+            return Some(EgressInterest {
+                seq_candidate,
+                window_update: WindowUpdateInterest::Unknown,
+            });
+        }
+
+        let window_update = self.rx_window_update_dirty() && self.window_to_update();
+        if window_update {
+            Some(EgressInterest {
+                seq_candidate: false,
+                window_update: WindowUpdateInterest::Ready,
+            })
+        } else {
+            None
+        }
+    }
+
     fn delayed_ack_expired(&self, timestamp: Instant) -> bool {
         match self.ack_delay_timer {
             AckDelayTimer::Idle => true,
@@ -2680,8 +2854,7 @@ impl<'a> Socket<'a> {
     /// <https://elixir.bootlin.com/linux/v6.11.4/source/net/ipv4/tcp_input.c#L5747>.
     fn immediate_ack_to_transmit(&self) -> bool {
         if let Some(remote_last_ack) = self.remote_last_ack {
-            remote_last_ack + (self.remote_mss as usize)
-                < self.remote_seq_no + self.rx_buffer.len()
+            remote_last_ack + (self.remote_mss as usize) < self.remote_seq_no + self.rx_buffer.len()
         } else {
             false
         }
@@ -2736,8 +2909,9 @@ impl<'a> Socket<'a> {
         if let Some(state) = self.dyn_state.as_ref()
             && self.rx_buffer.window() < (state.grow_chunk as usize).max(self.remote_mss as usize)
             && self.rx_growth_allowed()
+            && self.try_grow_rx()
         {
-            self.try_grow_rx();
+            self.flags.insert(Flags::RX_WINDOW_DIRTY);
         }
 
         // NOTE(unwrap): we check tuple is not None above.
@@ -2752,6 +2926,10 @@ impl<'a> Socket<'a> {
             self.reset();
             return Ok(());
         }
+
+        let Some(egress_interest) = self.egress_interest(cx.now()) else {
+            return Ok(());
+        };
 
         if self.remote_last_ts.is_none() {
             // We get here in exactly two cases:
@@ -2771,7 +2949,7 @@ impl<'a> Socket<'a> {
         // same MSS/window/cwnd state. Cache it. If the retransmit branch fires
         // it rewinds `remote_last_seq` so the cached value is stale — refresh
         // it there.
-        let mut want_send = self.seq_to_transmit(cx);
+        let mut want_send = egress_interest.seq_candidate && self.seq_to_transmit(cx);
 
         // Check if any state needs to be changed because of a timer.
         if self.timed_out(cx.now()) {
@@ -2815,7 +2993,12 @@ impl<'a> Socket<'a> {
         } else if self.ack_to_transmit() && self.delayed_ack_expired(cx.now()) {
             // If we have data to acknowledge, do it.
             tcp_trace!("outgoing segment will acknowledge");
-        } else if self.window_to_update() {
+        } else if match egress_interest.window_update {
+            WindowUpdateInterest::Ready => true,
+            WindowUpdateInterest::Unknown => {
+                self.rx_window_update_dirty() && self.window_to_update()
+            }
+        } {
             // If we have window length increase to advertise, do it.
             tcp_trace!("outgoing segment will update window");
         } else if self.state == State::Closed {
@@ -3048,7 +3231,11 @@ impl<'a> Socket<'a> {
         self.remote_last_seq = new_remote_last_seq;
         self.remote_last_ack = new_remote_last_ack;
         self.remote_last_win = new_remote_last_win;
-        self.flags.set(Flags::REMOTE_LAST_WIN_UNSCALED, new_remote_last_win_unscaled);
+        self.flags.set(
+            Flags::REMOTE_LAST_WIN_UNSCALED,
+            new_remote_last_win_unscaled,
+        );
+        self.clear_rx_window_update_dirty();
 
         if seg_len > 0 {
             self.rtte.on_send(cx.now(), new_remote_last_seq);
@@ -3066,12 +3253,17 @@ impl<'a> Socket<'a> {
         if self.state == State::Closed {
             // When aborting a connection, forget about it after sending a single RST packet.
             self.tuple = None;
+            #[cfg(feature = "socket-tcp-dynamic-buffer")]
+            self.release_dyn_buffers();
             #[cfg(feature = "async")]
             {
                 // Wake tx now so that async users can wait for the RST to be sent
                 self.tx_waker.wake();
             }
         }
+
+        #[cfg(feature = "socket-tcp-dynamic-buffer")]
+        self.release_dyn_buffers_if_terminal_empty();
 
         Ok(())
     }
@@ -3091,7 +3283,7 @@ impl<'a> Socket<'a> {
         } else if self.seq_to_transmit(cx) {
             // We have a data or flag packet to transmit.
             PollAt::Now
-        } else if self.window_to_update() {
+        } else if self.rx_window_update_dirty() && self.window_to_update() {
             // The receive window has been raised significantly.
             PollAt::Now
         } else {
@@ -3476,6 +3668,103 @@ mod test {
         s.local_seq_no = LOCAL_SEQ + 1 + 1;
         s.remote_last_seq = LOCAL_SEQ + 1 + 1;
         s
+    }
+
+    #[test]
+    fn test_egress_may_emit_is_false_for_idle_established_socket() {
+        let mut s = socket_established();
+        s.remote_last_ts = Some(Instant::from_millis(10));
+
+        assert!(s.socket.egress_interest(Instant::from_millis(20)).is_none());
+    }
+
+    #[test]
+    fn test_egress_may_emit_is_true_for_pending_data() {
+        let mut s = socket_established();
+        s.remote_last_ts = Some(Instant::from_millis(10));
+        s.send_slice(b"abcdef").unwrap();
+
+        assert!(s.socket.egress_interest(Instant::from_millis(20)).is_some());
+    }
+
+    #[test]
+    fn test_egress_may_emit_is_true_for_pending_ack() {
+        let mut s = socket_established();
+        s.remote_last_ts = Some(Instant::from_millis(10));
+        s.remote_last_ack = Some(REMOTE_SEQ);
+
+        assert!(s.socket.egress_interest(Instant::from_millis(20)).is_some());
+    }
+
+    #[test]
+    fn test_egress_may_emit_is_true_for_fin() {
+        let mut s = socket_fin_wait_1();
+        s.remote_last_ts = Some(Instant::from_millis(10));
+
+        assert!(s.socket.egress_interest(Instant::from_millis(20)).is_some());
+    }
+
+    #[test]
+    fn test_egress_may_emit_is_true_for_expired_timer() {
+        let mut s = socket_established();
+        s.remote_last_ts = Some(Instant::from_millis(10));
+        s.timer = Timer::Retransmit {
+            expires_at: Instant::from_millis_const(15),
+        };
+
+        assert!(s.socket.egress_interest(Instant::from_millis(20)).is_some());
+    }
+
+    #[test]
+    fn test_rx_dequeue_marks_window_update_dirty() {
+        let mut s = socket_established();
+        assert_eq!(s.rx_buffer.enqueue_slice(b"x"), 1);
+
+        s.recv(|buffer| (buffer.len(), ())).unwrap();
+
+        assert!(s.socket.rx_window_update_dirty());
+    }
+
+    #[test]
+    fn test_window_update_dispatch_clears_rx_window_dirty() {
+        let mut s = socket_established_with_buffer_sizes(64, 6);
+        s.remote_last_ts = Some(Instant::from_millis(10));
+        assert_eq!(s.rx_buffer.enqueue_slice(b"abc"), 3);
+        s.remote_last_ack = Some(s.remote_seq_no + s.rx_buffer.len());
+        s.remote_last_win = s.scaled_window();
+        s.recv(|buffer| (buffer.len(), ())).unwrap();
+        assert!(s.window_to_update());
+        assert!(s.socket.rx_window_update_dirty());
+
+        let mut emitted = false;
+        let result: Result<(), ()> = s.socket.dispatch(&mut s.cx, |_, (_, repr)| {
+            emitted = true;
+            assert_eq!(repr.window_len, 6);
+            Ok(())
+        });
+
+        assert!(result.is_ok());
+        assert!(emitted);
+        assert!(!s.socket.rx_window_update_dirty());
+    }
+
+    #[test]
+    fn test_insignificant_window_check_keeps_rx_window_dirty_without_emit() {
+        let mut s = socket_established();
+        s.remote_last_ts = Some(Instant::from_millis(10));
+        assert_eq!(s.rx_buffer.enqueue_slice(b"x"), 1);
+        s.remote_last_ack = Some(s.remote_seq_no + s.rx_buffer.len());
+        s.remote_last_win = s.scaled_window();
+        s.recv(|buffer| (buffer.len(), ())).unwrap();
+        assert!(!s.window_to_update());
+        assert!(s.socket.rx_window_update_dirty());
+
+        let result: Result<(), ()> = s.socket.dispatch(&mut s.cx, |_, _| {
+            panic!("insignificant window change must not emit a packet");
+        });
+
+        assert!(result.is_ok());
+        assert!(s.socket.rx_window_update_dirty());
     }
 
     fn socket_closing() -> TestSocket {
@@ -9573,7 +9862,10 @@ mod test {
         // Bring the SYN-RECEIVED + Established path into a dynamic socket
         // without going through the full handshake macros (which assume
         // legacy buffer sizing). Mirrors socket_established_with_buffer_sizes.
-        fn dyn_socket_established(cfg: DynamicBufferConfig, pool: Option<MemoryPool>) -> TestSocket {
+        fn dyn_socket_established(
+            cfg: DynamicBufferConfig,
+            pool: Option<MemoryPool>,
+        ) -> TestSocket {
             let mut s = dyn_socket(cfg, pool);
             s.state = State::Established;
             s.tuple = Some(TUPLE);
@@ -9818,6 +10110,162 @@ mod test {
         }
 
         #[test]
+        fn zero_initial_tx_can_send_when_growth_possible() {
+            let cfg = DynamicBufferConfig::symmetric(0, 32 * 1024, 4 * 1024);
+            let s = dyn_socket_established(cfg, None);
+
+            assert!(s.may_send());
+            assert!(s.can_send());
+        }
+
+        #[test]
+        fn public_listen_preserves_nonzero_initial_capacity() {
+            let pool = MemoryPool::new(64 * 1024);
+            let cfg = DynamicBufferConfig::symmetric(4 * 1024, 32 * 1024, 4 * 1024);
+            let mut s = dyn_socket(cfg, Some(pool.clone()));
+
+            assert_eq!(pool.used(), 8 * 1024);
+            assert_eq!(s.recv_capacity(), 4 * 1024);
+            assert_eq!(s.send_capacity(), 4 * 1024);
+
+            s.listen(LISTEN_END).unwrap();
+
+            assert_eq!(pool.used(), 8 * 1024);
+            assert_eq!(s.recv_capacity(), 4 * 1024);
+            assert_eq!(s.send_capacity(), 4 * 1024);
+        }
+
+        #[test]
+        fn public_connect_preserves_nonzero_initial_capacity() {
+            let pool = MemoryPool::new(64 * 1024);
+            let cfg = DynamicBufferConfig::symmetric(4 * 1024, 32 * 1024, 4 * 1024);
+            let mut s = dyn_socket(cfg, Some(pool.clone()));
+
+            s.socket
+                .connect(&mut s.cx, REMOTE_END, LOCAL_END.port)
+                .unwrap();
+
+            assert_eq!(pool.used(), 8 * 1024);
+            assert_eq!(s.recv_capacity(), 4 * 1024);
+            assert_eq!(s.send_capacity(), 4 * 1024);
+        }
+
+        #[test]
+        fn last_ack_data_fin_ack_dequeues_before_release() {
+            let pool = MemoryPool::new(64 * 1024);
+            let cfg = DynamicBufferConfig::symmetric(4 * 1024, 32 * 1024, 4 * 1024);
+            let mut s = dyn_socket_established(cfg, Some(pool.clone()));
+            s.state = State::LastAck;
+            s.remote_seq_no = REMOTE_SEQ + 1 + 1;
+            s.remote_last_ack = Some(REMOTE_SEQ + 1 + 1);
+            assert_eq!(s.tx_buffer.enqueue_slice(b"x"), 1);
+            s.remote_last_seq = LOCAL_SEQ + 1 + 1 + 1;
+
+            send!(
+                s,
+                TcpRepr {
+                    seq_number: REMOTE_SEQ + 1 + 1,
+                    ack_number: Some(LOCAL_SEQ + 1 + 1 + 1),
+                    ..SEND_TEMPL
+                }
+            );
+
+            assert_eq!(s.state, State::Closed);
+            assert_eq!(s.send_queue(), 0);
+            assert_eq!(pool.used(), 0);
+        }
+
+        #[test]
+        fn abort_with_unread_rx_sends_correct_rst_ack_then_refunds_pool() {
+            let pool = MemoryPool::new(64 * 1024);
+            let cfg = DynamicBufferConfig::symmetric(4 * 1024, 32 * 1024, 4 * 1024);
+            let mut s = dyn_socket_established(cfg, Some(pool.clone()));
+            let _ = send(
+                &mut s,
+                Instant::from_millis(0),
+                &TcpRepr {
+                    seq_number: REMOTE_SEQ + 1,
+                    ack_number: Some(LOCAL_SEQ + 1),
+                    payload: &b"abcd"[..],
+                    ..SEND_TEMPL
+                },
+            );
+            assert_eq!(s.recv_queue(), 4);
+            assert_eq!(pool.used(), 8 * 1024);
+
+            s.abort();
+            assert_eq!(s.recv_queue(), 4);
+            assert_eq!(pool.used(), 8 * 1024);
+
+            recv!(
+                s,
+                Ok(TcpRepr {
+                    control: TcpControl::Rst,
+                    seq_number: LOCAL_SEQ + 1,
+                    ack_number: Some(REMOTE_SEQ + 1 + 4),
+                    window_len: 4 * 1024 - 4,
+                    ..RECV_TEMPL
+                })
+            );
+            assert_eq!(pool.used(), 0);
+            assert_eq!(s.recv_capacity(), 0);
+        }
+
+        #[test]
+        fn time_wait_releases_empty_dynamic_buffers_after_ack() {
+            let pool = MemoryPool::new(64 * 1024);
+            let cfg = DynamicBufferConfig::symmetric(4 * 1024, 32 * 1024, 4 * 1024);
+            let mut s = dyn_socket_established(cfg, Some(pool.clone()));
+
+            assert!(s.try_grow_rx());
+            assert!(s.try_grow_tx());
+            assert!(pool.used() > 8 * 1024);
+
+            s.close();
+            recv!(
+                s,
+                [TcpRepr {
+                    control: TcpControl::Fin,
+                    seq_number: LOCAL_SEQ + 1,
+                    ack_number: Some(REMOTE_SEQ + 1),
+                    window_len: 8 * 1024,
+                    ..RECV_TEMPL
+                }]
+            );
+            send!(
+                s,
+                TcpRepr {
+                    seq_number: REMOTE_SEQ + 1,
+                    ack_number: Some(LOCAL_SEQ + 1 + 1),
+                    ..SEND_TEMPL
+                }
+            );
+            send!(
+                s,
+                TcpRepr {
+                    control: TcpControl::Fin,
+                    seq_number: REMOTE_SEQ + 1,
+                    ack_number: Some(LOCAL_SEQ + 1 + 1),
+                    ..SEND_TEMPL
+                }
+            );
+            recv!(
+                s,
+                [TcpRepr {
+                    seq_number: LOCAL_SEQ + 1 + 1,
+                    ack_number: Some(REMOTE_SEQ + 1 + 1),
+                    window_len: 8 * 1024,
+                    ..RECV_TEMPL
+                }]
+            );
+
+            assert_eq!(s.state, State::TimeWait);
+            assert_eq!(pool.used(), 0);
+            assert_eq!(s.recv_capacity(), 0);
+            assert_eq!(s.send_capacity(), 0);
+        }
+
+        #[test]
         fn send_data_survives_until_ack_with_dynamic_tx() {
             // Standard correctness: pre-ACK tx data is not freed by growth.
             let cfg = DynamicBufferConfig::symmetric(4 * 1024, 32 * 1024, 4 * 1024);
@@ -9882,7 +10330,11 @@ mod test {
             for _ in 0..300 {
                 sockets.push(Socket::new_dynamic(cfg, Some(pool.clone())));
             }
-            assert_eq!(pool.used(), 0, "idle sockets should not reserve any pool memory");
+            assert_eq!(
+                pool.used(),
+                0,
+                "idle sockets should not reserve any pool memory"
+            );
 
             // Now grow the first 50 to full rx_max + tx_max = 128 KiB each.
             // 50 * 128 KiB = 6.4 MiB, well within 24 MiB budget.
@@ -10026,30 +10478,27 @@ mod test {
             // memory could exceed budget. Fixed by widening charge to
             // usize and using checked_add.
             //
-            // Use a 2 GiB pool, request 768 MiB rx + 768 MiB tx (1.5 GiB),
-            // and verify pool.used() matches exactly.
-            //
-            // (We can't actually request u32::MAX bytes — that would try to
-            // allocate 4 GiB of zero-filled Vec each, OOMing on most test
-            // hosts. The unit-level invariant we're checking is the
-            // accounting arithmetic, not the alloc itself.)
+            // Exercise the accounting layer directly instead of allocating
+            // 1.5 GiB of Vec backing storage. The invariant is arithmetic,
+            // not allocator behavior.
             let pool = MemoryPool::new(2 * 1024 * 1024 * 1024);
             let cfg = DynamicBufferConfig {
-                rx_initial: 768 * 1024 * 1024,
-                rx_max: 768 * 1024 * 1024,
-                tx_initial: 768 * 1024 * 1024,
-                tx_max: 768 * 1024 * 1024,
+                rx_initial: 0,
+                rx_max: 1 << 30,
+                tx_initial: 0,
+                tx_max: 1 << 30,
                 grow_chunk: 8 * 1024,
             };
-            let s = Socket::new_dynamic(cfg, Some(pool.clone()));
-            // Both buffers should have allocated to the requested initial.
-            assert_eq!(s.rx_buffer.capacity(), 768 * 1024 * 1024);
-            assert_eq!(s.tx_buffer.capacity(), 768 * 1024 * 1024);
-            // Pool should record exactly 1.5 GiB charged.
-            assert_eq!(pool.used(), 2 * 768 * 1024 * 1024);
-            // And drop refunds fully.
-            drop(s);
+            let mut state = dynbuf::DynBufState::new(&cfg, Some(pool.clone()));
+            let charge = 2 * 768 * 1024 * 1024;
+
+            assert!(state.charge(charge));
+            assert_eq!(state.charged, charge);
+            assert_eq!(pool.used(), charge);
+
+            state.refund(charge);
             assert_eq!(pool.used(), 0);
+            assert_eq!(state.charged, 0);
         }
 
         #[test]

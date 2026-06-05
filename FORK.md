@@ -91,8 +91,12 @@ hyperthreading siblings of the bench CPU, and re-run three times.
 
 ```
 cargo build --release --example profile_loopback
-cargo run --release --example profile_loopback -- <shape> <seconds> [offload]
+cargo run --release --example profile_loopback -- --mode bench <shape> <seconds> [offload]
 ```
+
+`--mode bench` is the default and prints steady-state benchmark metrics.
+`--mode trace` keeps the workload shape stable for Instruments capture and
+disables periodic RSS sampling so the trace is not polluted by polling.
 
 Single-flow shapes (saturated one connection):
 
@@ -107,15 +111,16 @@ Single-flow shapes (saturated one connection):
 Multi-flow shapes (fairness + scaling + memory at large flow counts):
 
 ```
-cargo run --release --example profile_loopback -- many_tcp <seconds> <N>
-cargo run --release --example profile_loopback -- many_udp <seconds> <N>
+cargo run --release --example profile_loopback -- --mode bench many_tcp <seconds> <N>
+cargo run --release --example profile_loopback -- --mode bench many_tcp_fair <seconds> <N>
+cargo run --release --example profile_loopback -- --mode bench many_udp <seconds> <N>
 ```
 
 Sweep N to characterize scaling:
 
 ```
 for n in 50 100 200 500 1000 2000; do
-  cargo run --release --example profile_loopback -- many_tcp 5 $n 2>&1 | \
+  cargo run --release --example profile_loopback -- --mode bench many_tcp 5 $n 2>&1 | \
     grep -E "throughput \(app|Jain|verdict|RSS verdict"
 done
 ```
@@ -127,10 +132,11 @@ Report fields to read:
 | `throughput (app)` | Aggregate app-visible Gbps / MB/s. |
 | `per-packet` | ns + estimated cycles per packet at the harness's reference frequency. |
 | `poll-cycle latency: p50 / p99` | Tail latency of a single `Interface::poll` invocation. |
-| `Jain` | Per-flow fairness index. ≥ 0.95 = FAIR; below 0.95 needs investigation. |
+| `Jain` | Per-flow fairness index. `many_tcp_fair` is the deterministic TCP fairness signal; `many_tcp` is a high-throughput stress shape. |
 | `verdict` | Single-line pass/fail style summary for fairness + starvation. |
 | `RSS verdict` | `bounded` or `GROWTH`. GROWTH means the median RSS over the run is materially smaller than the final RSS — leak suspect. |
-| `net heap delta` | Should be a small constant (each periodic `/proc/self/status` read accounts for it). Non-constant values mean smoltcp itself allocated on the hot path → bug. |
+| `net heap delta` | Should be a small constant. Non-constant values mean smoltcp itself allocated on the hot path → bug. |
+| `lane stats` | Harness packet-pool health. Trace-mode performance claims require `fallback allocs == 0`. |
 
 ### 4.2.1 Dynamic-buffer / multi-thread shapes
 
@@ -141,39 +147,54 @@ that the legacy `many_tcp` / `many_udp` shapes don't cover.
 ```
 # Multi-Interface pool contention: N threads, M flows each, shared MemoryPool.
 cargo run --release --example profile_loopback --features socket-tcp-dynamic-buffer \
-  -- multi_tcp <seconds> <n_threads> <flows_per_thread>
+  -- --mode bench multi_tcp <seconds> <n_threads> <flows_per_thread>
+
+# One-way dynamic-buffer TCP sink. Uses `Socket::send` / `Socket::recv`
+# closures to reduce app-side copy pressure relative to `multi_tcp`.
+cargo run --release --example profile_loopback --features socket-tcp-dynamic-buffer \
+  -- --mode bench multi_tcp_sink <seconds> <n_threads> <flows_per_thread>
 
 # Connection churn: open/close at the target rate; verifies pool refund
 # accounting under high lifecycle pressure.
 cargo run --release --example profile_loopback --features socket-tcp-dynamic-buffer \
-  -- churn <seconds> <conn_per_sec>
+  -- --mode bench churn <seconds> <conn_per_sec>
 
 # Mixed idle + active: many idle sockets + few hot ones.
 cargo run --release --example profile_loopback --features socket-tcp-dynamic-buffer \
-  -- idle_hot <seconds> <n_idle> <n_active>
+  -- --mode bench idle_hot <seconds> <n_idle> <n_active>
 ```
 
 What each catches:
 
 | Shape | What's measured | What a regression looks like |
 |---|---|---|
-| `multi_tcp` | aggregate throughput scaling, per-thread Jain across `MemoryPool` contention | `Jain < 0.95` or aggregate throughput drops by >10 % at N=4 threads relative to N=1 |
+| `multi_tcp` | copy-heavy dynamic-buffer TCP echo throughput, per-thread Jain across `MemoryPool` contention | `Jain < 0.95`, nonzero lane fallback allocations in trace mode, or a large host-local throughput drop versus the previous isolated baseline |
+| `multi_tcp_sink` | one-way dynamic-buffer TCP throughput with direct send/recv closures | nonzero lane fallback allocations in trace mode, lower throughput than `multi_tcp` without a trace-backed explanation, or no reduction in copy/memmove pressure |
 | `churn` | open+close rate sustained, `pool used` returns to 0, `net heap delta` bounded | `pool used (end) > 0` (leaked reservations); `net heap delta` growing with rate (allocator-on-hot-path) |
-| `idle_hot` | `pool used post-create == 0` for idle flows; steady-state pool = N_active × 2 × MAX_BUF | non-zero charge from idle sockets (lazy alloc broken); active flows can't reach max (grow policy broken) |
+| `idle_hot` | `pool used post-create == 0` for idle flows; steady-state pool = N_active × 2 sockets × MAX_BUF | non-zero charge from idle sockets (lazy alloc broken); active flows can't reach max (grow policy broken) |
+
+In `--mode trace`, the lane packet pool is strict: if a shape exhausts its
+prebuilt lane packets the run fails instead of silently allocating fallback
+packets. Treat trace evidence as usable only when the printed lane stats show
+`fallback allocs: 0`.
 
 ### 4.3 Configuration variants worth measuring
 
 **Checksum offload:**
 
 ```
-cargo run --release --example profile_loopback -- udp 5            # software checksums (default)
-cargo run --release --example profile_loopback -- udp 5 offload    # device claims hardware offload
+cargo run --release --example profile_loopback -- --mode bench udp 5          # software checksums
+cargo run --release --example profile_loopback -- --mode bench udp 5 offload  # offload
 ```
 
 The delta is the all-in checksum cost. Useful as a ceiling number. `offload`
 mode is only safe when both peers ignore checksums (e.g., a loopback
 benchmark). Real deployments whose peer is a kernel TCP stack must NOT
 enable this — kernel strict-checksum validation will drop every reply.
+
+Dynamic-buffer readiness and trace comparisons use the default software
+checksum path. Checksum/offload behavior is intentionally excluded from those
+pass/fail claims unless a separate checksum-specific run is explicitly named.
 
 **Congestion control:**
 
@@ -202,13 +223,13 @@ Run on a quiet host, governor pinned to `performance`:
 for i in 1 2 3; do cargo +nightly bench --bench bench; done
 
 # Single-flow shapes, 10 sec each for stable averages
-cargo run --release --example profile_loopback -- all 10
-cargo run --release --example profile_loopback -- all 10 offload
+cargo run --release --example profile_loopback -- --mode bench all 10
+cargo run --release --example profile_loopback -- --mode bench all 10 offload
 
 # Scaling sweep
 for n in 100 500 1000; do
-  cargo run --release --example profile_loopback -- many_tcp 10 $n
-  cargo run --release --example profile_loopback -- many_udp 10 $n
+  cargo run --release --example profile_loopback -- --mode bench many_tcp 10 $n
+  cargo run --release --example profile_loopback -- --mode bench many_udp 10 $n
 done
 ```
 
@@ -217,9 +238,10 @@ done
 ### 5.1 perf
 
 ```
-perf record -F 999 --call-graph dwarf -o /tmp/prof.data \
+PROFILE_DIR=$(mktemp -d)
+perf record -F 999 --call-graph dwarf -o "$PROFILE_DIR/prof.data" \
   target/release/examples/profile_loopback udp 5
-perf report -i /tmp/prof.data --no-children --stdio --percent-limit 1
+perf report -i "$PROFILE_DIR/prof.data" --no-children --stdio --percent-limit 1
 ```
 
 Symbols to expect in the top 10 on any reasonable workload:
@@ -238,6 +260,92 @@ Diagnostics:
 `perf stat -e cycles,instructions,cache-misses,branch-misses` requires hardware
 PMU access. Containers and locked-down VMs typically disallow it; `perf record`
 still works (falls back to `task-clock` software sampling).
+
+### 5.1.1 macOS Instruments trace analysis
+
+Use direct binary launch for capture, then analyze every `.trace` bundle with
+Instruments' Summary, Call Tree, and System Trace tables. Do not use ad-hoc
+`xctrace export --xpath`, XML parsing, or grep-based trace analysis.
+
+Build once:
+
+```
+cargo build --release --example profile_loopback \
+  --features socket-tcp-dynamic-buffer
+
+BIN=target/release/examples/profile_loopback
+```
+
+CPU Profiler or Time Profiler for hot functions. Capture both the copy-heavy
+echo workload and the one-way sink workload when evaluating copy pressure:
+
+```
+TRACE_DIR=$(mktemp -d)
+TRACE="$TRACE_DIR/smoltcp-multi-tcp-cpu.trace"
+xcrun xctrace record --template "CPU Profiler" --time-limit 15s \
+  --output "$TRACE" --target-stdout - \
+  --launch -- "$BIN" --mode trace multi_tcp 5 4 30
+
+TRACE="$TRACE_DIR/smoltcp-multi-tcp-sink-cpu.trace"
+xcrun xctrace record --template "CPU Profiler" --time-limit 15s \
+  --output "$TRACE" --target-stdout - \
+  --launch -- "$BIN" --mode trace multi_tcp_sink 5 4 30
+```
+
+After capture, record the trace summary, top function hotspots, and a call
+tree or flamegraph view.
+
+If a Time Profiler capture has samples but no symbolized function rows for a
+raw CLI, capture a supplemental `"CPU Profiler"` trace with the same
+`--mode trace` workload. Keep the Time Profiler bundle for the required
+sample timeline, but quote function-level hotspots only from a symbolized
+trace.
+
+System Trace for scheduler/syscall/thread-state evidence:
+
+```
+TRACE_DIR=$(mktemp -d)
+TRACE="$TRACE_DIR/smoltcp-multi-tcp-system.trace"
+xcrun xctrace record --template "System Trace" --time-limit 12s \
+  --output "$TRACE" --target-stdout - \
+  --launch -- "$BIN" --mode trace multi_tcp 5 4 30
+
+TRACE="$TRACE_DIR/smoltcp-multi-tcp-sink-system.trace"
+xcrun xctrace record --template "System Trace" --time-limit 12s \
+  --output "$TRACE" --target-stdout - \
+  --launch -- "$BIN" --mode trace multi_tcp_sink 5 4 30
+```
+
+After capture, record summary, thread-state, context-switch, syscall, and
+virtual-memory evidence.
+
+For System Trace rate math, divide event counts by `data_window_seconds`
+from `summary`, not the requested `--time-limit`; the template can record
+in Windowed mode and retain only the final event window.
+
+Allocations / Leaks require re-signing raw Cargo-built CLIs with
+`get-task-allow` after each build:
+
+```
+TRACE_DIR=$(mktemp -d)
+ENTITLEMENTS="$TRACE_DIR/task-allow.plist"
+cat > "$ENTITLEMENTS" <<'EOF'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>com.apple.security.get-task-allow</key><true/>
+</dict></plist>
+EOF
+codesign --force --sign - --entitlements "$ENTITLEMENTS" "$BIN"
+
+TRACE="$TRACE_DIR/smoltcp-alloc.trace"
+xcrun xctrace record --template "Allocations" --time-limit 10s \
+  --output "$TRACE" --target-stdout - \
+  --launch -- "$BIN" --mode trace many_tcp 8 200
+```
+
+After capture, record the trace summary and allocation table grouped by
+category or call site.
 
 ### 5.2 samply
 
@@ -272,7 +380,7 @@ Look in the emitted `.s` files at the `_ZN.*checksum.*data.*` symbol:
 
 ```
 cargo install flamegraph
-cargo flamegraph --example profile_loopback -- udp 5
+cargo flamegraph --example profile_loopback -- --mode bench udp 5
 # Outputs flamegraph.svg
 ```
 
@@ -297,14 +405,15 @@ process memory:
   rss end:                ...
 ```
 
-`many_*` shapes additionally print an RSS trajectory sampled every ~250 ms
-with a verdict line.
+`many_*`, `churn`, and `idle_hot` additionally print an RSS/footprint
+trajectory sampled every ~250 ms in `--mode bench`. On Linux this reads
+`/proc/self/status`; on macOS it uses Mach task VM info. `--mode trace`
+disables those periodic samples so Instruments captures are cleaner.
 
 Interpretation rules:
 
-- **`net heap delta` should be a small constant** dominated by the harness's
-  own periodic `/proc/self/status` reads. Anything else means smoltcp itself
-  allocated on the hot path — a regression to investigate.
+- **`net heap delta` should be a small constant**. Anything else means
+  smoltcp itself allocated on the hot path — a regression to investigate.
 - **`RSS verdict: bounded`** when the final RSS is within ~1.5× the median.
   `GROWTH` flags a possible leak; drop into massif/heaptrack to confirm.
 - **`bytes allocated ≈ bytes freed`** in steady state. A persistent imbalance
@@ -314,10 +423,11 @@ Interpretation rules:
 ### 6.2 massif
 
 ```
+MASSIF_DIR=$(mktemp -d)
 valgrind --tool=massif --pages-as-heap=no \
-  --massif-out-file=/tmp/massif.out \
+  --massif-out-file="$MASSIF_DIR/massif.out" \
   target/release/examples/profile_loopback udp 2
-ms_print /tmp/massif.out | less
+ms_print "$MASSIF_DIR/massif.out" | less
 ```
 
 Per-allocation-site heap trajectory. Use when the harness's `RSS verdict`
@@ -340,7 +450,7 @@ The harness has a build-time switch that swaps the global allocator for
 `https://nnethercote.github.io/dh_view/dh_view.html` for an interactive view.
 
 ```
-cargo run --release --example profile_loopback --features dhat-heap -- many_tcp 3 100
+cargo run --release --example profile_loopback --features dhat-heap -- --mode bench many_tcp 3 100
 # inspect quickly without the GUI:
 python3 -c "import json; d=json.load(open('dhat-heap.json')); \
   pps=d['pps']; ftbl=d['ftbl']; import re; g={}
@@ -374,15 +484,15 @@ catch.
 The canonical check:
 
 ```
-cargo run --release --example profile_loopback -- many_tcp 5 1000 2>&1 | \
+cargo run --release --example profile_loopback -- --mode bench many_tcp 5 1000 2>&1 | \
   grep -E "net heap delta|allocation count"
 ```
 
 Expect a small constant `net heap delta` and an `allocation count` whose
-magnitude tracks the number of `/proc/self/status` reads (one per
-`MemTrace::maybe_sample`, roughly every 250 ms). Materially higher values
-indicate something is allocating per packet — usually a `Vec::with_capacity`
-or `Bytes::from(Vec)` introduced in the hot path.
+magnitude tracks the number of `MemTrace::maybe_sample` calls in bench
+mode. Materially higher values indicate something is allocating per
+packet — usually a `Vec::with_capacity` or `Bytes::from(Vec)` introduced
+in the hot path.
 
 ## 7. Property tests as regression gates
 
@@ -420,8 +530,8 @@ What each guards:
 
 The `fuzz/` directory carries libFuzzer harnesses for the wire parsers.
 Coverage-guided fuzzing finds the kinds of input-validation bugs that
-property tests miss — the codex audit PRs that landed (6LoWPAN, IPsec AH,
-IPv6 loopback) were the exact bug class this catches.
+property tests miss, including parser edge cases such as 6LoWPAN, IPsec AH,
+and IPv6 loopback handling.
 
 ```
 cargo install cargo-fuzz   # one-time
@@ -577,94 +687,64 @@ holds means the pseudo-header consolidation regressed.
 
 ### 13.2 End-to-end shapes (`profile_loopback`)
 
-10-second runs on the same host:
+Record current host baselines from 10-second isolated runs instead of carrying
+stale headline numbers in this document.
 
-| Shape | Throughput (app) | Per-packet | Notes |
-|---|---:|---:|---|
-| `udp` | ~20–26 Gbps | ~80 ns | Software checksum. |
-| `udp offload` | ~31–33 Gbps | ~63 ns | `ChecksumCapabilities::ignored()`. Loopback-only; see §4.3. |
-| `small` | ~3 Mpps | ~330 ns | State-machine bound. |
-| `pingpong` | ~1.33 M-rtt/s | n/a | Latency-bound. |
-| `firehose` | varies | n/a | Cwnd dynamics on both peers; ratios only. |
+| Shape | Primary use |
+|---|---|
+| `udp` | software-checksum packet-forwarding throughput and Mpps. |
+| `small` | TCP state-machine overhead on small segments. |
+| `pingpong` | latency-bound request/response behavior. |
+| `firehose` | one-way TCP bulk transfer; useful for ratios because both peers are smoltcp and cwnd dynamics dominate. |
 
 Cubic and Reno raise the `pingpong` RTT/s count on short handshakes
 because of the IW10 first-RTT ramp; bulk shapes barely move.
 
-### 13.3 Scaling and fairness (`many_tcp` / `many_udp`)
+### 13.3 Scaling and fairness (`many_tcp` / `many_tcp_fair` / `many_udp`)
 
-| Shape | N | Jain | RSS verdict | Net heap delta |
-|---|---:|---:|---|---|
-| `many_tcp` | 100 | ≥0.99 | bounded | small constant |
-| `many_tcp` | 500 | ≥0.98 | bounded | small constant |
-| `many_tcp` | 1000 | ≥0.97 | bounded | small constant |
-| `many_udp` | any | 1.00 | bounded | small constant |
+Use separate shapes for separate claims:
 
-Jain < 0.95 at any flow count is a regression: scheduling or socket-pump
-ordering. RSS verdict ≠ `bounded` is a leak or unbounded buffer growth.
+| Shape | Evidence role | Gate |
+|---|---|---|
+| `many_tcp` | High-throughput TCP stress, memory growth, and starvation discovery. | zero-flow count must stay 0; RSS verdict should be `bounded`; Jain is diagnostic because the hot loop intentionally favors throughput. |
+| `many_tcp_fair` | Deterministic TCP fairness. One flow gets one bounded send/drain opportunity per round, and the start flow rotates each round. | Jain ≥ 0.95, zero-flow count 0, RSS bounded, lane fallback allocs 0 in trace mode. |
+| `many_udp` | UDP control shape without TCP flow-control or cwnd effects. | Jain should be 1.00 or close to it; RSS bounded. |
+
+RSS verdict ≠ `bounded` is a leak or unbounded buffer growth. Nonzero lane
+fallback allocations in trace mode mean the harness pool, not smoltcp, polluted
+the trace; do not quote that run as performance evidence.
 
 ### 13.3.1 Dynamic-buffer / multi-thread shapes
 
-Reference numbers from a containerized x86_64 host (high noise floor;
-ratios more durable than absolute Gbps).
+Do not keep fixed Gbps or RSS headline numbers here unless they come from
+current isolated runs on the same host and revision. The durable gates are:
 
-`multi_tcp` aggregate Gbps and Jain across threads:
+| Shape | Durable gate |
+|---|---|
+| `multi_tcp` | per-thread Jain ≥ 0.95, bounded pool CAS retries, `pool used (end)` returns to 0, trace-mode lane fallback allocs 0. |
+| `multi_tcp_sink` | same pool and lane gates as `multi_tcp`; compare Time/CPU Profiler hotspots against `multi_tcp` for lower app-side copy pressure before claiming a copy win. |
+| `churn` | achieved close rate tracks target rate, `pool used (end) == 0`, net heap delta does not grow with connection rate. |
+| `idle_hot` | `pool used post-create == 0`; steady pool charge is proportional only to active client/server sockets; `n_active=0` is valid and should keep steady pool use at 0. |
 
-| Threads × flows/thread | Total flows | Aggregate Gbps | Jain |
-|---|---:|---:|---:|
-| 2 × 30 | 60 | ~7.5 | ≥0.99 |
-| 4 × 20 | 80 | ~11.7 | ≥0.98 |
-
-Sub-linear scaling at 4 threads is expected (each thread is fully
-CPU-bound). Jain < 0.95 across threads suggests `MemoryPool` cache-
-line contention regressed (verify §14 `#[repr(align(64))]` is intact).
-
-`churn` sustained connections/sec and pool balance:
-
-| Target rate | Achieved | Pool end | Net heap delta |
-|---:|---:|---:|---:|
-| 500 conn/s | 500 conn/s | 0 KiB | ~256 B |
-| 1000 conn/s | 1000 conn/s | 0 KiB | ~256 B |
-| 2000 conn/s | 2000 conn/s | 0 KiB | ~256 B |
-
-`pool end != 0` means the refund path leaked (regression to debug at
-§14 release sites). `net heap delta` proportional to rate means an
-allocator-on-hot-path slipped in (use `dhat` to localize).
-
-`idle_hot` per-flow accounting:
-
-| n_idle + n_active | Pool post-create | Pool steady | Idle/flow |
-|---|---:|---:|---:|
-| 200 + 10 | 0 KiB | 640 KiB | 0 B |
-| 1000 + 0 | 0 KiB | 0 KiB | 0 B |
-
-Non-zero `Pool post-create` is the canary: lazy allocation broken.
-`Pool steady` should equal `n_active × 2 × MAX_BUF` exactly.
+Sub-linear scaling at higher thread counts is expected once every worker is
+CPU-bound. Jain < 0.95 across threads suggests `MemoryPool` contention or host
+scheduling noise; confirm with System Trace before changing pool internals.
 
 ### 13.3.2 Context switches
 
-Every shape now prints `voluntary` / `nonvoluntary` context-switch
-counts read from `/proc/self/status`. Voluntary means a thread blocked
-or yielded; nonvoluntary means the OS scheduler preempted a running
-thread. Both should stay tiny in our spin-loop designs.
+On Linux, every shape prints `voluntary` / `nonvoluntary`
+context-switch counts read from `/proc/self/status`. Voluntary means a
+thread blocked or yielded; nonvoluntary means the OS scheduler preempted
+a running thread. Both should stay tiny in the spin-loop designs.
 
-Reference on a 4-core container, 5-second runs:
+On macOS, do not emulate `/proc` in the harness. Use System Trace analysis
+(§5.1.1) and read `threads`, `context-switches`, `syscalls`, and
+`virtual-memory`; use `data_window_seconds` from `summary` for rates.
 
-| Shape | Voluntary | Nonvoluntary | Notes |
-|---|---:|---:|---|
-| `udp` (1 task) | 0 | ~4 | setup-dominated |
-| `many_tcp 200` (1 task) | 0 | ~5 | setup-dominated |
-| `multi_tcp × 1 thread × 30` | 1 | 0 | spawn/join + spin |
-| `multi_tcp × 4 threads × 30` | 1 | 0 | matches core count |
-| `multi_tcp × 8 threads × 30` | 9 | 0 | 2× oversubscribed |
-| `multi_tcp × 16 threads × 30` | 16 | 0 | 4× oversubscribed |
-| `multi_tcp × 32 threads × 30` | 19 | 2 | 8× oversubscribed |
-
-Nonvoluntary > 0 at any thread count where threads ≤ core count is a
-regression: it means something in our hot path is yielding, either via
-a syscall (allocator hitting `brk`?) or a Mutex contention path we don't
-own. Voluntary growing super-linearly with thread count signals a
-blocking synchronization primitive crept in — the `MemoryPool` CAS is
-lock-free and should never block.
+Nonvoluntary growth at thread counts ≤ core count is a regression signal
+to investigate with System Trace: look for syscalls, blocking thread
+states, allocator activity, or a synchronization primitive outside the
+lock-free `MemoryPool` CAS path.
 
 **Pool CAS retries.** `multi_tcp` also reports `pool CAS retries:` —
 the count of `compare_exchange_weak` failures observed across all
@@ -688,7 +768,7 @@ synchronization primitive at this contention level.
 Hot-path atomics that fire in each shape, listed by emitter. None of
 these is per-packet; rates are per-allocation or per-sample event.
 
-| Shape | `CountingAlloc` `fetch_add` (= alloc/free count) | `MemoryPool` charge/refund | `MemoryPool` CAS retries | `MemTrace` /proc reads |
+| Shape | `CountingAlloc` `fetch_add` (= alloc/free count) | `MemoryPool` charge/refund | `MemoryPool` CAS retries | `MemTrace` RSS/footprint samples |
 |---|---:|---:|---:|---:|
 | `udp` | ~14 (setup-dominated) | 0 (legacy buffers) | 0 | ~4 / sec |
 | `small` | ~7 | 0 | 0 | ~4 / sec |
@@ -726,11 +806,9 @@ valgrind --tool=cachegrind --cache-sim=yes --branch-sim=yes \
 | `firehose` | 154 M | 44 M / 30 M | 21.4 M / 2.0 M | 1.3 % | 0.0 % |
 | `many_tcp N=50` | 243 M | 59 M / 30 M | 40.2 M / 1.9 M | 0.7 % | 0.0 % |
 | `many_udp N=50` | 162 M | 40 M / 28 M | 21.3 M / 0.9 M | 0.6 % | 0.0 % |
-| `dynbuf_memcompare N=200` | 12 M | 0.2 M / 11.7 M | 11.7 M / 0.006 M | 0.1 % | 0.8 % |
-
-(`dynbuf_memcompare` is dominated by `vec![0u8; N]` zeroing — high D-write
-count, near-zero D-reads, and 0.8 % LL miss rate from streaming through
-new buffers. Confirms the allocator is the hot path there, not smoltcp.)
+Run `dynbuf_memcompare legacy <N>` and `dynbuf_memcompare dynamic <N>` as
+separate cachegrind processes if you need call-site cost data for the
+memory comparison. Do not use `both` mode as numeric evidence.
 
 Interpretation:
 - LL miss rate at 0.0 % everywhere → working set fits L3. Regressions
@@ -842,7 +920,7 @@ of any shape's profile** — `#[cold]` placement working as designed.
 ```
 cargo build --release --example profile_loopback \
   --features socket-tcp-dynamic-buffer,dhat-heap
-target/release/examples/profile_loopback many_tcp 3 100
+target/release/examples/profile_loopback --mode bench many_tcp 3 100
 # Reads dhat-heap.json
 ```
 
@@ -854,14 +932,14 @@ Top callsites by total bytes allocated (lifetime, not steady-state):
 | 1.64 MB | `profile_loopback::add_tcp_socket` (100 sockets × 16 KB rx+tx) |
 | 258 KB | `smoltcp::iface::socket_set::SocketSet::add` (slab growth) |
 | 205 KB | `profile_loopback::Lane::new` (VecDeque + pool Vec) |
-| 61 KB | `profile_loopback::rss_bytes` (periodic `/proc/self/status` reads) |
-| 8 KB | `profile_loopback::ctxsw_counts` (periodic `/proc/self/status` reads) |
+| 61 KB | `profile_loopback::rss_bytes` (periodic bench-mode RSS/footprint samples) |
+| 8 KB | `profile_loopback::ctxsw_counts` (Linux-only `/proc/self/status` reads) |
 
 Smoltcp internals (`process_ipv4`, `dispatch_ip`, `Interface::poll`,
 …) **do not appear** — confirming the "smoltcp itself does not
 allocate on the hot path" invariant (FORK.md §6.5). Hot-path
-allocations live entirely in the harness's lane pool and in the
-sampling-instrumentation `/proc` reads.
+allocations live entirely in the harness's lane pool and in bench-mode
+sampling instrumentation.
 
 ### 13.4 Struct footprint (`sizecheck`)
 
@@ -891,9 +969,9 @@ Record the new values in the commit that moves them.
 
 Across every shape:
 
-- `net heap delta`: small constant, dominated by the harness's periodic
-  `/proc/self/status` reads (~1.5 KiB visible). Materially larger →
-  smoltcp itself is allocating on the hot path.
+- `net heap delta`: small constant, dominated by harness sampling in
+  bench mode. Materially larger → smoltcp itself is allocating on the
+  hot path.
 - `allocation count`: scales with `MemTrace` sample count (one per
   ~250 ms), not with packet count.
 
@@ -917,7 +995,8 @@ API is bit-for-bit unchanged.
 - `tcp::Socket::new_dynamic(config, Option<MemoryPool>)` — alternate
   constructor. Buffers start at `initial`, grow geometrically on
   pressure (mirrors Linux `tcp_rcv_space_adjust`/`tcp_sndbuf_expand`,
-  XNU `tcp_sbrcv_grow`), and release on `Closed`/`reset`/`Drop`.
+  XNU `tcp_sbrcv_grow`), and release only after pending ACK/dequeue/RST
+  work no longer needs the queues, plus `reset`/`Drop`.
 
 ### 14.2 Canonical patterns mirrored
 
@@ -929,7 +1008,7 @@ API is bit-for-bit unchanged.
 | Pressure → window collapse | Linux `__tcp_select_window` zero | grow refuses → backpressure |
 | Pressure-tier autotune throttle | Linux `tcp_under_memory_pressure(sk)` gates `tcp_rcv_space_adjust` | `MemoryPool::under_pressure` (75% threshold) forces linear growth |
 | Geometric grow | Linux `copied << 1`; XNU ×2/×4 | `max(cur+chunk, cur×2)` |
-| Release on close | Linux `tcp_done` returns `sk_forward_alloc` | `set_state(Closed)` releases |
+| Release on safe close/reset points | Linux `tcp_done` returns `sk_forward_alloc` | release after ACK/dequeue/RST work has completed and queues are empty |
 | Fallible alloc | n/a (kernel context) | `Vec::try_reserve_exact` |
 
 ### 14.3 Cost when feature is **off**
@@ -939,73 +1018,35 @@ Zero. The `dyn_state` field, the new module, all hooks — all
 
 ### 14.4 Cost when feature is **on** but not used (legacy API)
 
-- `tcp::Socket` is **the same 472 B** size feature-OFF was at before
-  any of this fork's work. The 8 B for `Option<Box<DynBufState>>` is
-  offset by packing 5 scattered `bool` fields into one `flags: u8`
-  byte (§13.4). Net Socket size change vs upstream baseline: **0 B**.
-- The hot dispatch path gains a single null-pointer check
-  (≤ 3 cycles) before the conditional growth code (which is `#[cold]`
-  and verified to live in `.text.unlikely.*`).
-- Net measured UDP cost (20-run pinned-binary, 8 s each, on this
-  containerized x86_64 host, feature-OFF vs feature-ON):
-  - OFF: mean 27.24 ± 0.35, median **27.24** Gbps
-  - ON:  mean 25.92 ± 0.54, median **26.08** Gbps
-  - Mean delta: **−4.8 %**, median delta: **−4.3 %**
-  - 20 samples, stddev tight → statistically significant; not noise.
-- The cost source is **binary-layout shift**: feature-ON adds
-  **~60 KiB of stripped code** to the executable (cold-section symbols
-  for `MemoryPool`, `try_grow_*`, `release_dyn_buffers`, `DynBufState`,
-  the `Drop` glue, `bitflags!`-derived methods, etc.). That shifts the
-  load addresses of all other code; even though none of it runs on the
-  UDP packet path (callgrind §13.3.3 confirms dynamic-buffer symbols
-  don't appear in any shape's top 20), the prefetcher / branch-
-  predictor / icache state interacts differently with the new layout.
-- The active code on the UDP fast path is unchanged. The cost is
-  passive.
-
-**LTO recovers the regression.** The default release profile has
-`lto = false`, so the linker doesn't get a chance to lay out hot and
-cold code globally — each codegen unit is placed independently. With
-`lto = "fat"` (a single global codegen pass), the layout is rebuilt
-end-to-end and the icache/prefetcher interaction with the new cold
-code disappears.
-
-A `release-lto` profile is in Cargo.toml for exactly this purpose:
+- Legacy sockets still use `Socket::new(rx_buf, tx_buf)`; dynamic
+  buffers are opt-in through `Socket::new_dynamic`.
+- The legacy hot path should show no dynamic-buffer growth or release
+  frames in Time Profiler. Verify with the recipe in §5.1.1 and quote
+  only numbers from isolated `--mode bench` runs.
+- If measuring feature-on/off overhead, build two release binaries
+  from the same revision and run the same shape in separate processes:
 
 ```
-cargo build --profile release-lto --example profile_loopback \
+cargo build --release --example profile_loopback
+target/release/examples/profile_loopback --mode bench udp 10
+
+cargo build --release --example profile_loopback \
   --features socket-tcp-dynamic-buffer
+target/release/examples/profile_loopback --mode bench udp 10
 ```
 
-Measured the same way (10-run pinned-binary medians):
-
-| Profile | UDP OFF | UDP ON | Delta |
-|---|---:|---:|---:|
-| `release` (no LTO) | 27.24 Gbps | 26.08 Gbps | **−4.3 %** |
-| `release-lto` (`lto=fat`) | 30.28 Gbps | 31.23 Gbps | **+3.2 %** |
-
-(LTO also raises absolute throughput ~12 % on UDP and 30–70 % on
-small/pingpong, so the comparison isn't apples-to-apples in
-absolute terms — what matters here is that the feature-on overhead
-collapses into noise once LTO does its layout pass.)
-
-For consumers that ship with LTO on by default (which most
-Apple/Android/server release pipelines do), the regression is
-**already recovered without code changes**. The 2 % criterion is
-met on those builds. Consumers using the bare `release` profile pay
-the documented passive cost.
-- Cannot reduce below this floor without one of: splitting `Socket`
-  into separate types, moving `dyn_state` to a SocketHandle-keyed
-  side-table, or per-feature crate compilation. All of these break
-  the additive-API goal. For TCP-driven workloads (e.g. the iOS
-  NetworkExtension consumer that prompted this work), the UDP shape
-  cost is structurally irrelevant — UDP traffic bypasses smoltcp
-  entirely in that use case.
+Do not keep old feature-overhead percentages in this document unless
+they are backed by current isolated runs and a matching trace showing
+where the cost comes from.
 
 ### 14.5 Cost when feature is **on** and used (`new_dynamic`)
 
 - Per-flow steady state: `Vec<u8>` per buffer sized to current
   capacity (between `initial` and `max`).
+- Public `listen()` / `connect()` preserve nonzero `rx_initial` and
+  `tx_initial` after the internal reset that opens a new connection.
+- `can_send()` reports true for zero-initial dynamic TX buffers when
+  the buffer can grow under the socket and pool limits.
 - Growth path: amortized O(rx_max) total memcpy across O(log(rx_max))
   steps. Geometric.
 - Atomic CAS on each grow attempt (pool charge) and on each refund.
@@ -1013,13 +1054,23 @@ the documented passive cost.
 
 ### 14.6 Memory savings (idle flows)
 
-Per the `dynbuf_memcompare` example, 32 KiB rx + 32 KiB tx per flow:
+Measure legacy and dynamic idle sockets as separate processes. The
+convenience `both` mode is useful for smoke checks, but allocator state
+from the first phase can affect the second phase's RSS and must not be
+used as evidence.
 
-| N | Legacy fixed (KiB / flow) | Dynamic idle (KiB / flow) |
-|---:|---:|---:|
-| 100 | 55.0 | 0.0 |
-| 1000 | 55.0 | 0.4 |
-| 4000 | 55.0 | 0.5 |
+```
+cargo run --release --example dynbuf_memcompare \
+  --features socket-tcp-dynamic-buffer -- legacy 1000
+cargo run --release --example dynbuf_memcompare \
+  --features socket-tcp-dynamic-buffer -- dynamic 1000
+cargo run --release --example dynbuf_memcompare \
+  --features socket-tcp-dynamic-buffer -- both 1000   # smoke only
+```
+
+Expected invariant: dynamic idle sockets with `rx_initial = tx_initial = 0`
+charge 0 bytes to the `MemoryPool`; fixed legacy sockets pay their full
+rx+tx buffer allocation at construction.
 
 ### 14.7 Test matrix additions
 
@@ -1030,7 +1081,8 @@ cargo test --release --lib --features socket-tcp-dynamic-buffer
 cargo test --release --lib --no-default-features \
   --features "alloc,medium-ethernet,proto-ipv4,proto-ipv6,socket-raw,socket-udp,socket-tcp,socket-icmp,proto-ipv6-slaac,socket-tcp-dynamic-buffer"
 cargo +nightly miri test --lib --features socket-tcp-dynamic-buffer socket::tcp::test::dyn_buf
-cargo run --release --example dynbuf_memcompare --features socket-tcp-dynamic-buffer -- 1000
+cargo run --release --example dynbuf_memcompare --features socket-tcp-dynamic-buffer -- legacy 1000
+cargo run --release --example dynbuf_memcompare --features socket-tcp-dynamic-buffer -- dynamic 1000
 ```
 
 ### 14.8 Upstream-sync surface
@@ -1038,11 +1090,12 @@ cargo run --release --example dynbuf_memcompare --features socket-tcp-dynamic-bu
 Touched files:
 
 - `Cargo.toml` — feature decl, example registration.
-- `src/storage/ring_buffer.rs` — `try_grow` + `release_owned` (alloc-gated,
-  appended).
+- `src/storage/ring_buffer.rs` — crate-internal `try_grow` + `release_owned`
+  (alloc-gated, appended).
 - `src/socket/tcp.rs` — module decl, struct field, `new_dynamic`,
-  grow/release helpers, hooks in `dispatch`/`send_impl`/`set_state`/
-  `reset`. All `#[cfg(feature = "socket-tcp-dynamic-buffer")]`-gated.
+  grow/release helpers, hooks in `listen`/`connect`/`dispatch`/`process`/
+  `send_impl`/`recv_slice`/`reset`. All
+  `#[cfg(feature = "socket-tcp-dynamic-buffer")]`-gated.
 - `src/socket/tcp/dynbuf.rs` — new file, no conflict.
 - `examples/dynbuf_memcompare.rs` — new file.
 

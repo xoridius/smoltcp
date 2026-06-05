@@ -256,6 +256,8 @@ impl DynamicBufferConfig {
 /// it is disabled.
 #[derive(Debug)]
 pub(super) struct DynBufState {
+    pub rx_initial: u32,
+    pub tx_initial: u32,
     pub rx_max: u32,
     pub tx_max: u32,
     pub grow_chunk: u32,
@@ -273,6 +275,8 @@ pub(super) struct DynBufState {
 impl DynBufState {
     pub(super) fn new(cfg: &DynamicBufferConfig, pool: Option<MemoryPool>) -> Self {
         Self {
+            rx_initial: cfg.rx_initial,
+            tx_initial: cfg.tx_initial,
             rx_max: cfg.rx_max,
             tx_max: cfg.tx_max,
             grow_chunk: cfg.grow_chunk.max(1),
