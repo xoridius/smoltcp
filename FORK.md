@@ -924,3 +924,44 @@ restructures the surrounding code.
   growth there is impossible anyway.
 - Per-flow `rx_max`/`tx_max` is fixed at `new_dynamic`. No setter
   yet for runtime adjustment (analogous to `setsockopt(SO_RCVBUF)`).
+
+### 14.10 Recommended configuration for iOS packet tunnels
+
+Starting point for a `NEPacketTunnelProvider`-style consumer under the
+50 MB extension memory limit:
+
+```rust
+let pool = tcp::MemoryPool::new(24 * 1024 * 1024); // one per process
+
+let cfg = tcp::DynamicBufferConfig {
+    rx_initial: 0,
+    rx_max: 64 * 1024,
+    tx_initial: 0,
+    tx_max: 64 * 1024,
+    grow_chunk: 4 * 1024,
+};
+let socket = tcp::Socket::new_dynamic(cfg, Some(pool.clone()));
+```
+
+Rationale:
+
+- **Pool = 24 MiB**, roughly half the 50 MB jetsam budget. The rest is
+  headroom for wire/device buffers, the `Interface`, non-TCP sockets, the
+  consumer's own state, and the Network-framework overhead the extension
+  pays regardless. The pool bounds the worst case; idle flows cost ~0
+  (`dynbuf_memcompare`: ~0.5 KiB/flow RSS vs ~55 KiB/flow for legacy
+  64 KiB fixed buffers).
+- **`rx_max = tx_max = 64 KiB`** keeps the window-scale shift at 1 and is
+  enough to fill typical mobile BDPs (e.g. 100 Mbit/s × 5 ms ≈ 62 KB).
+  Don't raise `rx_max` past what the flow's bandwidth-delay product needs:
+  large maxima raise the negotiated shift, and with it the growth floor
+  (one scale granule, `1 << shift`) and worst-case per-flow cost under load.
+- **`initial = 0`** so admission is free: hundreds of idle flows (DNS,
+  keep-alive idle HTTP) charge nothing until traffic arrives.
+- **Worst case** = `budget` bytes of socket buffers across all flows, e.g.
+  192 concurrent flows all grown to both 64 KiB maxima. Past that, growth
+  refusal converts into advertised-window backpressure per flow instead of
+  memory growth — the failure mode is throughput, not jetsam.
+
+Validate a configuration change with `pool_capacity_floor_*`-style tests,
+`dynbuf_memcompare`, and the `churn`/`idle_hot` shapes (§4.2.1).
