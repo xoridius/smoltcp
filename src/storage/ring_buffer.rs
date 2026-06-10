@@ -415,6 +415,14 @@ impl<'a, T: 'a + Copy + Default> RingBuffer<'a, T> {
     /// Grow the backing storage to `new_capacity`, preserving the buffered
     /// contents and their order. Returns `true` if the growth was applied.
     ///
+    /// The **entire** ring is preserved in logical order — not just the
+    /// `length` bytes of enqueued data. Callers (the TCP receive path) store
+    /// out-of-order segment payloads in the unallocated region past `length`
+    /// via `write_unallocated` and later claim them with
+    /// `enqueue_unallocated`, indexed by `Assembler` ranges. Those
+    /// speculative bytes must survive a grow at unchanged logical offsets,
+    /// or reassembly would silently deliver zeroed payload in their place.
+    ///
     /// `false` is returned if storage is borrowed, if `new_capacity` does not
     /// strictly exceed the current capacity, or if allocation fails (via
     /// `Vec::try_reserve_exact`). The latter matters on hosts with strict
@@ -440,16 +448,17 @@ impl<'a, T: 'a + Copy + Default> RingBuffer<'a, T> {
         }
         new_vec.resize(new_capacity, T::default());
 
-        let len = self.length;
+        // Unwrap the old ring into the front of the new storage: logical
+        // offset i (relative to read_at) lands at physical index i. This
+        // keeps `get_allocated`/`read_allocated` offsets (< length) AND
+        // `write_unallocated`/`get_unallocated` offsets (>= length) stable
+        // across the grow, because both are computed relative to read_at,
+        // which is reset to 0 here.
         let read_at = self.read_at;
-        if len > 0 && old_capacity > 0 {
-            if read_at + len <= old_capacity {
-                new_vec[..len].copy_from_slice(&owned[read_at..read_at + len]);
-            } else {
-                let head = old_capacity - read_at;
-                new_vec[..head].copy_from_slice(&owned[read_at..old_capacity]);
-                new_vec[head..len].copy_from_slice(&owned[..len - head]);
-            }
+        if old_capacity > 0 {
+            let head = old_capacity - read_at;
+            new_vec[..head].copy_from_slice(&owned[read_at..]);
+            new_vec[head..old_capacity].copy_from_slice(&owned[..read_at]);
         }
 
         *owned = new_vec;
@@ -560,6 +569,49 @@ mod test {
         }
         assert_eq!(ring.dequeue_one(), Err(Empty));
         assert!(ring.is_empty());
+    }
+
+    #[cfg(feature = "alloc")]
+    #[test]
+    fn test_try_grow_preserves_unallocated_writes() {
+        // The TCP rx path stores out-of-order payloads past `length` via
+        // write_unallocated and claims them later with enqueue_unallocated.
+        // try_grow must preserve them at unchanged logical offsets, or
+        // reassembly delivers zeroed bytes in their place.
+        let mut ring = RingBuffer::new(vec![b'.'; 10]);
+        assert_eq!(ring.enqueue_slice(b"ABCD"), 4);
+        // Out-of-order write: 3 bytes at unallocated offset 2 (hole at 0..2).
+        assert_eq!(ring.write_unallocated(2, b"XYZ"), 3);
+
+        assert!(ring.try_grow(64));
+        assert_eq!(ring.capacity(), 64);
+
+        // In-order data intact.
+        let mut out = [0u8; 4];
+        assert_eq!(ring.read_allocated(0, &mut out), 4);
+        assert_eq!(&out, b"ABCD");
+        // Out-of-order bytes intact at the same logical offset.
+        assert_eq!(ring.get_unallocated(2, 3), b"XYZ");
+    }
+
+    #[cfg(feature = "alloc")]
+    #[test]
+    fn test_try_grow_preserves_unallocated_writes_wrapped() {
+        // Same, but with read_at != 0 so both the in-order data and the
+        // unallocated region wrap around the end of the old storage.
+        let mut ring = RingBuffer::new(vec![b'.'; 8]);
+        assert_eq!(ring.enqueue_slice(b"abcdef"), 6);
+        assert_eq!(ring.dequeue_many(5), b"abcde"); // read_at = 5, length = 1
+        assert_eq!(ring.enqueue_slice(b"gh"), 2); // length = 3, wraps at 8
+        // Unallocated offsets 0..5 start at physical (5 + 3) % 8 = 0.
+        assert_eq!(ring.write_unallocated(1, b"OOO"), 3);
+
+        assert!(ring.try_grow(32));
+
+        let mut out = [0u8; 3];
+        assert_eq!(ring.read_allocated(0, &mut out), 3);
+        assert_eq!(&out, b"fgh");
+        assert_eq!(ring.get_unallocated(1, 3), b"OOO");
     }
 
     #[cfg(feature = "alloc")]

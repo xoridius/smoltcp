@@ -1131,6 +1131,83 @@ fn syn_received_rst_to_listen_restores_nonzero_initial_capacity() {
 }
 
 #[test]
+fn rx_grow_preserves_out_of_order_payload() {
+    // Regression for the out-of-order data-corruption bug. The TCP rx
+    // path parks out-of-order payload in the ring's unallocated region
+    // past `length` (write_unallocated, indexed by Assembler ranges) and
+    // claims it with enqueue_unallocated once the hole fills.
+    // RingBuffer::try_grow used to copy only the in-order `length` bytes,
+    // so a grow that fired mid-hole (entirely realistic: free window
+    // shrinks below the grow threshold exactly when segments queue up)
+    // zeroed the parked bytes — and reassembly then delivered zeros to
+    // the application in their place. Silent corruption, no error.
+    let cfg = DynamicBufferConfig::symmetric(4 * 1024, 32 * 1024, 4 * 1024);
+    let mut s = dyn_socket_established(cfg, None);
+    assert_eq!(s.rx_buffer.capacity(), 4 * 1024);
+
+    // In-order segment: 2000 × 'a'.
+    let seg_a = std::vec![b'a'; 2000];
+    let _ = process_snapshot(
+        &mut s,
+        Instant::from_millis(100),
+        &TcpRepr {
+            seq_number: REMOTE_SEQ + 1,
+            ack_number: Some(LOCAL_SEQ + 1),
+            payload: &seg_a,
+            ..SEND_TEMPL
+        },
+    );
+    assert_eq!(s.recv_queue(), 2000);
+
+    // Out-of-order segment: 1000 × 'b', leaving a hole at 2000..2500.
+    let seg_b = std::vec![b'b'; 1000];
+    let _ = process_snapshot(
+        &mut s,
+        Instant::from_millis(101),
+        &TcpRepr {
+            seq_number: REMOTE_SEQ + 1 + 2500,
+            ack_number: Some(LOCAL_SEQ + 1),
+            payload: &seg_b,
+            ..SEND_TEMPL
+        },
+    );
+    // Hole keeps the in-order edge at 2000.
+    assert_eq!(s.recv_queue(), 2000);
+
+    // Free window (4096 − 2000) is below the grow threshold, so this
+    // dispatch grows the buffer while the assembler still holds the
+    // out-of-order range.
+    let _ = dispatch_snapshot(&mut s, Instant::from_millis(102));
+    assert!(
+        s.rx_buffer.capacity() > 4 * 1024,
+        "test premise: the grow must fire while the hole is open"
+    );
+
+    // Hole filler: 500 × 'c'. Reassembly claims 2000..3500 in one go.
+    let seg_c = std::vec![b'c'; 500];
+    let _ = process_snapshot(
+        &mut s,
+        Instant::from_millis(103),
+        &TcpRepr {
+            seq_number: REMOTE_SEQ + 1 + 2000,
+            ack_number: Some(LOCAL_SEQ + 1),
+            payload: &seg_c,
+            ..SEND_TEMPL
+        },
+    );
+    assert_eq!(s.recv_queue(), 3500);
+
+    let mut out = std::vec![0u8; 3500];
+    assert_eq!(s.recv_slice(&mut out), Ok(3500));
+    assert!(out[..2000].iter().all(|&b| b == b'a'), "in-order data lost");
+    assert!(out[2000..2500].iter().all(|&b| b == b'c'), "hole fill lost");
+    assert!(
+        out[2500..].iter().all(|&b| b == b'b'),
+        "out-of-order payload corrupted by rx grow"
+    );
+}
+
+#[test]
 fn large_rx_max_grows_until_window_advertisable() {
     // Regression for the stuck-zero-window deadlock. With rx_max = 1 GiB
     // the negotiated shift is 14, so the advertised window is
