@@ -945,11 +945,27 @@ impl<'a> Socket<'a> {
         self.restore_dyn_initial_buffers();
     }
 
+    /// Release for the connection-is-gone case (RST received, abort RST
+    /// emitted, final ACK in LastAck): no segment can ever be emitted or
+    /// accepted again, so the tx side is released immediately — its
+    /// contents are undeliverable. The rx side, however, may hold data
+    /// that was received and ACKed but not yet read; `may_recv` promises
+    /// it stays readable in `Closed` (Linux likewise delivers pre-RST
+    /// queued data before surfacing ECONNRESET). Releasing rx is deferred
+    /// to `recv_slice` once the application drains it; `reset`/`Drop`
+    /// remain the backstop if it never does.
     #[cfg(feature = "socket-tcp-dynamic-buffer")]
     #[cold]
     fn release_dyn_buffers_if_closed_and_detached(&mut self) {
-        if self.state == State::Closed && self.tuple.is_none() {
+        if self.state != State::Closed || self.tuple.is_some() {
+            return;
+        }
+        if self.rx_buffer.is_empty() {
             self.release_dyn_buffers();
+        } else if let Some(state) = self.dyn_state.as_deref_mut() {
+            let tx_capacity = self.tx_buffer.capacity();
+            self.tx_buffer.release_owned();
+            state.refund(tx_capacity);
         }
     }
 
@@ -1777,7 +1793,13 @@ impl<'a> Socket<'a> {
             (size, size)
         });
         #[cfg(feature = "socket-tcp-dynamic-buffer")]
-        self.release_dyn_buffers_if_terminal_empty();
+        {
+            self.release_dyn_buffers_if_terminal_empty();
+            // Completes the deferred release for connections torn down with
+            // unread rx data (RST received, abort): once the application has
+            // drained the buffer, the backing storage can finally go.
+            self.release_dyn_buffers_if_closed_and_detached();
+        }
         result
     }
 
@@ -2901,10 +2923,25 @@ impl<'a> Socket<'a> {
             return Ok(());
         }
 
+        // NOTE(unwrap): we check tuple is not None above.
+        let tuple = self.tuple.unwrap();
+
+        // Check if the interface still has our source IP address.
+        // If not (e.g. the interface's IP changed), reset the socket.
+        // We use reset() instead of set_state(Closed) to avoid sending
+        // an RST packet with the now-invalid source IP.
+        if !cx.has_ip_addr(tuple.local.addr) {
+            net_debug!("source IP address no longer available, closing socket");
+            self.reset();
+            return Ok(());
+        }
+
         // Dynamic-buffer rx growth: if our advertised window is about to be
         // sub-MSS, and we have headroom up to rx_max, request more backing
-        // from the pool. Done before computing scaled_window() so the
-        // segment we're about to emit reflects the new capacity. One grow
+        // from the pool. Done after the lost-source-IP reset above (so a
+        // doomed socket doesn't charge the pool only to refund it) and
+        // before `egress_interest` / scaled_window(), so the gate and the
+        // segment we're about to emit both see the new capacity. One grow
         // per dispatch matches the kernel autotune cadence (Linux's
         // `tcp_rcv_space_adjust` runs per recvmsg / per RTT-cycle, not in
         // a loop). Failure (pool exhausted, at max) silently collapses the
@@ -2931,19 +2968,6 @@ impl<'a> Socket<'a> {
             && self.try_grow_rx()
         {
             self.flags.insert(Flags::RX_WINDOW_DIRTY);
-        }
-
-        // NOTE(unwrap): we check tuple is not None above.
-        let tuple = self.tuple.unwrap();
-
-        // Check if the interface still has our source IP address.
-        // If not (e.g. the interface's IP changed), reset the socket.
-        // We use reset() instead of set_state(Closed) to avoid sending
-        // an RST packet with the now-invalid source IP.
-        if !cx.has_ip_addr(tuple.local.addr) {
-            net_debug!("source IP address no longer available, closing socket");
-            self.reset();
-            return Ok(());
         }
 
         let Some(egress_interest) = self.egress_interest(cx.now()) else {
@@ -3273,7 +3297,7 @@ impl<'a> Socket<'a> {
             // When aborting a connection, forget about it after sending a single RST packet.
             self.tuple = None;
             #[cfg(feature = "socket-tcp-dynamic-buffer")]
-            self.release_dyn_buffers();
+            self.release_dyn_buffers_if_closed_and_detached();
             #[cfg(feature = "async")]
             {
                 // Wake tx now so that async users can wait for the RST to be sent

@@ -660,6 +660,14 @@ fn abort_with_unread_rx_sends_correct_rst_ack_then_refunds_pool() {
             ..RECV_TEMPL
         })
     );
+    // Once the RST is on the wire the tx side is gone, but the unread,
+    // already-ACKed rx bytes stay readable (`may_recv` contract); only
+    // their backing remains charged until the application drains them.
+    assert_eq!(s.send_capacity(), 0);
+    assert_eq!(pool.used(), s.recv_capacity());
+    let mut out = [0u8; 4];
+    assert_eq!(s.recv_slice(&mut out), Ok(4));
+    assert_eq!(&out, b"abcd");
     assert_eq!(pool.used(), 0);
     assert_eq!(s.recv_capacity(), 0);
 }
@@ -815,6 +823,60 @@ fn established_remote_rst_releases_dynamic_buffers() {
     assert_eq!(pool.used(), 0);
     assert_eq!(s.recv_capacity(), 0);
     assert_eq!(s.send_capacity(), 0);
+}
+
+#[test]
+fn closed_by_rst_keeps_unread_rx_readable_until_drained() {
+    // Data that was received and ACKed before a remote RST must remain
+    // readable after the teardown — `may_recv` promises it for `Closed`,
+    // and Linux likewise delivers pre-RST queued data before surfacing
+    // ECONNRESET. Releasing the rx backing on the RST path would
+    // silently destroy bytes the peer believes were delivered. Only the
+    // (undeliverable) tx side is released eagerly; rx storage goes once
+    // the application drains it.
+    let pool = MemoryPool::new(64 * 1024);
+    let cfg = DynamicBufferConfig::symmetric(4 * 1024, 32 * 1024, 4 * 1024);
+    let mut s = dyn_socket_established(cfg, Some(pool.clone()));
+
+    let payload = std::vec![b'r'; 1000];
+    let _ = process_snapshot(
+        &mut s,
+        Instant::from_millis(100),
+        &TcpRepr {
+            seq_number: REMOTE_SEQ + 1,
+            ack_number: Some(LOCAL_SEQ + 1),
+            payload: &payload,
+            ..SEND_TEMPL
+        },
+    );
+    assert_eq!(s.recv_queue(), 1000);
+
+    let _ = process_snapshot(
+        &mut s,
+        Instant::from_millis(101),
+        &TcpRepr {
+            control: TcpControl::Rst,
+            seq_number: REMOTE_SEQ + 1 + 1000,
+            ack_number: Some(LOCAL_SEQ + 1),
+            ..SEND_TEMPL
+        },
+    );
+
+    assert_eq!(s.state, State::Closed);
+    assert_eq!(s.tuple, None);
+    // Tx (undeliverable) released; rx retained, still charged to the pool.
+    assert_eq!(s.send_capacity(), 0);
+    assert!(s.recv_capacity() >= 1000);
+    assert_eq!(pool.used(), s.recv_capacity());
+    assert!(s.may_recv());
+
+    let mut out = std::vec![0u8; 1000];
+    assert_eq!(s.recv_slice(&mut out), Ok(1000));
+    assert!(out.iter().all(|&b| b == b'r'), "pre-RST data corrupted");
+
+    // Drained: the deferred release completes and the pool is whole again.
+    assert_eq!(s.recv_capacity(), 0);
+    assert_eq!(pool.used(), 0);
 }
 
 #[test]
