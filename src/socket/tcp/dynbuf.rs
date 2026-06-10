@@ -28,7 +28,13 @@
 //! * The socket's RFC 1323 window-scale factor is fixed at SYN time using
 //!   the per-flow **max**, not the current capacity. Once a connection is
 //!   negotiated, the scale cannot change, so it must accommodate any future
-//!   growth.
+//!   growth. Per RFC 7323 the shift is capped at 14.
+//!
+//! * The receive buffer must always be able to grow until at least one
+//!   scale granule (`1 << shift`) of window is free, because the advertised
+//!   window is `window() >> shift`: any smaller capacity truncates to a
+//!   permanent zero advertisement and the connection deadlocks behind
+//!   zero-window probes. The dispatch-time growth trigger enforces this.
 //!
 //! * `rx_buffer.capacity()` is monotonically non-decreasing while a live peer
 //!   can still deliver bytes into the receive half. We release only after the
@@ -215,11 +221,13 @@ impl MemoryPool {
 pub struct DynamicBufferConfig {
     /// Initial receive-buffer capacity in bytes. May be 0.
     pub rx_initial: u32,
-    /// Maximum receive-buffer capacity in bytes. Must be ≤ `1 << 30`.
+    /// Maximum receive-buffer capacity in bytes. Values above `1 << 30`
+    /// (the RFC 7323 window cap) are clamped at construction.
     pub rx_max: u32,
     /// Initial transmit-buffer capacity in bytes. May be 0.
     pub tx_initial: u32,
-    /// Maximum transmit-buffer capacity in bytes.
+    /// Maximum transmit-buffer capacity in bytes. Values above `1 << 30`
+    /// are clamped at construction.
     pub tx_max: u32,
     /// Chunk size for each growth step. Clamped to `[1, max]`.
     pub grow_chunk: u32,

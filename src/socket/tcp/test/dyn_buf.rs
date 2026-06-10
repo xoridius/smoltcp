@@ -393,6 +393,10 @@ fn win_shift_uses_max_not_current() {
         (128 * 1024, 2),
         (256 * 1024, 3),
         (1024 * 1024, 5),
+        // RFC 7323 cap: the naive log2 formula yields 15 for exactly
+        // 1 GiB, but receivers MUST treat shifts above 14 as 14, so we
+        // must never advertise more.
+        (1 << 30, 14),
     ] {
         let cfg = DynamicBufferConfig {
             rx_initial: 0,
@@ -1124,4 +1128,50 @@ fn syn_received_rst_to_listen_restores_nonzero_initial_capacity() {
     assert_eq!(pool.used(), 6 * 1024);
     assert_eq!(s.rx_buffer.capacity(), 4 * 1024);
     assert_eq!(s.tx_buffer.capacity(), 2 * 1024);
+}
+
+#[test]
+fn large_rx_max_grows_until_window_advertisable() {
+    // Regression for the stuck-zero-window deadlock. With rx_max = 1 GiB
+    // the negotiated shift is 14, so the advertised window is
+    // `window() >> 14` — anything below 16 KiB of free space truncates
+    // to a zero advertisement. The old growth trigger stopped once
+    // `window() >= max(grow_chunk, mss)` (4 KiB here), leaving the
+    // socket advertising 0 forever while believing it had room: the
+    // peer could never send and the connection deadlocked behind
+    // zero-window probes. The trigger must keep growing until at least
+    // one scale granule (1 << shift) of window is advertisable.
+    let cfg = DynamicBufferConfig {
+        rx_initial: 0,
+        rx_max: 1 << 30,
+        tx_initial: 0,
+        tx_max: 64 * 1024,
+        grow_chunk: 4 * 1024,
+    };
+    let mut s = dyn_socket_established(cfg, None);
+    assert_eq!(s.remote_win_shift, 14);
+    assert_eq!(s.scaled_window(), 0);
+
+    let mut advertised = None;
+    for step in 0..10 {
+        let snapshot = dispatch_snapshot(&mut s, Instant::from_millis(100 + step));
+        if let Some(snap) = snapshot {
+            advertised = Some(snap.repr.window_len);
+            break;
+        }
+    }
+
+    // The growth ramp must terminate with a nonzero advertised window,
+    // emitted as a window-update segment.
+    let advertised = advertised.expect("window update must eventually be emitted");
+    assert!(advertised > 0, "advertised window must escape zero");
+    assert!(s.scaled_window() > 0);
+
+    // The ramp must not overshoot: one granule of advertisable window
+    // is enough to unstick the peer; the rest grows on data pressure.
+    assert!(
+        s.recv_capacity() <= 2 * (1 << 14),
+        "growth should stop near one scale granule, got {}",
+        s.recv_capacity()
+    );
 }

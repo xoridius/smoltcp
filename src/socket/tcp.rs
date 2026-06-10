@@ -591,6 +591,21 @@ struct EgressInterest {
     window_update: WindowUpdateInterest,
 }
 
+/// RFC 7323 §2.2/§2.3: "the shift count must be limited to 14 (which allows
+/// windows of 2**30 = 1 Gbyte)". A receiver of a larger value MUST use 14,
+/// so advertising more would only cause the two ends to disagree about the
+/// scale of our window field.
+const MAX_WIN_SHIFT: u8 = 14;
+
+/// Window-scale shift sized so `cap` bytes of receive window can be
+/// advertised, clamped to the RFC 7323 maximum of 14. The shift is carried
+/// in the SYN and fixed for the connection's lifetime, so it must be
+/// computed from the largest capacity the receive buffer may ever reach.
+fn win_shift_for_capacity(cap: usize) -> u8 {
+    let cap_log2 = mem::size_of::<usize>() * 8 - cap.leading_zeros() as usize;
+    (cap_log2.saturating_sub(16) as u8).min(MAX_WIN_SHIFT)
+}
+
 impl<'a> Socket<'a> {
     #[allow(unused_comparisons)] // small usize platforms always pass rx_capacity check
     /// Create a socket using the given buffers.
@@ -609,7 +624,6 @@ impl<'a> Socket<'a> {
         if rx_capacity > (1 << 30) {
             panic!("receiving buffer too large, cannot exceed 1 GiB")
         }
-        let rx_cap_log2 = mem::size_of::<usize>() * 8 - rx_capacity.leading_zeros() as usize;
 
         Socket {
             state: State::Closed,
@@ -629,7 +643,7 @@ impl<'a> Socket<'a> {
             remote_last_ack: None,
             remote_last_win: 0,
             remote_win_len: 0,
-            remote_win_shift: rx_cap_log2.saturating_sub(16) as u8,
+            remote_win_shift: win_shift_for_capacity(rx_capacity),
             remote_win_scale: None,
             remote_mss: DEFAULT_MSS as u32,
             remote_last_ts: None,
@@ -683,12 +697,15 @@ impl<'a> Socket<'a> {
         // a pathological tx_max could escape the per-direction ceiling,
         // and on a 32-bit pointer target `(rx_initial + tx_initial)` could
         // even overflow `usize`. The cap matches what the wire-level
-        // window-scale negotiation can express.
-        const PER_DIRECTION_CAP: usize = 1 << 30;
-        let rx_max = (config.rx_max as usize).min(PER_DIRECTION_CAP);
-        let tx_max = (config.tx_max as usize).min(PER_DIRECTION_CAP);
-        let rx_initial = (config.rx_initial as usize).min(rx_max);
-        let tx_initial = (config.tx_initial as usize).min(tx_max);
+        // window-scale negotiation can express. On targets whose `usize`
+        // cannot represent 2^30 (16-bit), saturate to `usize::MAX` — the
+        // address space gates allocation well before the RFC cap does.
+        const PER_DIRECTION_CAP: u32 = 1 << 30;
+        let cap = |v: u32| usize::try_from(v.min(PER_DIRECTION_CAP)).unwrap_or(usize::MAX);
+        let rx_max = cap(config.rx_max);
+        let tx_max = cap(config.tx_max);
+        let rx_initial = cap(config.rx_initial).min(rx_max);
+        let tx_initial = cap(config.tx_initial).min(tx_max);
 
         let mut state = dynbuf::DynBufState::new(
             &DynamicBufferConfig {
@@ -722,21 +739,9 @@ impl<'a> Socket<'a> {
         // Override the window-scale shift: it must be sized for `rx_max`,
         // not for the (possibly tiny) current capacity, because the SYN
         // carries the scale and it is fixed for the connection's lifetime.
-        sock.remote_win_shift = Self::win_shift_for(rx_max);
+        sock.remote_win_shift = win_shift_for_capacity(rx_max);
         sock.dyn_state = Some(Box::new(state));
         sock
-    }
-
-    /// Window-scale shift sized for `rx_max`. Mirrors the unscaled
-    /// computation in [`Socket::new`] / [`Socket::reset`] but takes an
-    /// explicit cap so the SYN value reflects future growth potential.
-    #[cfg(feature = "socket-tcp-dynamic-buffer")]
-    fn win_shift_for(rx_max: usize) -> u8 {
-        if rx_max == 0 {
-            return 0;
-        }
-        let cap_log2 = mem::size_of::<usize>() * 8 - rx_max.leading_zeros() as usize;
-        cap_log2.saturating_sub(16) as u8
     }
 
     /// Returns the configured per-flow max receive capacity for a
@@ -1266,7 +1271,7 @@ impl<'a> Socket<'a> {
         #[cfg(not(feature = "socket-tcp-dynamic-buffer"))]
         let cap_for_shift = self.rx_buffer.capacity();
 
-        let rx_cap_log2 = mem::size_of::<usize>() * 8 - cap_for_shift.leading_zeros() as usize;
+        let new_win_shift = win_shift_for_capacity(cap_for_shift);
 
         self.state = State::Closed;
         self.timer = Timer::new();
@@ -1292,7 +1297,7 @@ impl<'a> Socket<'a> {
         self.flags.set(Flags::REMOTE_LAST_WIN_UNSCALED, false);
         self.remote_win_len = 0;
         self.remote_win_scale = None;
-        self.remote_win_shift = rx_cap_log2.saturating_sub(16) as u8;
+        self.remote_win_shift = new_win_shift;
         self.remote_mss = DEFAULT_MSS as u32;
         self.remote_last_ts = None;
         self.last_remote_tsval = 0;
@@ -2909,9 +2914,19 @@ impl<'a> Socket<'a> {
         // usually false (buffer has room) in steady state, so it
         // short-circuits before the state-machine match in
         // `rx_growth_allowed`.
+        //
+        // The `1 << remote_win_shift` term is a correctness floor, not a
+        // tuning knob: the advertised window is `window() >> shift`, so
+        // any free space below one scale granule truncates to a zero
+        // advertisement. Without it, a flow whose `rx_max` implies a large
+        // shift would stop growing at a capacity that still advertises 0
+        // and deadlock behind zero-window probes forever.
         #[cfg(feature = "socket-tcp-dynamic-buffer")]
         if let Some(state) = self.dyn_state.as_ref()
-            && self.rx_buffer.window() < (state.grow_chunk as usize).max(self.remote_mss as usize)
+            && self.rx_buffer.window()
+                < (state.grow_chunk as usize)
+                    .max(self.remote_mss as usize)
+                    .max(1usize << self.remote_win_shift)
             && self.rx_growth_allowed()
             && self.try_grow_rx()
         {
@@ -3769,6 +3784,19 @@ mod test {
 
         assert!(result.is_ok());
         assert!(s.socket.rx_window_update_dirty());
+    }
+
+    #[test]
+    fn test_win_shift_capped_at_rfc7323_max() {
+        // RFC 7323: a shift above 14 is invalid; receivers MUST treat it
+        // as 14, so the two ends would disagree about our window scale.
+        // The naive log2 formula yields 15 for a capacity of exactly 1 GiB.
+        assert_eq!(win_shift_for_capacity(0), 0);
+        assert_eq!(win_shift_for_capacity(64 * 1024), 1);
+        assert_eq!(win_shift_for_capacity((1 << 30) - 1), 14);
+        assert_eq!(win_shift_for_capacity(1 << 30), 14);
+        #[cfg(target_pointer_width = "64")]
+        assert_eq!(win_shift_for_capacity(usize::MAX), 14);
     }
 
     fn socket_closing() -> TestSocket {
