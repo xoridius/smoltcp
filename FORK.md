@@ -509,6 +509,8 @@ cargo test --release --lib checksum_odd_byte_is_padded_zero
 cargo test --release --lib checksum_pinned_values         # platform-independent pinned values; BE regression catch
 cargo test --release --lib test_paws_rejects_older_tsval
 cargo test --release --lib test_paws_accepts_newer_tsval
+cargo test --release --lib test_win_shift_capped_at_rfc7323_max
+cargo test --release --lib --features socket-tcp-dynamic-buffer large_rx_max_grows_until_window_advertisable
 ```
 
 What each guards:
@@ -528,6 +530,12 @@ What each guards:
 - PAWS tests — guard the segment-acceptance check in `Socket::process`
   against future refactors that would re-introduce silent acceptance of
   replayed/wrapped segments.
+- `test_win_shift_capped_at_rfc7323_max` — the window-scale shift must never
+  exceed 14 (RFC 7323); the naive log2 formula yields 15 at exactly 1 GiB.
+- `large_rx_max_grows_until_window_advertisable` — dynamic-buffer rx growth
+  must continue until at least one scale granule (`1 << shift`) of window is
+  free; stopping earlier truncates the advertised window to a permanent zero
+  and deadlocks the connection behind zero-window probes.
 
 ### 7.1 Coverage-guided fuzzing (`fuzz/`)
 

@@ -35,6 +35,8 @@ FEATURES_TEST=(
     "std,medium-ieee802154,medium-ip,proto-ipv4,socket-raw,auto-icmp-echo-reply"
     "std,medium-ethernet,proto-ipv4,proto-ipsec,socket-raw"
     "alloc,medium-ethernet,proto-ipv4,proto-ipv6,socket-raw,socket-udp,socket-tcp,socket-icmp,proto-ipv6-slaac"
+    "std,medium-ip,proto-ipv4,proto-ipv6,socket-tcp,socket-tcp-dynamic-buffer"
+    "alloc,medium-ethernet,proto-ipv4,proto-ipv6,socket-raw,socket-udp,socket-tcp,socket-icmp,proto-ipv6-slaac,socket-tcp-dynamic-buffer"
 )
 
 FEATURES_CHECK=(
@@ -78,6 +80,7 @@ clippy() {
     rustup toolchain install $MSRV
     rustup component add clippy --toolchain=$MSRV
     cargo +$MSRV clippy --tests --examples -- -D warnings
+    cargo +$MSRV clippy --tests --examples --features socket-tcp-dynamic-buffer -- -D warnings
 }
 
 build_16bit() {
