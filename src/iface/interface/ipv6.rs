@@ -210,9 +210,12 @@ impl InterfaceInner {
             (ipv6_repr.next_header, ipv6_packet.payload())
         };
 
-        if !self.has_ip_addr(ipv6_repr.dst_addr)
-            && !(ipv6_repr.dst_addr.is_multicast() && self.has_multicast_group(ipv6_repr.dst_addr))
-        {
+        // The packet is for us if the destination is one of our unicast
+        // addresses, or a multicast group we have joined.
+        let dst_is_ours = self.has_ip_addr(ipv6_repr.dst_addr)
+            || (ipv6_repr.dst_addr.is_multicast() && self.has_multicast_group(ipv6_repr.dst_addr));
+
+        if !dst_is_ours {
             if !ipv6_repr.dst_addr.x_is_unicast() {
                 net_trace!(
                     "Rejecting IPv6 packet; {} is not a unicast address",
