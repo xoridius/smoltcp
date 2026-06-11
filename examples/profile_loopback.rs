@@ -2808,6 +2808,17 @@ fn shape_churn(seconds: u64, target_conn_per_sec: usize, offload: bool, mode: Ru
     let free_bytes = alloc_after.free_bytes - alloc_before.free_bytes;
     let alloc_count = alloc_after.alloc_count - alloc_before.alloc_count;
 
+    // Two pool readings with different roles. At the deadline, slots can
+    // legitimately hold charge: connections mid-lifecycle, plus sockets
+    // whose peer-side abort left undrained rx — which stays readable (and
+    // charged) until the slot recycles, per the `may_recv`-after-Closed
+    // contract. That value is a bounded diagnostic. The *leak gate* is the
+    // post-teardown reading: dropping the sockets must refund every byte.
+    let pool_at_deadline = pool.used();
+    drop(server);
+    drop(client);
+    let pool_after_teardown = pool.used();
+
     println!("\n========== shape: churn ==========");
     println!("  target rate:            {} conn/s", target_conn_per_sec);
     println!("  slot ring size:         {SLOTS}");
@@ -2815,7 +2826,14 @@ fn shape_churn(seconds: u64, target_conn_per_sec: usize, offload: bool, mode: Ru
     println!("  opened:                 {opened}   ({conn_rate:.1} conn/s)");
     println!("  closed:                 {closed}   ({close_rate:.1} conn/s)");
     println!("  app bytes xfer:         {bytes_xferred}");
-    println!("  pool used (end):        {} KiB", pool.used() / 1024);
+    println!(
+        "  pool used at deadline:  {} KiB  (in-flight + retained rx; bounded)",
+        pool_at_deadline / 1024
+    );
+    println!(
+        "  pool used (end):        {} KiB  (after teardown; leak gate, expect 0)",
+        pool_after_teardown / 1024
+    );
     println!("  pool budget:            {} KiB", pool_bytes / 1024);
     println!("  bytes allocated:        {alloc_bytes}");
     println!("  bytes freed:            {free_bytes}");

@@ -170,7 +170,7 @@ What each catches:
 |---|---|---|
 | `multi_tcp` | copy-heavy dynamic-buffer TCP echo throughput, per-thread Jain across `MemoryPool` contention | `Jain < 0.95`, nonzero lane fallback allocations in trace mode, or a large host-local throughput drop versus the previous isolated baseline |
 | `multi_tcp_sink` | one-way dynamic-buffer TCP throughput with direct send/recv closures | nonzero lane fallback allocations in trace mode, lower throughput than `multi_tcp` without a trace-backed explanation, or no reduction in copy/memmove pressure |
-| `churn` | open+close rate sustained, `pool used` returns to 0, `net heap delta` bounded | `pool used (end) > 0` (leaked reservations); `net heap delta` growing with rate (allocator-on-hot-path) |
+| `churn` | open+close rate sustained, post-teardown `pool used (end)` returns to 0, `net heap delta` bounded | post-teardown `pool used (end) > 0` (leaked reservations); `net heap delta` growing with rate (allocator-on-hot-path). The separate `pool used at deadline` line is diagnostic: in-flight connections plus aborted-with-unread-rx sockets (readable until the slot recycles, per the `may_recv`-after-Closed contract) legitimately hold a small bounded charge at cutoff |
 | `idle_hot` | `pool used post-create == 0` for idle flows; steady-state pool = N_active × 2 sockets × MAX_BUF | non-zero charge from idle sockets (lazy alloc broken); active flows can't reach max (grow policy broken) |
 
 In `--mode trace`, the lane packet pool is strict: if a shape exhausts its
@@ -733,7 +733,7 @@ current isolated runs on the same host and revision. The durable gates are:
 |---|---|
 | `multi_tcp` | per-thread Jain >= 0.95, bounded pool CAS retries, `pool used (end)` returns to 0, trace-mode lane fallback allocs 0. |
 | `multi_tcp_sink` | same pool and lane gates as `multi_tcp`; compare Time/CPU Profiler hotspots against `multi_tcp` for lower app-side copy pressure before claiming a copy win. |
-| `churn` | achieved close rate tracks target rate, `pool used (end) == 0`, net heap delta does not grow with connection rate. |
+| `churn` | achieved close rate tracks target rate, post-teardown `pool used (end) == 0` (the at-deadline reading may be small and bounded), net heap delta does not grow with connection rate. |
 | `idle_hot` | `pool used post-create == 0`; steady pool charge is proportional only to active client/server sockets; `n_active=0` is valid and should keep steady pool use at 0. |
 
 Sub-linear scaling at higher thread counts is expected once every worker is
