@@ -831,6 +831,24 @@ mod test {
     }
 
     #[test]
+    fn ext_header_truncated_length_is_rejected() {
+        // Buffer ends before the length field.
+        assert!(ExtHeaderPacket::new_checked(&[0xe3][..]).is_err());
+        // Length field claims 255 bytes of payload in a 2-byte buffer.
+        assert!(ExtHeaderPacket::new_checked(&[0xe3, 0xff][..]).is_err());
+    }
+
+    #[test]
+    fn ext_header_truncated_payload_is_rejected() {
+        // Valid header, but the length field (6) exceeds the remaining
+        // payload (3) — accessing payload() would slice out of bounds if
+        // check_len did not validate the declared length.
+        let bytes = [0xe3, 0x06, 0x03, 0x00, 0xff];
+
+        assert!(ExtHeaderPacket::new_checked(&bytes[..]).is_err());
+    }
+
+    #[test]
     fn ext_header_emit() {
         let ext_header = ExtHeaderRepr {
             ext_header_id: ExtHeaderId::RoutingHeader,

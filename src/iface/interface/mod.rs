@@ -162,10 +162,14 @@ pub struct InterfaceInner {
 pub struct Config {
     /// Random seed.
     ///
-    /// It is strongly recommended that the random seed is different on each boot,
-    /// to avoid problems with TCP port/sequence collisions.
+    /// This seed is used for protocol identifiers such as TCP initial sequence
+    /// numbers, DHCP transaction IDs, and ephemeral source ports.
     ///
-    /// The seed doesn't have to be cryptographically secure.
+    /// It is strongly recommended that the random seed is different on each boot,
+    /// to avoid predictable protocol identifiers and TCP port/sequence collisions.
+    ///
+    /// The seed doesn't have to be cryptographically secure, but it should not be
+    /// predictable by devices that can observe or inject network traffic.
     pub random_seed: u64,
 
     /// Set the Hardware address the interface will use.
@@ -211,6 +215,17 @@ impl Interface {
             caps.medium,
             "The hardware address does not match the medium of the interface."
         );
+
+        // A zero seed makes TCP initial sequence numbers, DHCP transaction
+        // IDs, and ephemeral ports predictable to an on-path or spoofing
+        // attacker. Panicking here would break every consumer using the
+        // `Config::new()` default, so warn instead; production deployments
+        // must provide per-boot entropy via `Config::random_seed`.
+        if config.random_seed == 0 {
+            net_debug!(
+                "iface: random_seed is 0; TCP ISNs, DHCP XIDs and ephemeral ports will be predictable"
+            );
+        }
 
         let mut rand = Rand::new(config.random_seed);
 

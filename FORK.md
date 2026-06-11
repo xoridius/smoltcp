@@ -642,7 +642,16 @@ re-litigating scope:
   is the consumer's responsibility.
 - **RFC 6528 ISN generation.** Security hardening, not behavioural
   correctness. Consumers can plug in a stronger `rand` source via
-  `Config::random_seed`.
+  `Config::random_seed`. Rejecting a zero seed at `Interface::new` (proposed
+  on a `codex/*` branch) would panic for every consumer using the
+  `Config::new()` default; instead `Interface::new` logs a debug warning
+  when the seed is zero. Production deployments must set per-boot entropy.
+- **Bounding `poll()` ingress work.** `poll()` intentionally drains the
+  device queue and documents the DoS trade-off; consumers that need bounded
+  per-call latency use the upstream `poll_ingress_single()` /
+  `poll_egress()` / `poll_maintenance()` primitives. Changing `poll()` to
+  one-packet-per-call (proposed on a `codex/*` branch) silently breaks the
+  semantics every existing consumer was written against; rejected.
 - **Async `Device` trait.** The sync trait composes cleanly with
   consumer-side async drivers; an async trait would fragment the ecosystem.
 - **Asymmetric `ChecksumCapabilities` (TX-only / RX-only).** Useful for
