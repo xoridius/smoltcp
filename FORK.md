@@ -532,6 +532,9 @@ What each guards:
   replayed/wrapped segments.
 - `test_win_shift_capped_at_rfc7323_max` — the window-scale shift must never
   exceed 14 (RFC 7323); the naive log2 formula yields 15 at exactly 1 GiB.
+- `test_sack_*` — sender-side SACK recovery (§15): hole-walk ordering,
+  selective-only under Cubic, re-lost-hole repair on partial ACK, RTO
+  scoreboard discard, hostile-block ingest, recovery across the 2^32 wrap.
 - `large_rx_max_grows_until_window_advertisable` — dynamic-buffer rx growth
   must continue until at least one scale granule (`1 << shift`) of window is
   free; stopping earlier truncates the advertised window to a permanent zero
@@ -668,6 +671,7 @@ map for triage:
 | Wire-layer perf (vectorized checksum, single-buffer pseudo-header) | Yes; low-controversy, file as perf PRs. |
 | Bug fixes (big-endian checksum, IPv6 zero-csum reject, BPF length) | Yes; file as bug-fix PRs with the failing case. |
 | RFC compliance (PAWS, IW10, rwnd-shrink) | Yes; file with RFC citation. |
+| SACK-based selective retransmission (§15) | Yes; RFC 2018/6675/6582 citations plus the netsim multi-seed evidence. The NoControl redundant pass needs design discussion. |
 | Phy hardening (panic → log+drop) | Likely; brief design discussion. |
 | Field-type shrink (`usize → u32`) | Low-controversy; easy PR. |
 | Static-dispatch wrappers on `AnyController` | Touches trait surface; needs maintainer buy-in. |
@@ -972,5 +976,46 @@ Rationale:
   refusal converts into advertised-window backpressure per flow instead of
   memory growth — the failure mode is throughput, not jetsam.
 
+Build with `socket-tcp-cubic` for cellular deployments: a real congestion
+controller keeps loss recovery (§15) strictly selective — the cwnd budget
+goes to reassembly holes — where `NoControl` deliberately falls back to a
+redundant in-order pass after the holes.
+
 Validate a configuration change with `pool_capacity_floor_*`-style tests,
 `dynbuf_memcompare`, and the `churn`/`idle_hot` shapes (§4.2.1).
+
+## 15. SACK-based selective retransmission
+
+The sender consumes incoming SACK blocks (RFC 2018) instead of ignoring
+them. Always on; zero-cost on lossless connections (the scoreboard is
+empty and every consumer short-circuits on `is_empty`).
+
+Design, in `src/socket/tcp.rs`:
+
+- **Scoreboard**: peer-SACKed ranges in a second fixed-size `Assembler`
+  (+64 B per socket, no allocation), stored as offsets relative to
+  SND.UNA; `Assembler::shift_front` slides it with the cumulative ACK.
+  Ingest validates hostile blocks with wrapping-ordered comparisons
+  before any subtraction, trims to SND.UNA, clamps to buffered data, and
+  drops on overflow — worst case equals pre-SACK behavior.
+- **Invariant I1**: `remote_last_seq` never rests inside a SACKed range
+  (`normalize_tx_cursor`, enforced at every cursor/scoreboard mutation).
+  The pure observers (`seq_to_transmit`, `poll_at`, `egress_interest`)
+  therefore needed no changes. The segment selector clamps a hole
+  retransmission at the next SACKed block.
+- **Recovery point** (RFC 6582 §3): armed at dupack #3 and on RTO.
+  Partial ACKs below it rewind-and-walk the next hole immediately;
+  reaching it ends recovery. RTO discards the scoreboard and resends
+  conservatively (RFC 2018 §8).
+- **Redundant pass, `NoControl` only**: when the selective walk exhausts
+  while recovery is open, one bounded in-order resend of the window —
+  holes always first, then redundancy fills the unmanaged pipe and
+  solicits a fresh ACK (lost-cumACK repair in one RTT). Under Reno/Cubic
+  (`AnyController::manages_window`) the pass is skipped.
+
+Evidence gates (re-measure per host; see §13 policy): deterministic
+netsim across 16 seeds at 32 KiB buffers — mean ±0% at 2% loss, +6% at
+5%, +36% at 10%; real-kernel TUN interop at 5% loss — multi-fold faster
+with the RTO tail eliminated, byte-exact. Clean-path throughput
+unchanged. RACK-TLP and pacing remain out of scope (§11) until profile
+evidence demands them.
