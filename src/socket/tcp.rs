@@ -523,6 +523,20 @@ pub struct Socket<'a> {
     /// The number of packets received directly after
     /// each other which have the same ACK number.
     local_rx_dup_acks: u8,
+    /// Sender-side SACK scoreboard (RFC 2018): ranges the peer reported
+    /// holding via SACK blocks, stored as sequence-space offsets relative
+    /// to `local_seq_no` (SND.UNA). Retransmissions walk around these
+    /// ranges instead of resending delivered data. Empty on a lossless
+    /// connection — every consumer short-circuits on `is_empty`, so the
+    /// hot path pays a single load+branch.
+    sack_scoreboard: Assembler,
+    /// RFC 6582/6675 recovery point: SND.NXT at the moment fast retransmit
+    /// last triggered. While the cumulative ACK stays below it, ACKs that
+    /// advance SND.UNA are *partial ACKs*: they prove the next hole's
+    /// retransmission was lost too, and it is retransmitted immediately
+    /// instead of waiting for three fresh duplicate ACKs or the RTO.
+    /// `None` outside recovery.
+    recovery_point: Option<TcpSeqNumber>,
     /// Packed bool flags. See the `Flags` bitflags struct below for
     /// the bit definitions. Same packing idiom as `wire::dns::Flags`,
     /// `wire::dhcpv4::Flags`, etc.
@@ -576,6 +590,12 @@ bitflags::bitflags! {
         #[cfg(feature = "socket-tcp-pause-synack")]
         const SYNACK_PAUSED          = 1 << 4;
         const RX_WINDOW_DIRTY        = 1 << 5;
+        /// Loss recovery is in its one-shot redundant pass: after the
+        /// selective hole-walk exhausted, the cursor was rewound to
+        /// SND.UNA for one in-order resend of the whole window
+        /// (`NoControl` only — see `manages_window`). While set, the
+        /// SACK skip/clamp logic is suspended.
+        const SACK_REDUNDANT_PASS    = 1 << 6;
     }
 }
 
@@ -650,6 +670,8 @@ impl<'a> Socket<'a> {
             local_rx_last_ack: None,
             local_rx_last_seq: None,
             local_rx_dup_acks: 0,
+            sack_scoreboard: Assembler::new(),
+            recovery_point: None,
             // Packed flags: nagle = true (default-on); everything else off.
             flags: Flags::NAGLE,
             ack_delay: Some(ACK_DELAY_DEFAULT),
@@ -1293,6 +1315,9 @@ impl<'a> Socket<'a> {
         self.timer = Timer::new();
         self.rtte = RttEstimator::default();
         self.assembler = Assembler::new();
+        self.sack_scoreboard = Assembler::new();
+        self.recovery_point = None;
+        self.flags.remove(Flags::SACK_REDUNDANT_PASS);
         self.tx_buffer.clear();
         self.rx_buffer.clear();
         self.flags.set(Flags::RX_FIN_RECEIVED, false);
@@ -2555,6 +2580,10 @@ impl<'a> Socket<'a> {
 
                     if self.local_rx_dup_acks == 3 {
                         self.timer.set_for_fast_retransmit();
+                        // RFC 6582/6675: remember how far we had sent when
+                        // recovery began; ACKs below this are partial ACKs.
+                        self.recovery_point = Some(self.remote_last_seq);
+                        self.flags.remove(Flags::SACK_REDUNDANT_PASS);
                         net_debug!("started fast retransmit");
                     }
                 }
@@ -2567,6 +2596,15 @@ impl<'a> Socket<'a> {
                     self.local_rx_last_ack = Some(ack_number);
                 }
             };
+            // The scoreboard stores offsets relative to SND.UNA; slide its
+            // window forward with the cumulative ACK before SND.UNA moves.
+            // Guarded comparison: `ack_number` is never below `local_seq_no`
+            // here, but a wrapping-ordered check keeps the panicking
+            // subtraction unreachable by construction.
+            if !self.sack_scoreboard.is_empty() && ack_number > self.local_seq_no {
+                self.sack_scoreboard
+                    .shift_front(ack_number - self.local_seq_no);
+            }
             // We've processed everything in the incoming segment, so advance the local
             // sequence number past it.
             self.local_seq_no = ack_number;
@@ -2577,6 +2615,39 @@ impl<'a> Socket<'a> {
             // deallocated from the buffer.
             if self.remote_last_seq < self.local_seq_no {
                 self.remote_last_seq = self.local_seq_no
+            }
+
+            // RFC 2018 sender side: record any SACK blocks this ACK carries,
+            // then restore invariant I1 — the cumulative-ACK slide above can
+            // leave the first scoreboard range at offset 0 with the cursor
+            // on it, and fresh blocks can land on the cursor as well.
+            if !self.sack_scoreboard.is_empty() || repr.sack_ranges.iter().any(|r| r.is_some()) {
+                self.ingest_sack_ranges(&repr.sack_ranges);
+                self.normalize_tx_cursor();
+            }
+
+            match self.recovery_point {
+                // The cumulative ACK reached the recovery point: loss
+                // recovery is complete.
+                Some(recovery_point) if ack_number >= recovery_point => {
+                    self.recovery_point = None;
+                    self.flags.remove(Flags::SACK_REDUNDANT_PASS);
+                }
+                // Partial ACK during SACK-based recovery: SND.UNA advanced
+                // but not past the recovery point, which means the segment
+                // right at the new SND.UNA — retransmitted in the walk that
+                // started this recovery — was lost again. Rewind the cursor
+                // to SND.UNA; `normalize_tx_cursor` immediately jumps it to
+                // the first real hole, and the next dispatch retransmits it
+                // without waiting for three fresh duplicate ACKs or the
+                // (exponentially backed-off) RTO. Scoreboard-empty flows
+                // keep the legacy behavior unchanged.
+                Some(_) if ack_len > 0 && !self.sack_scoreboard.is_empty() => {
+                    self.flags.remove(Flags::SACK_REDUNDANT_PASS);
+                    self.remote_last_seq = self.local_seq_no;
+                    self.normalize_tx_cursor();
+                }
+                _ => {}
             }
         }
 
@@ -2716,6 +2787,90 @@ impl<'a> Socket<'a> {
             (Some(remote_last_ts), Some(timeout)) => timestamp >= remote_last_ts + timeout,
             (_, _) => false,
         }
+    }
+
+    /// Ingest the SACK blocks of an incoming ACK into the sender scoreboard
+    /// (RFC 2018 §5). Blocks are advisory: anything malformed, stale, or
+    /// beyond what we have buffered is trimmed or ignored, and a scoreboard
+    /// overflow (`TooManyHolesError`) silently drops the block — the worst
+    /// case is retransmitting data the peer already holds, which is exactly
+    /// the pre-SACK behavior.
+    ///
+    /// Wire values are absolute sequence numbers; the scoreboard stores
+    /// offsets relative to `local_seq_no` (SND.UNA). All comparisons below
+    /// use the wrapping `SeqNumber` ordering, and every subtraction is
+    /// guarded by an ordering check first, so adversarial blocks can never
+    /// hit the panicking underflow path of `SeqNumber::sub`.
+    fn ingest_sack_ranges(&mut self, ranges: &[Option<(u32, u32)>; 3]) {
+        let tx_len = self.tx_buffer.len();
+        for &(left, right) in ranges.iter().flatten() {
+            let left = TcpSeqNumber(left as i32);
+            let right = TcpSeqNumber(right as i32);
+            // Malformed or empty block.
+            if right <= left {
+                continue;
+            }
+            // Entirely below SND.UNA: stale information or a D-SACK
+            // duplicate report — nothing for the scoreboard either way.
+            if right <= self.local_seq_no {
+                continue;
+            }
+            let left = left.max(self.local_seq_no);
+            let offset = left - self.local_seq_no;
+            // A block beyond the bytes we actually hold cannot be honest.
+            if offset >= tx_len {
+                continue;
+            }
+            let len = (right - left).min(tx_len - offset);
+            let _ = self.sack_scoreboard.add(offset, len);
+        }
+    }
+
+    /// Invariant I1: `remote_last_seq` never points into the interior of a
+    /// peer-SACKed range — those bytes are already delivered, so the cursor
+    /// jumps to the range's end. This is enforced at every site that moves
+    /// the cursor backwards or grows the scoreboard (fast-retransmit rewind,
+    /// SACK ingest, post-emit advance), which keeps the pure observers
+    /// (`seq_to_transmit`, `has_unsent_or_control_to_transmit`, `poll_at`,
+    /// `egress_interest`) consistent without teaching them about SACK:
+    /// they only ever see a cursor that has real work at or after it.
+    fn normalize_tx_cursor(&mut self) {
+        if self.flags.contains(Flags::SACK_REDUNDANT_PASS) || self.sack_scoreboard.is_empty() {
+            return;
+        }
+        let offset = self.remote_last_seq - self.local_seq_no;
+        for (start, end) in self.sack_scoreboard.iter_data() {
+            if offset < start {
+                break;
+            }
+            if offset < end {
+                // Ranges are merged, so the position after this range is a
+                // hole (or the end of the buffered data) — one jump suffices.
+                self.remote_last_seq = self.local_seq_no + end;
+                break;
+            }
+        }
+    }
+
+    /// Begin the one-shot redundant pass of loss recovery: rewind the
+    /// cursor to SND.UNA and resend the window in order, ignoring the
+    /// scoreboard. Entered only when the selective hole-walk has nothing
+    /// left to send while recovery is still open, and only under
+    /// `NoControl` — when the consumer manages no bandwidth budget, the
+    /// redundant copies cost nothing they care about and each one is
+    /// another chance against loss (and a fresh-ACK solicitor). Under
+    /// Reno/Cubic the congestion window already prioritizes the
+    /// selective walk, and the pass is skipped entirely.
+    ///
+    /// One-shot per recovery trigger: the flag is cleared by the next
+    /// trigger (dupack #3, partial ACK, RTO) or by recovery completing,
+    /// so the walk cannot loop.
+    fn enter_sack_redundant_pass(&mut self) {
+        if self.congestion_controller.manages_window() {
+            return;
+        }
+        self.flags.insert(Flags::SACK_REDUNDANT_PASS);
+        self.remote_last_seq = self.local_seq_no;
     }
 
     fn seq_to_transmit(&self, cx: &mut Context) -> bool {
@@ -3003,6 +3158,22 @@ impl<'a> Socket<'a> {
             // If a retransmit timer expired, we should resend data starting at the last ACK.
             net_debug!("retransmitting");
 
+            // RFC 2018 §8: after a retransmission timeout, discard the SACK
+            // scoreboard and retransmit conservatively from SND.UNA — an RTO
+            // this deep into recovery suggests severe loss or a reneging
+            // receiver. Fast retransmit keeps the scoreboard: the rewound
+            // cursor then walks only the holes between SACKed ranges.
+            if matches!(self.timer, Timer::Retransmit { .. }) {
+                self.sack_scoreboard.clear();
+                // RFC 6582 §3: (re)arm the recovery point on timeout as
+                // well. SACK blocks arriving during the go-back-N walk
+                // repopulate the scoreboard, and partial ACKs below this
+                // point then repair re-lost holes immediately instead of
+                // waiting out further exponentially backed-off RTOs.
+                self.recovery_point = Some(self.remote_last_seq);
+                self.flags.remove(Flags::SACK_REDUNDANT_PASS);
+            }
+
             // Rewind "last sequence number sent", as if we never
             // had sent them. This will cause all data in the queue
             // to be sent again.
@@ -3020,8 +3191,28 @@ impl<'a> Socket<'a> {
             // Inform the congestion controller that we're retransmitting.
             self.congestion_controller.on_retransmit(cx.now());
 
-            // The rewind above may have changed whether we have anything to send.
+            // Skip the rewound cursor past any leading SACKed range
+            // (invariant I1), then recompute whether anything needs sending.
+            self.normalize_tx_cursor();
             want_send = self.seq_to_transmit(cx);
+
+            // If the skip consumed the entire retransmission (every
+            // outstanding byte is SACKed), the peer holds all our data but
+            // its cumulative ACK is missing — lost on the way back, or the
+            // receiver reneged. Going silent would stall until the
+            // (backed-off) RTO. Enter the redundant pass: rewind to SND.UNA
+            // and resend in order. Even the first duplicate forces the peer
+            // to emit a fresh ACK, repairing the lost-ACK case in one RTT.
+            // The RTO is also kept armed as the true backstop — if it
+            // fires, the scoreboard is discarded above and recovery
+            // degrades to the conservative full rewind. Scoreboard-empty
+            // (legacy) behavior is unchanged.
+            if !want_send && !self.sack_scoreboard.is_empty() && !self.tx_buffer.is_empty() {
+                self.enter_sack_redundant_pass();
+                want_send = self.seq_to_transmit(cx);
+                let rto = self.rtte.retransmission_timeout();
+                self.timer.set_for_retransmit(cx.now(), rto);
+            }
         }
 
         #[cfg(feature = "socket-tcp-pause-synack")]
@@ -3155,11 +3346,28 @@ impl<'a> Socket<'a> {
                 // 1. remote window
                 // 2. MSS the remote is willing to accept, probably determined by their MTU
                 // 3. MSS we can send, determined by our MTU.
-                let size = win_limit
+                let mut size = win_limit
                     .min(self.remote_mss as usize)
                     .min(cx.ip_mtu() - ip_repr.header_len() - TCP_HEADER_LEN);
 
                 let offset = self.remote_last_seq - self.local_seq_no;
+
+                // RFC 6675: when retransmitting a hole, do not run into the
+                // following peer-SACKed block — those bytes are already
+                // delivered. The cursor is never *inside* a range
+                // (invariant I1, `normalize_tx_cursor`), so clamping to the
+                // next range start suffices and leaves at least one byte.
+                if !self.flags.contains(Flags::SACK_REDUNDANT_PASS)
+                    && !self.sack_scoreboard.is_empty()
+                {
+                    for (start, _) in self.sack_scoreboard.iter_data() {
+                        if start > offset {
+                            size = size.min(start - offset);
+                            break;
+                        }
+                    }
+                }
+
                 repr.payload = self.tx_buffer.get_allocated(offset, size);
 
                 // If we've sent everything we had in the buffer, follow it with the PSH or FIN
@@ -3272,6 +3480,22 @@ impl<'a> Socket<'a> {
         let new_remote_last_win_unscaled = repr.control == TcpControl::Syn;
 
         self.remote_last_seq = new_remote_last_seq;
+        // Restore invariant I1: the segment we just emitted may end exactly
+        // at the start of a SACKed block; jump the cursor over it so the
+        // next dispatch starts at the following hole (or new data). The RTT
+        // and congestion updates below use the captured pre-jump values, so
+        // they account the segment actually transmitted.
+        self.normalize_tx_cursor();
+        // If that jump exhausted the selective walk while loss recovery is
+        // still open (cursor at the end of buffered data, holes all sent),
+        // fall into the one-shot redundant pass — under NoControl only.
+        if self.recovery_point.is_some()
+            && !self.flags.contains(Flags::SACK_REDUNDANT_PASS)
+            && !self.sack_scoreboard.is_empty()
+            && self.remote_last_seq == self.local_seq_no + self.tx_buffer.len()
+        {
+            self.enter_sack_redundant_pass();
+        }
         self.remote_last_ack = new_remote_last_ack;
         self.remote_last_win = new_remote_last_win;
         self.flags.set(
@@ -7189,6 +7413,423 @@ mod test {
             ack_number: Some(LOCAL_SEQ + 1 + (6 * 4)),
             ..SEND_TEMPL
         });
+    }
+
+    /// Build one wire-format SACK block from absolute sequence numbers.
+    fn sack_block(left: TcpSeqNumber, right: TcpSeqNumber) -> Option<(u32, u32)> {
+        Some((left.0 as u32, right.0 as u32))
+    }
+
+    /// Send 4 × 6-byte segments on an established socket and emit them.
+    fn socket_with_four_segments_in_flight() -> TestSocket {
+        let mut s = socket_established();
+        s.remote_mss = 6;
+        send!(s, time 0, TcpRepr {
+            seq_number: REMOTE_SEQ + 1,
+            ack_number: Some(LOCAL_SEQ + 1),
+            ..SEND_TEMPL
+        });
+        s.send_slice(b"xxxxxxyyyyyywwwwwwzzzzzz").unwrap();
+        for (i, payload) in [&b"xxxxxx"[..], b"yyyyyy", b"wwwwww", b"zzzzzz"]
+            .into_iter()
+            .enumerate()
+        {
+            recv!(s, time 1000 + i as i64 * 5, Ok(TcpRepr {
+                seq_number: LOCAL_SEQ + 1 + 6 * i,
+                ack_number: Some(REMOTE_SEQ + 1),
+                payload,
+                ..RECV_TEMPL
+            }));
+        }
+        s
+    }
+
+    /// Three duplicate ACKs reporting segments 2 and 4 as SACKed.
+    fn send_three_dupacks_sacking_2_and_4(mut s: &mut TestSocket, times: [i64; 3]) {
+        for t in times {
+            send!(s, time t, TcpRepr {
+                seq_number: REMOTE_SEQ + 1,
+                ack_number: Some(LOCAL_SEQ + 1),
+                sack_ranges: [
+                    sack_block(LOCAL_SEQ + 1 + 6, LOCAL_SEQ + 1 + 12),
+                    sack_block(LOCAL_SEQ + 1 + 18, LOCAL_SEQ + 1 + 24),
+                    None,
+                ],
+                ..SEND_TEMPL
+            });
+        }
+    }
+
+    #[cfg(not(any(feature = "socket-tcp-cubic", feature = "socket-tcp-reno")))]
+    #[test]
+    fn test_sack_fast_retransmit_holes_first_then_redundant_pass() {
+        // Under NoControl (no congestion window), recovery sends the holes
+        // FIRST — the delivery-blocking bytes — and then, because nothing
+        // bounds the pipe, one redundant in-order pass over the window as
+        // extra insurance and ACK solicitation. Under Reno/Cubic the
+        // redundant pass is skipped entirely (see the cubic-gated test).
+        let mut s = socket_with_four_segments_in_flight();
+        send_three_dupacks_sacking_2_and_4(&mut s, [1050, 1055, 1060]);
+
+        // Phase 1: the two holes, in order, ahead of everything else.
+        recv!(s, time 1100, Ok(TcpRepr {
+            seq_number: LOCAL_SEQ + 1,
+            ack_number: Some(REMOTE_SEQ + 1),
+            payload:    &b"xxxxxx"[..],
+            ..RECV_TEMPL
+        }));
+        recv!(s, time 1105, Ok(TcpRepr {
+            seq_number: LOCAL_SEQ + 1 + 12,
+            ack_number: Some(REMOTE_SEQ + 1),
+            payload:    &b"wwwwww"[..],
+            ..RECV_TEMPL
+        }));
+        // Phase 2: one redundant in-order pass, then quiescence.
+        for (i, payload) in [&b"xxxxxx"[..], b"yyyyyy", b"wwwwww", b"zzzzzz"]
+            .into_iter()
+            .enumerate()
+        {
+            recv!(s, time 1110 + i as i64 * 5, Ok(TcpRepr {
+                seq_number: LOCAL_SEQ + 1 + 6 * i,
+                ack_number: Some(REMOTE_SEQ + 1),
+                payload,
+                ..RECV_TEMPL
+            }));
+        }
+        recv_nothing!(s, time 1140);
+        assert!(matches!(s.timer, Timer::Retransmit { .. }));
+
+        send!(s, time 1200, TcpRepr {
+            seq_number: REMOTE_SEQ + 1,
+            ack_number: Some(LOCAL_SEQ + 1 + 24),
+            ..SEND_TEMPL
+        });
+        assert!(s.recovery_point.is_none());
+        assert!(s.sack_scoreboard.is_empty());
+        assert_eq!(s.tx_buffer.len(), 0);
+    }
+
+    #[cfg(feature = "socket-tcp-cubic")]
+    #[test]
+    fn test_sack_fast_retransmit_selective_only_with_congestion_control() {
+        // With a real congestion controller, the redundant pass is skipped:
+        // recovery retransmits ONLY the holes. The cwnd budget must go to
+        // useful bytes — this is the bandwidth-constrained product path.
+        let mut s = socket_with_four_segments_in_flight();
+        s.set_congestion_control(CongestionControl::Cubic);
+        s.congestion_controller.set_mss(6);
+        send_three_dupacks_sacking_2_and_4(&mut s, [1050, 1055, 1060]);
+
+        recv!(s, time 1100, Ok(TcpRepr {
+            seq_number: LOCAL_SEQ + 1,
+            ack_number: Some(REMOTE_SEQ + 1),
+            payload:    &b"xxxxxx"[..],
+            ..RECV_TEMPL
+        }));
+        recv!(s, time 1105, Ok(TcpRepr {
+            seq_number: LOCAL_SEQ + 1 + 12,
+            ack_number: Some(REMOTE_SEQ + 1),
+            payload:    &b"wwwwww"[..],
+            ..RECV_TEMPL
+        }));
+        recv_nothing!(s, time 1110);
+
+        send!(s, time 1200, TcpRepr {
+            seq_number: REMOTE_SEQ + 1,
+            ack_number: Some(LOCAL_SEQ + 1 + 24),
+            ..SEND_TEMPL
+        });
+        assert!(s.sack_scoreboard.is_empty());
+        assert_eq!(s.tx_buffer.len(), 0);
+    }
+
+    #[cfg(feature = "socket-tcp-cubic")]
+    #[test]
+    fn test_sack_relost_hole_retransmits_on_partial_ack() {
+        // RFC 6582/6675: a partial ACK during recovery proves the next
+        // hole's retransmission was lost again; it is retransmitted
+        // immediately, without three fresh dupacks or the backed-off RTO.
+        // Cubic build: selective walk only, no redundant pass.
+        let mut s = socket_with_four_segments_in_flight();
+        s.set_congestion_control(CongestionControl::Cubic);
+        s.congestion_controller.set_mss(6);
+        send_three_dupacks_sacking_2_and_4(&mut s, [1050, 1055, 1060]);
+
+        recv!(s, time 1100, Ok(TcpRepr {
+            seq_number: LOCAL_SEQ + 1,
+            ack_number: Some(REMOTE_SEQ + 1),
+            payload:    &b"xxxxxx"[..],
+            ..RECV_TEMPL
+        }));
+        recv!(s, time 1105, Ok(TcpRepr {
+            seq_number: LOCAL_SEQ + 1 + 12,
+            ack_number: Some(REMOTE_SEQ + 1),
+            payload:    &b"wwwwww"[..],
+            ..RECV_TEMPL
+        }));
+        recv_nothing!(s, time 1110);
+
+        // Partial ACK below the recovery point, segment 4 still SACKed:
+        // hole 3's retransmission was lost again — resend it now.
+        send!(s, time 1210, TcpRepr {
+            seq_number: REMOTE_SEQ + 1,
+            ack_number: Some(LOCAL_SEQ + 1 + 12),
+            sack_ranges: [
+                sack_block(LOCAL_SEQ + 1 + 18, LOCAL_SEQ + 1 + 24),
+                None,
+                None,
+            ],
+            ..SEND_TEMPL
+        });
+        recv!(s, time 1215, Ok(TcpRepr {
+            seq_number: LOCAL_SEQ + 1 + 12,
+            ack_number: Some(REMOTE_SEQ + 1),
+            payload:    &b"wwwwww"[..],
+            ..RECV_TEMPL
+        }));
+        recv_nothing!(s, time 1220);
+
+        send!(s, time 1300, TcpRepr {
+            seq_number: REMOTE_SEQ + 1,
+            ack_number: Some(LOCAL_SEQ + 1 + 24),
+            ..SEND_TEMPL
+        });
+        assert!(s.recovery_point.is_none());
+        assert!(s.sack_scoreboard.is_empty());
+        assert_eq!(s.tx_buffer.len(), 0);
+    }
+
+    #[test]
+    fn test_sack_all_outstanding_sacked_solicits_ack_and_rearms_rto() {
+        let mut s = socket_established();
+        s.remote_mss = 6;
+        send!(s, time 0, TcpRepr {
+            seq_number: REMOTE_SEQ + 1,
+            ack_number: Some(LOCAL_SEQ + 1),
+            ..SEND_TEMPL
+        });
+        s.send_slice(b"xxxxxxyyyyyy").unwrap();
+        recv!(s, time 1000, Ok(TcpRepr {
+            seq_number: LOCAL_SEQ + 1,
+            ack_number: Some(REMOTE_SEQ + 1),
+            payload:    &b"xxxxxx"[..],
+            ..RECV_TEMPL
+        }));
+        recv!(s, time 1005, Ok(TcpRepr {
+            seq_number: LOCAL_SEQ + 1 + 6,
+            ack_number: Some(REMOTE_SEQ + 1),
+            payload:    &b"yyyyyy"[..],
+            ..RECV_TEMPL
+        }));
+
+        // The peer reports holding ALL outstanding data; only its
+        // cumulative ACK is missing.
+        for t in [1050, 1055, 1060] {
+            send!(s, time t, TcpRepr {
+                seq_number: REMOTE_SEQ + 1,
+                ack_number: Some(LOCAL_SEQ + 1),
+                sack_ranges: [
+                    sack_block(LOCAL_SEQ + 1, LOCAL_SEQ + 1 + 12),
+                    None,
+                    None,
+                ],
+                ..SEND_TEMPL
+            });
+        }
+
+        // Nothing selective to send. Under NoControl, the redundant pass
+        // solicits a fresh ACK by resending in order; with a congestion
+        // controller, the socket stays quiet and relies on the RTO. In
+        // both cases the RTO must stay armed as the backstop.
+        #[cfg(not(any(feature = "socket-tcp-cubic", feature = "socket-tcp-reno")))]
+        {
+            recv!(s, time 1100, Ok(TcpRepr {
+                seq_number: LOCAL_SEQ + 1,
+                ack_number: Some(REMOTE_SEQ + 1),
+                payload:    &b"xxxxxx"[..],
+                ..RECV_TEMPL
+            }));
+            recv!(s, time 1105, Ok(TcpRepr {
+                seq_number: LOCAL_SEQ + 1 + 6,
+                ack_number: Some(REMOTE_SEQ + 1),
+                payload:    &b"yyyyyy"[..],
+                ..RECV_TEMPL
+            }));
+        }
+        recv_nothing!(s, time 1110);
+        assert!(matches!(s.timer, Timer::Retransmit { .. }));
+
+        // If even that is lost, the (backed-off) RTO clears the scoreboard
+        // and recovery degrades to the conservative full rewind.
+        recv!(s, time 5000, Ok(TcpRepr {
+            seq_number: LOCAL_SEQ + 1,
+            ack_number: Some(REMOTE_SEQ + 1),
+            payload:    &b"xxxxxx"[..],
+            ..RECV_TEMPL
+        }));
+        assert!(s.sack_scoreboard.is_empty());
+        recv!(s, time 5005, Ok(TcpRepr {
+            seq_number: LOCAL_SEQ + 1 + 6,
+            ack_number: Some(REMOTE_SEQ + 1),
+            payload:    &b"yyyyyy"[..],
+            ..RECV_TEMPL
+        }));
+    }
+
+    #[test]
+    fn test_sack_rto_clears_scoreboard_and_resends_all() {
+        let mut s = socket_with_four_segments_in_flight();
+
+        // One SACK-bearing duplicate ACK (not enough for fast retransmit).
+        send!(s, time 1050, TcpRepr {
+            seq_number: REMOTE_SEQ + 1,
+            ack_number: Some(LOCAL_SEQ + 1),
+            sack_ranges: [
+                sack_block(LOCAL_SEQ + 1 + 6, LOCAL_SEQ + 1 + 12),
+                sack_block(LOCAL_SEQ + 1 + 18, LOCAL_SEQ + 1 + 24),
+                None,
+            ],
+            ..SEND_TEMPL
+        });
+        assert!(!s.sack_scoreboard.is_empty());
+
+        // RTO: conservative recovery discards the scoreboard and resends
+        // the full window, including the previously-SACKed segments.
+        for (i, payload) in [&b"xxxxxx"[..], b"yyyyyy", b"wwwwww", b"zzzzzz"]
+            .into_iter()
+            .enumerate()
+        {
+            recv!(s, time 5000 + i as i64 * 5, Ok(TcpRepr {
+                seq_number: LOCAL_SEQ + 1 + 6 * i,
+                ack_number: Some(REMOTE_SEQ + 1),
+                payload,
+                ..RECV_TEMPL
+            }));
+        }
+        assert!(s.sack_scoreboard.is_empty());
+    }
+
+    #[test]
+    fn test_sack_ingest_rejects_malformed_and_hostile_blocks() {
+        let mut s = socket_with_four_segments_in_flight();
+
+        // A pile of garbage: inverted, stale (below SND.UNA), entirely
+        // beyond what we ever sent. None of it may panic or populate the
+        // scoreboard.
+        send!(s, time 1050, TcpRepr {
+            seq_number: REMOTE_SEQ + 1,
+            ack_number: Some(LOCAL_SEQ + 1),
+            sack_ranges: [
+                sack_block(LOCAL_SEQ + 1 + 12, LOCAL_SEQ + 1 + 6),
+                sack_block(LOCAL_SEQ - 20, LOCAL_SEQ + 1),
+                sack_block(LOCAL_SEQ + 1 + 5000, LOCAL_SEQ + 9000),
+            ],
+            ..SEND_TEMPL
+        });
+        assert!(s.sack_scoreboard.is_empty());
+
+        // A block straddling SND.UNA must be trimmed, not rejected, and a
+        // block overrunning the buffered data must be clamped to it.
+        send!(s, time 1055, TcpRepr {
+            seq_number: REMOTE_SEQ + 1,
+            ack_number: Some(LOCAL_SEQ + 1),
+            sack_ranges: [
+                sack_block(LOCAL_SEQ - 5, LOCAL_SEQ + 1 + 6),
+                sack_block(LOCAL_SEQ + 1 + 18, LOCAL_SEQ + 1 + 90),
+                None,
+            ],
+            ..SEND_TEMPL
+        });
+        let ranges: std::vec::Vec<_> = s.sack_scoreboard.iter_data().collect();
+        assert_eq!(ranges, std::vec![(0, 6), (18, 24)]);
+
+        // Scoreboard overflow: more disjoint ranges than the assembler can
+        // track are silently dropped (advisory data), never an error.
+        send!(s, time 1060, TcpRepr {
+            seq_number: REMOTE_SEQ + 1,
+            ack_number: Some(LOCAL_SEQ + 1),
+            sack_ranges: [
+                sack_block(LOCAL_SEQ + 1 + 8, LOCAL_SEQ + 1 + 9),
+                sack_block(LOCAL_SEQ + 1 + 11, LOCAL_SEQ + 1 + 12),
+                sack_block(LOCAL_SEQ + 1 + 14, LOCAL_SEQ + 1 + 15),
+            ],
+            ..SEND_TEMPL
+        });
+        assert!(!s.sack_scoreboard.is_empty());
+    }
+
+    #[test]
+    fn test_sack_recovery_across_sequence_wraparound() {
+        let mut s = socket_established();
+        s.remote_mss = 6;
+        // Park the connection 13 bytes before the 2^32 wrap so the four
+        // in-flight segments straddle it.
+        let una = TcpSeqNumber(-13);
+        s.local_seq_no = una;
+        s.remote_last_seq = una;
+        s.local_rx_last_ack = Some(una);
+
+        s.send_slice(b"xxxxxxyyyyyywwwwwwzzzzzz").unwrap();
+        for (i, payload) in [&b"xxxxxx"[..], b"yyyyyy", b"wwwwww", b"zzzzzz"]
+            .into_iter()
+            .enumerate()
+        {
+            recv!(s, time 1000 + i as i64 * 5, Ok(TcpRepr {
+                seq_number: una + 6 * i,
+                ack_number: Some(REMOTE_SEQ + 1),
+                payload,
+                ..RECV_TEMPL
+            }));
+        }
+
+        for t in [1050, 1055, 1060] {
+            send!(s, time t, TcpRepr {
+                seq_number: REMOTE_SEQ + 1,
+                ack_number: Some(una),
+                sack_ranges: [
+                    sack_block(una + 6, una + 12),
+                    sack_block(una + 18, una + 24),
+                    None,
+                ],
+                ..SEND_TEMPL
+            });
+        }
+
+        // Holes first, straddling the wrap…
+        recv!(s, time 1100, Ok(TcpRepr {
+            seq_number: una,
+            ack_number: Some(REMOTE_SEQ + 1),
+            payload:    &b"xxxxxx"[..],
+            ..RECV_TEMPL
+        }));
+        recv!(s, time 1105, Ok(TcpRepr {
+            seq_number: una + 12,
+            ack_number: Some(REMOTE_SEQ + 1),
+            payload:    &b"wwwwww"[..],
+            ..RECV_TEMPL
+        }));
+        // …then, under NoControl only, the redundant pass.
+        #[cfg(not(any(feature = "socket-tcp-cubic", feature = "socket-tcp-reno")))]
+        for (i, payload) in [&b"xxxxxx"[..], b"yyyyyy", b"wwwwww", b"zzzzzz"]
+            .into_iter()
+            .enumerate()
+        {
+            recv!(s, time 1110 + i as i64 * 5, Ok(TcpRepr {
+                seq_number: una + 6 * i,
+                ack_number: Some(REMOTE_SEQ + 1),
+                payload,
+                ..RECV_TEMPL
+            }));
+        }
+        recv_nothing!(s, time 1140);
+
+        send!(s, time 1200, TcpRepr {
+            seq_number: REMOTE_SEQ + 1,
+            ack_number: Some(una + 24),
+            ..SEND_TEMPL
+        });
+        assert!(s.sack_scoreboard.is_empty());
+        assert_eq!(s.tx_buffer.len(), 0);
     }
 
     #[test]

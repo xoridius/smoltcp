@@ -86,7 +86,15 @@ impl AnyController {
     // Parameters are unused in the `None` arm when no real controller is
     // compiled in, hence the impl-level `unused_variables` allow.
 
+    /// Whether this controller actively manages the send window. `false`
+    /// for `NoControl`, where the consumer has opted out of bandwidth
+    /// management entirely — loss recovery may then use opportunistic
+    /// redundancy, since nothing else bounds the pipe.
     #[inline]
+    pub fn manages_window(&self) -> bool {
+        !matches!(self, AnyController::None(_))
+    }
+
     pub fn window(&self) -> usize {
         match self {
             AnyController::None(_) => usize::MAX,

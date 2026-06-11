@@ -337,6 +337,36 @@ impl Assembler {
             }
         })
     }
+
+    /// Advance the assembler's window start by `n` bytes: everything below
+    /// the new start is discarded, consuming leading hole space first, then
+    /// leading data, repeatedly. Surviving ranges keep their position
+    /// relative to the new start.
+    ///
+    /// Used by the TCP sender's SACK scoreboard, where offset 0 is SND.UNA:
+    /// when the cumulative ACK advances, the whole window slides forward and
+    /// any ranges below the new SND.UNA are no longer interesting.
+    pub(crate) fn shift_front(&mut self, mut n: usize) {
+        while n > 0 {
+            let front = self.contigs[0];
+            if front.hole_size >= n {
+                self.contigs[0].hole_size -= n;
+                return;
+            }
+            n -= front.hole_size;
+            self.contigs[0].hole_size = 0;
+            if front.data_size == 0 {
+                // Assembler is empty; nothing left to consume.
+                return;
+            }
+            if front.data_size > n {
+                self.contigs[0].data_size -= n;
+                return;
+            }
+            n -= front.data_size;
+            self.remove_contig_at(0);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -703,5 +733,55 @@ mod test {
                 }
             }
         }
+    }
+
+    #[test]
+    fn test_shift_front_within_hole() {
+        let mut assr = contigs![(10, 4), (10, 4)];
+        assr.shift_front(0);
+        assert_eq!(assr, contigs![(10, 4), (10, 4)]);
+        assr.shift_front(6);
+        assert_eq!(assr, contigs![(4, 4), (10, 4)]);
+    }
+
+    #[test]
+    fn test_shift_front_into_data() {
+        let mut assr = contigs![(10, 4), (10, 4)];
+        // Consume the whole leading hole and one byte of data.
+        assr.shift_front(11);
+        assert_eq!(assr, contigs![(0, 3), (10, 4)]);
+    }
+
+    #[test]
+    fn test_shift_front_across_contigs() {
+        let mut assr = contigs![(10, 4), (10, 4)];
+        // Consume hole+data of the first contig and 5 of the next hole.
+        assr.shift_front(19);
+        assert_eq!(assr, contigs![(5, 4)]);
+    }
+
+    #[test]
+    fn test_shift_front_past_everything() {
+        let mut assr = contigs![(10, 4), (10, 4)];
+        assr.shift_front(1000);
+        assert_eq!(assr, contigs![]);
+        assert!(assr.is_empty());
+        // Shifting an empty assembler is a no-op.
+        assr.shift_front(7);
+        assert!(assr.is_empty());
+        // And it can be reused afterwards.
+        assert_eq!(assr.add(3, 2), Ok(()));
+        assert_eq!(assr, contigs![(3, 2)]);
+    }
+
+    #[test]
+    fn test_shift_front_exact_boundaries() {
+        let mut assr = contigs![(10, 4), (10, 4)];
+        // Exactly the leading hole: data moves to the front.
+        assr.shift_front(10);
+        assert_eq!(assr, contigs![(0, 4), (10, 4)]);
+        // Exactly the leading data: next contig becomes the front.
+        assr.shift_front(4);
+        assert_eq!(assr, contigs![(10, 4)]);
     }
 }
