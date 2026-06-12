@@ -6,7 +6,6 @@ use core::mem::size_of;
 
 #[test]
 fn print_sizes() {
-    use smoltcp::socket;
     use smoltcp::storage::*;
     use smoltcp::wire::*;
 
@@ -17,10 +16,14 @@ fn print_sizes() {
     }
 
     println!("\n--- smoltcp footprint ---");
-    row!(socket::tcp::Socket<'static>);
-    row!(socket::udp::Socket<'static>);
-    row!(socket::icmp::Socket<'static>);
-    row!(socket::raw::Socket<'static>);
+    #[cfg(feature = "socket-tcp")]
+    row!(smoltcp::socket::tcp::Socket<'static>);
+    #[cfg(feature = "socket-udp")]
+    row!(smoltcp::socket::udp::Socket<'static>);
+    #[cfg(feature = "socket-icmp")]
+    row!(smoltcp::socket::icmp::Socket<'static>);
+    #[cfg(feature = "socket-raw")]
+    row!(smoltcp::socket::raw::Socket<'static>);
     row!(IpAddress);
     row!(IpEndpoint);
     row!(IpRepr);

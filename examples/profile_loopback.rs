@@ -321,11 +321,7 @@ impl Histo {
     }
 
     fn mean(&self) -> u64 {
-        if self.samples == 0 {
-            0
-        } else {
-            self.sum_ns / self.samples
-        }
+        self.sum_ns.checked_div(self.samples).unwrap_or(0)
     }
 }
 
@@ -3065,10 +3061,12 @@ fn print_socket_sizes() {
         "  UDP socket:             {:>6}",
         size_of::<socket::udp::Socket>()
     );
+    #[cfg(feature = "socket-icmp")]
     println!(
         "  ICMP socket:            {:>6}",
         size_of::<socket::icmp::Socket>()
     );
+    #[cfg(feature = "socket-raw")]
     println!(
         "  Raw socket:             {:>6}",
         size_of::<socket::raw::Socket>()
@@ -3125,8 +3123,7 @@ fn main() {
 
     // Many-flow shapes interpret args[2] as the flow count and args[3] as the
     // offload flag; single-flow shapes interpret args[2] directly as offload.
-    // Pool-aware shapes use args[2]/args[3]
-    // for their own knobs; offload is interpreted positionally per shape.
+    // Pool-aware shapes reserve positional knobs before the offload flag.
     let (n_flows, offload) = if shape.starts_with("many_") {
         let n: usize = args
             .get(2)
@@ -3134,8 +3131,9 @@ fn main() {
             .unwrap_or(100)
             .max(1);
         (Some(n), is_offload(args.get(3).map(String::as_str)))
-    } else if matches!(shape, "multi_tcp" | "multi_tcp_sink" | "churn" | "idle_hot") {
-        // For these shapes, offload is the 5th positional argument.
+    } else if shape == "churn" {
+        (None, is_offload(args.get(3).map(String::as_str)))
+    } else if matches!(shape, "multi_tcp" | "multi_tcp_sink" | "idle_hot") {
         (None, is_offload(args.get(4).map(String::as_str)))
     } else {
         (None, is_offload(args.get(2).map(String::as_str)))
