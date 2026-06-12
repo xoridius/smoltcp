@@ -382,6 +382,11 @@ fn pool_overcommit_falls_back_to_zero() {
 }
 
 #[test]
+fn impossible_initial_allocation_is_fallible() {
+    assert!(super::super::try_zeroed_socket_storage(usize::MAX).is_none());
+}
+
+#[test]
 fn win_shift_uses_max_not_current() {
     // The negotiated window scale must accommodate any future
     // growth, so it tracks rx_max, not the current (possibly tiny)

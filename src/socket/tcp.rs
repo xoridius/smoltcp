@@ -596,6 +596,11 @@ bitflags::bitflags! {
         /// (`NoControl` only — see `manages_window`). While set, the
         /// SACK skip/clamp logic is suspended.
         const SACK_REDUNDANT_PASS    = 1 << 6;
+        /// We advertised SACK-permitted to the peer, so incoming SACK
+        /// blocks are valid for this connection. This is intentionally
+        /// separate from `REMOTE_HAS_SACK`, which controls whether we may
+        /// send SACK blocks to the peer.
+        const LOCAL_HAS_SACK         = 1 << 7;
     }
 }
 
@@ -624,6 +629,16 @@ const MAX_WIN_SHIFT: u8 = 14;
 fn win_shift_for_capacity(cap: usize) -> u8 {
     let cap_log2 = mem::size_of::<usize>() * 8 - cap.leading_zeros() as usize;
     (cap_log2.saturating_sub(16) as u8).min(MAX_WIN_SHIFT)
+}
+
+#[cfg(feature = "socket-tcp-dynamic-buffer")]
+fn try_zeroed_socket_storage(capacity: usize) -> Option<alloc::vec::Vec<u8>> {
+    let mut storage = alloc::vec::Vec::new();
+    if storage.try_reserve_exact(capacity).is_err() {
+        return None;
+    }
+    storage.resize(capacity, 0);
+    Some(storage)
 }
 
 impl<'a> Socket<'a> {
@@ -712,7 +727,6 @@ impl<'a> Socket<'a> {
     #[cfg(feature = "socket-tcp-dynamic-buffer")]
     pub fn new_dynamic(config: DynamicBufferConfig, pool: Option<MemoryPool>) -> Socket<'a> {
         use alloc::boxed::Box;
-        use alloc::vec;
 
         // The RFC 1323 effective-window cap is 2^30 (1 GiB) — enforce on
         // BOTH directions, not just rx. Without this cap, callers passing
@@ -746,16 +760,24 @@ impl<'a> Socket<'a> {
         // target (32-bit usize maxes at 2^32); saturating_add is
         // defensive in case the per-direction caps above are ever
         // loosened past the RFC limit.
-        let mut rx_capacity = rx_initial;
-        let mut tx_capacity = tx_initial;
         let charge = rx_initial.saturating_add(tx_initial);
-        if !state.charge(charge) {
-            rx_capacity = 0;
-            tx_capacity = 0;
-        }
+        let (rx_storage, tx_storage) = if state.charge(charge) {
+            match (
+                try_zeroed_socket_storage(rx_initial),
+                try_zeroed_socket_storage(tx_initial),
+            ) {
+                (Some(rx_storage), Some(tx_storage)) => (rx_storage, tx_storage),
+                _ => {
+                    state.refund(charge);
+                    (alloc::vec::Vec::new(), alloc::vec::Vec::new())
+                }
+            }
+        } else {
+            (alloc::vec::Vec::new(), alloc::vec::Vec::new())
+        };
 
-        let rx_buffer = SocketBuffer::new(vec![0u8; rx_capacity]);
-        let tx_buffer = SocketBuffer::new(vec![0u8; tx_capacity]);
+        let rx_buffer = SocketBuffer::new(rx_storage);
+        let tx_buffer = SocketBuffer::new(tx_storage);
 
         let mut sock = Socket::new(rx_buffer, tx_buffer);
         // Override the window-scale shift: it must be sized for `rx_max`,
@@ -1317,7 +1339,9 @@ impl<'a> Socket<'a> {
         self.assembler = Assembler::new();
         self.sack_scoreboard = Assembler::new();
         self.recovery_point = None;
+        self.flags.remove(Flags::REMOTE_HAS_SACK);
         self.flags.remove(Flags::SACK_REDUNDANT_PASS);
+        self.flags.remove(Flags::LOCAL_HAS_SACK);
         self.tx_buffer.clear();
         self.rx_buffer.clear();
         self.flags.set(Flags::RX_FIN_RECEIVED, false);
@@ -1480,6 +1504,7 @@ impl<'a> Socket<'a> {
             local: local_endpoint,
             remote: remote_endpoint,
         });
+        self.flags.insert(Flags::LOCAL_HAS_SACK);
         self.set_state(State::SynSent);
 
         let seq = Self::random_seq_no(cx);
@@ -2373,6 +2398,7 @@ impl<'a> Socket<'a> {
                 self.remote_seq_no = repr.seq_number + 1;
                 self.remote_last_seq = self.local_seq_no;
                 self.flags.set(Flags::REMOTE_HAS_SACK, repr.sack_permitted);
+                self.flags.set(Flags::LOCAL_HAS_SACK, repr.sack_permitted);
                 self.remote_win_scale = repr.window_scale;
                 // Remote doesn't support window scaling, don't do it.
                 if self.remote_win_scale.is_none() {
@@ -2621,9 +2647,14 @@ impl<'a> Socket<'a> {
             // then restore invariant I1 — the cumulative-ACK slide above can
             // leave the first scoreboard range at offset 0 with the cursor
             // on it, and fresh blocks can land on the cursor as well.
-            if !self.sack_scoreboard.is_empty() || repr.sack_ranges.iter().any(|r| r.is_some()) {
+            let has_sack_ranges = repr.sack_ranges.iter().any(|r| r.is_some());
+            if self.flags.contains(Flags::LOCAL_HAS_SACK)
+                && (!self.sack_scoreboard.is_empty() || has_sack_ranges)
+            {
                 self.ingest_sack_ranges(&repr.sack_ranges);
                 self.normalize_tx_cursor();
+            } else if has_sack_ranges {
+                net_debug!("ignoring SACK blocks because SACK was not locally advertised");
             }
 
             match self.recovery_point {
@@ -7423,6 +7454,7 @@ mod test {
     /// Send 4 × 6-byte segments on an established socket and emit them.
     fn socket_with_four_segments_in_flight() -> TestSocket {
         let mut s = socket_established();
+        s.flags.insert(Flags::LOCAL_HAS_SACK);
         s.remote_mss = 6;
         send!(s, time 0, TcpRepr {
             seq_number: REMOTE_SEQ + 1,
@@ -7600,8 +7632,34 @@ mod test {
     }
 
     #[test]
+    fn test_sack_ignored_when_not_locally_advertised() {
+        let mut s = socket_with_four_segments_in_flight();
+        s.flags.remove(Flags::LOCAL_HAS_SACK);
+
+        send!(s, time 1050, TcpRepr {
+            seq_number: REMOTE_SEQ + 1,
+            ack_number: Some(LOCAL_SEQ + 1),
+            sack_ranges: [
+                sack_block(LOCAL_SEQ + 1 + 6, LOCAL_SEQ + 1 + 12),
+                None,
+                None,
+            ],
+            ..SEND_TEMPL
+        });
+
+        assert!(s.sack_scoreboard.is_empty());
+        recv!(s, time 5000, Ok(TcpRepr {
+            seq_number: LOCAL_SEQ + 1,
+            ack_number: Some(REMOTE_SEQ + 1),
+            payload:    &b"xxxxxx"[..],
+            ..RECV_TEMPL
+        }));
+    }
+
+    #[test]
     fn test_sack_all_outstanding_sacked_solicits_ack_and_rearms_rto() {
         let mut s = socket_established();
+        s.flags.insert(Flags::LOCAL_HAS_SACK);
         s.remote_mss = 6;
         send!(s, time 0, TcpRepr {
             seq_number: REMOTE_SEQ + 1,
@@ -7761,6 +7819,7 @@ mod test {
     #[test]
     fn test_sack_recovery_across_sequence_wraparound() {
         let mut s = socket_established();
+        s.flags.insert(Flags::LOCAL_HAS_SACK);
         s.remote_mss = 6;
         // Park the connection 13 bytes before the 2^32 wrap so the four
         // in-flight segments straddle it.
