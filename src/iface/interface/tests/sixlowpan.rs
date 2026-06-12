@@ -24,6 +24,87 @@ fn ieee802154_wrong_pan_id(#[case] medium: Medium) {
     );
 }
 
+#[test]
+#[cfg(all(
+    feature = "medium-ieee802154",
+    feature = "proto-sixlowpan-fragmentation"
+))]
+fn fragmented_sixlowpan_without_link_layer_addresses_is_dropped() {
+    let (mut iface, mut sockets, _device) = setup(Medium::Ieee802154);
+    let ieee802154_repr = Ieee802154Repr {
+        frame_type: Ieee802154FrameType::Data,
+        security_enabled: false,
+        frame_pending: false,
+        ack_request: false,
+        sequence_number: Some(1),
+        pan_id_compression: false,
+        frame_version: Ieee802154FrameVersion::Ieee802154,
+        dst_pan_id: None,
+        dst_addr: None,
+        src_pan_id: None,
+        src_addr: None,
+    };
+    let first_fragment = [0xc0, 0x28, 0x00, 0x01];
+
+    assert_eq!(
+        iface.inner.process_sixlowpan(
+            &mut sockets,
+            PacketMeta::default(),
+            &ieee802154_repr,
+            &first_fragment,
+            &mut iface.fragments,
+        ),
+        None
+    );
+}
+
+#[test]
+#[cfg(all(
+    feature = "medium-ieee802154",
+    feature = "socket-raw",
+    feature = "proto-sixlowpan"
+))]
+fn raw_ipv6_over_sixlowpan_is_emitted_uncompressed() {
+    let (mut iface, _sockets, mut device) = setup(Medium::Ieee802154);
+    let raw_payload = [0xde, 0xad, 0xbe, 0xef];
+    let tx_token = device.transmit(Instant::now()).unwrap();
+
+    iface.inner.dispatch_ieee802154(
+        Ieee802154Address::default(),
+        tx_token,
+        PacketMeta::default(),
+        Packet::new_ipv6(
+            Ipv6Repr {
+                src_addr: Ipv6Address::new(0xfe80, 0, 0, 0, 0, 0, 0xfffe, 0),
+                dst_addr: Ipv6Address::new(0xfe80, 0, 0, 0, 0, 0, 0xfffe, 0),
+                next_header: IpProtocol::Unknown(253),
+                payload_len: raw_payload.len(),
+                hop_limit: 64,
+            },
+            IpPayload::Raw(&raw_payload),
+        ),
+        &mut iface.fragmenter,
+    );
+
+    let frame_bytes = device.tx_queue.pop_front().unwrap();
+    let frame = Ieee802154Frame::new_checked(&frame_bytes[..]).unwrap();
+    let frame_repr = Ieee802154Repr::parse(&frame).unwrap();
+    let iphc = SixlowpanIphcPacket::new_checked(frame.payload().unwrap()).unwrap();
+    let iphc_repr = SixlowpanIphcRepr::parse(
+        &iphc,
+        frame_repr.src_addr,
+        frame_repr.dst_addr,
+        &iface.inner.sixlowpan_address_context,
+    )
+    .unwrap();
+
+    assert_eq!(
+        iphc_repr.next_header,
+        SixlowpanNextHeader::Uncompressed(IpProtocol::Unknown(253))
+    );
+    assert_eq!(iphc.payload(), raw_payload);
+}
+
 #[rstest]
 #[case::ieee802154(Medium::Ieee802154)]
 #[cfg(feature = "medium-ieee802154")]

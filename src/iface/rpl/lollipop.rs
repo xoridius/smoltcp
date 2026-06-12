@@ -59,7 +59,7 @@ impl PartialEq for SequenceCounter {
         {
             false
         } else {
-            let result = if a > b { a - b } else { b - a };
+            let result = a.abs_diff(b);
 
             if result <= super::consts::SEQUENCE_WINDOW as usize {
                 // RFC1982
@@ -95,7 +95,7 @@ impl PartialOrd for SequenceCounter {
         } else if ((0..128).contains(&a) && (0..128).contains(&b))
             || ((128..256).contains(&a) && (128..256).contains(&b))
         {
-            let result = if a > b { a - b } else { b - a };
+            let result = a.abs_diff(b);
 
             if result <= SEQUENCE_WINDOW as usize {
                 // RFC1982

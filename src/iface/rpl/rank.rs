@@ -10,12 +10,12 @@
 //!
 //! Meaning of the comparison:
 //! - **Rank M is less than Rank N**: the position of M is closer to the DODAG root than the position
-//! of N. Node M may safely be a DODAG parent for node N.
+//!   of N. Node M may safely be a DODAG parent for node N.
 //! - **Ranks are equal**: the positions of both nodes within the DODAG and with respect to the DODAG
-//! are similar or identical. Routing through a node with equal Rank may cause a routing loop.
+//!   are similar or identical. Routing through a node with equal Rank may cause a routing loop.
 //! - **Rank M is greater than Rank N**: the position of node M is farther from the DODAG root
-//! than the position of N. Node M may in fact be in the sub-DODAG of node N. If node N selects
-//! node M as a DODAG parent, there is a risk of creating a loop.
+//!   than the position of N. Node M may in fact be in the sub-DODAG of node N. If node N selects
+//!   node M as a DODAG parent, there is a risk of creating a loop.
 
 use super::consts::DEFAULT_MIN_HOP_RANK_INCREASE;
 

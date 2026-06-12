@@ -120,9 +120,28 @@ impl InterfaceInner {
             return None;
         }
 
+        let (ll_src_addr, ll_dst_addr) = match (ieee802154_repr.src_addr, ieee802154_repr.dst_addr)
+        {
+            (Some(src), Some(dst))
+                if !matches!(src, Ieee802154Address::Absent)
+                    && !matches!(dst, Ieee802154Address::Absent) =>
+            {
+                (src, dst)
+            }
+            _ => {
+                net_debug!("6LoWPAN: fragmented packet missing link-layer addresses");
+                return None;
+            }
+        };
+
         // The key specifies to which 6LoWPAN fragment it belongs too.
         // It is based on the link layer addresses, the tag and the size.
-        let key = FragKey::Sixlowpan(frag.get_key(ieee802154_repr));
+        let key = FragKey::Sixlowpan(SixlowpanFragKey {
+            ll_src_addr,
+            ll_dst_addr,
+            datagram_size: frag.datagram_size(),
+            datagram_tag: frag.datagram_tag(),
+        });
 
         // The offset of this fragment in increments of 8 octets.
         let offset = frag.datagram_offset() as usize * 8;
@@ -202,6 +221,15 @@ impl InterfaceInner {
         total_len: Option<usize>,
         buffer: &mut [u8],
     ) -> Result<usize> {
+        if let Some(total_len) = total_len
+            && total_len < 40
+        {
+            return Err(Error);
+        }
+        if buffer.len() < 40 {
+            return Err(Error);
+        }
+
         let iphc = SixlowpanIphcPacket::new_checked(iphc_payload)?;
         let iphc_repr = SixlowpanIphcRepr::parse(
             &iphc,
@@ -282,7 +310,10 @@ impl InterfaceInner {
             src_addr: iphc_repr.src_addr,
             dst_addr: iphc_repr.dst_addr,
             next_header: decompress_next_header(iphc_repr.next_header, iphc.payload())?,
-            payload_len: total_len.unwrap_or(payload_len) - 40,
+            payload_len: total_len
+                .unwrap_or(payload_len)
+                .checked_sub(40)
+                .ok_or(Error)?,
             hop_limit: iphc_repr.hop_limit,
         };
         ipv6_repr.emit(&mut ipv6_header);
@@ -425,7 +456,9 @@ impl InterfaceInner {
         ieee_repr: &Ieee802154Repr,
         mut buffer: &mut [u8],
     ) {
-        let last_header = packet.payload.as_sixlowpan_next_header();
+        let last_header = packet
+            .payload
+            .as_sixlowpan_next_header(packet.header.next_header);
         let next_header = last_header;
 
         #[cfg(feature = "proto-ipv6-hbh")]
@@ -543,7 +576,7 @@ impl InterfaceInner {
                 );
             }
             #[cfg(feature = "socket-raw")]
-            IpPayload::Raw(_raw) => todo!(),
+            IpPayload::Raw(raw) => buffer[..raw.len()].copy_from_slice(raw),
 
             #[allow(unreachable_patterns)]
             _ => unreachable!(),
@@ -560,7 +593,9 @@ impl InterfaceInner {
         packet: &PacketV6,
         ieee_repr: &Ieee802154Repr,
     ) -> (usize, usize, usize) {
-        let last_header = packet.payload.as_sixlowpan_next_header();
+        let last_header = packet
+            .payload
+            .as_sixlowpan_next_header(packet.header.next_header);
         let next_header = last_header;
 
         #[cfg(feature = "proto-ipv6-hbh")]
@@ -762,7 +797,9 @@ fn decompress_udp(
         return Err(Error);
     }
     let udp_payload_len = if let Some(total_len) = total_len {
-        total_len - *payload_len - 8
+        total_len
+            .checked_sub(payload_len.checked_add(8).ok_or(Error)?)
+            .ok_or(Error)?
     } else {
         payload.len()
     };
@@ -772,6 +809,91 @@ fn decompress_udp(
     udp_repr.0.emit_header(&mut udp, udp_payload_len);
     buffer[8..][..payload.len()].copy_from_slice(payload);
     Ok(())
+}
+
+#[cfg(test)]
+mod safety_tests {
+    use super::*;
+
+    fn ieee_repr() -> Ieee802154Repr {
+        Ieee802154Repr {
+            frame_type: Ieee802154FrameType::Data,
+            security_enabled: false,
+            frame_pending: false,
+            ack_request: false,
+            sequence_number: Some(1),
+            pan_id_compression: true,
+            frame_version: Ieee802154FrameVersion::Ieee802154_2003,
+            dst_pan_id: Some(Ieee802154Pan(0xbeef)),
+            dst_addr: Some(Ieee802154Address::default()),
+            src_pan_id: Some(Ieee802154Pan(0xbeef)),
+            src_addr: Some(Ieee802154Address::default()),
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "proto-sixlowpan")]
+    fn sixlowpan_decompress_rejects_too_small_ipv6_total_length() {
+        let mut buffer = [0u8; 64];
+
+        assert!(
+            InterfaceInner::sixlowpan_to_ipv6(&[], &ieee_repr(), &[], Some(39), &mut buffer,)
+                .is_err()
+        );
+
+        assert!(
+            InterfaceInner::sixlowpan_to_ipv6(&[], &ieee_repr(), &[], None, &mut buffer[..39],)
+                .is_err()
+        );
+    }
+
+    #[test]
+    #[cfg(all(feature = "proto-sixlowpan", feature = "socket-udp"))]
+    fn sixlowpan_decompress_rejects_impossible_fragment_udp_length() {
+        let ieee_repr = ieee_repr();
+        let packet = PacketV6 {
+            header: Ipv6Repr {
+                src_addr: Ipv6Address::new(0xfe80, 0, 0, 0, 0, 0, 0xfffe, 0),
+                dst_addr: Ipv6Address::new(0xfe80, 0, 0, 0, 0, 0, 0xfffe, 0),
+                next_header: IpProtocol::Udp,
+                payload_len: 8,
+                hop_limit: 64,
+            },
+            #[cfg(feature = "proto-ipv6-hbh")]
+            hop_by_hop: None,
+            #[cfg(feature = "proto-ipv6-fragmentation")]
+            fragment: None,
+            #[cfg(feature = "proto-ipv6-routing")]
+            routing: None,
+            payload: IpPayload::Udp(
+                UdpRepr {
+                    src_port: 0xf0b0,
+                    dst_port: 0xf0b1,
+                },
+                &[],
+            ),
+        };
+        let (compressed_len, _, _) = InterfaceInner::compressed_packet_size(&packet, &ieee_repr);
+        let mut compressed = vec![0u8; compressed_len];
+        InterfaceInner::ipv6_to_sixlowpan(
+            &ChecksumCapabilities::default(),
+            packet,
+            &ieee_repr,
+            &mut compressed,
+        );
+
+        let mut decompressed = [0u8; 64];
+        assert!(
+            InterfaceInner::sixlowpan_to_ipv6(
+                &[],
+                &ieee_repr,
+                &compressed,
+                Some(47),
+                &mut decompressed,
+            )
+            .is_err()
+        );
+    }
 }
 
 #[cfg(test)]
@@ -863,7 +985,18 @@ mod tests {
             src_addr: Some(Ieee802154Address::Extended([0, 3, 0, 3, 0, 3, 0, 3])),
         };
 
-        let mut ip_packet = PacketV6 {
+        let icmp_payload = Icmpv6Repr::Rpl(RplRepr::DestinationAdvertisementObject {
+            rpl_instance_id: RplInstanceId::Global(30),
+            expect_ack: false,
+            sequence: 241,
+            dodag_id: Some(Ipv6Address::from_octets([
+                253, 0, 0, 0, 0, 0, 0, 0, 2, 1, 0, 1, 0, 1, 0, 1,
+            ])),
+            options: &[],
+        });
+        let payload_len = icmp_payload.buffer_len();
+
+        let ip_packet = PacketV6 {
             header: Ipv6Repr {
                 src_addr: Ipv6Address::from_octets([
                     253, 0, 0, 0, 0, 0, 0, 0, 2, 3, 0, 3, 0, 3, 0, 3,
@@ -872,7 +1005,7 @@ mod tests {
                     253, 0, 0, 0, 0, 0, 0, 0, 2, 1, 0, 1, 0, 1, 0, 1,
                 ]),
                 next_header: IpProtocol::Icmpv6,
-                payload_len: 66,
+                payload_len,
                 hop_limit: 64,
             },
             #[cfg(feature = "proto-ipv6-hbh")]
@@ -881,18 +1014,10 @@ mod tests {
             fragment: None,
             #[cfg(feature = "proto-ipv6-routing")]
             routing: None,
-            payload: IpPayload::Icmpv6(Icmpv6Repr::Rpl(RplRepr::DestinationAdvertisementObject {
-                rpl_instance_id: RplInstanceId::Global(30),
-                expect_ack: false,
-                sequence: 241,
-                dodag_id: Some(Ipv6Address::from_octets([
-                    253, 0, 0, 0, 0, 0, 0, 0, 2, 1, 0, 1, 0, 1, 0, 1,
-                ])),
-                options: &[],
-            })),
+            payload: IpPayload::Icmpv6(icmp_payload),
         };
 
-        let (total_size, _, _) = InterfaceInner::compressed_packet_size(&mut ip_packet, &ieee_repr);
+        let (total_size, _, _) = InterfaceInner::compressed_packet_size(&ip_packet, &ieee_repr);
         let mut buffer = vec![0u8; total_size];
 
         InterfaceInner::ipv6_to_sixlowpan(
@@ -903,16 +1028,13 @@ mod tests {
         );
 
         let result = [
-            0x7e, 0x0, 0xfd, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x2, 0x3, 0x0, 0x3, 0x0, 0x3, 0x0,
-            0x3, 0xfd, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x2, 0x1, 0x0, 0x1, 0x0, 0x1, 0x0, 0x1,
-            0xe0, 0x3a, 0x6, 0x63, 0x4, 0x0, 0x1e, 0x3, 0x0, 0x9b, 0x2, 0x3e, 0x63, 0x1e, 0x40,
-            0x0, 0xf1, 0xfd, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x2, 0x1, 0x0, 0x1, 0x0, 0x1, 0x0,
-            0x1, 0x5, 0x12, 0x0, 0x80, 0xfd, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x2, 0x3, 0x0, 0x3,
-            0x0, 0x3, 0x0, 0x3, 0x6, 0x14, 0x0, 0x0, 0x0, 0x1e, 0xfd, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0,
+            0x7a, 0x0, 0x3a, 0xfd, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x2, 0x3, 0x0, 0x3, 0x0, 0x3,
+            0x0, 0x3, 0xfd, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x2, 0x1, 0x0, 0x1, 0x0, 0x1, 0x0,
+            0x1, 0x9b, 0x2, 0x48, 0x63, 0x1e, 0x40, 0x0, 0xf1, 0xfd, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0,
             0x0, 0x2, 0x1, 0x0, 0x1, 0x0, 0x1, 0x0, 0x1,
         ];
 
-        assert_eq!(&result, &result);
+        assert_eq!(&buffer[..total_size], &result);
     }
 
     #[test]
@@ -946,7 +1068,7 @@ mod tests {
             }))
             .unwrap();
 
-        let mut ip_packet = PacketV6 {
+        let ip_packet = PacketV6 {
             header: Ipv6Repr {
                 src_addr: addr,
                 dst_addr: parent_address,
@@ -976,7 +1098,7 @@ mod tests {
             })),
         };
 
-        let (total_size, _, _) = InterfaceInner::compressed_packet_size(&mut ip_packet, &ieee_repr);
+        let (total_size, _, _) = InterfaceInner::compressed_packet_size(&ip_packet, &ieee_repr);
         let mut buffer = vec![0u8; total_size];
 
         InterfaceInner::ipv6_to_sixlowpan(

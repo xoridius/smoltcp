@@ -577,7 +577,7 @@ impl<T: AsRef<[u8]>> UdpNhcPacket<T> {
                 let data = self.buffer.as_ref();
                 let start = self.nhc_fields_start();
 
-                0xf0b0 + (data[start] & 0xff) as u16
+                0xf0b0 + (data[start] & 0x0f) as u16
             }
             _ => unreachable!(),
         }
@@ -649,7 +649,7 @@ impl<T: AsRef<[u8]> + AsMut<[u8]>> UdpNhcPacket<T> {
                 // We can compress both the source and destination ports.
                 self.set_ports_field(0b11);
                 let data = self.buffer.as_mut();
-                data[idx] = (((src_port - 0xf0b0) as u8) << 4) & ((dst_port - 0xf0b0) as u8);
+                data[idx] = (((src_port - 0xf0b0) as u8) << 4) | ((dst_port - 0xf0b0) as u8);
             }
             (0xf000..=0xf0ff, _) => {
                 // We can compress the source port, but not the destination port.
@@ -905,5 +905,31 @@ mod test {
         assert_eq!(packet.src_port(), 0xf0b1);
         assert_eq!(packet.dst_port(), 0xf001);
         assert_eq!(packet.payload_mut(), b"Hello World!");
+    }
+
+    #[test]
+    fn udp_emit_compresses_both_four_bit_ports() {
+        let udp = UdpNhcRepr(UdpRepr {
+            src_port: 0xf0b1,
+            dst_port: 0xf0be,
+        });
+
+        let src_addr = ipv6::Address::UNSPECIFIED;
+        let dst_addr = ipv6::Address::UNSPECIFIED;
+        let len = udp.header_len();
+        let mut buffer = [0u8; 127];
+        let mut packet = UdpNhcPacket::new_unchecked(&mut buffer[..len]);
+        udp.emit(
+            &mut packet,
+            &src_addr,
+            &dst_addr,
+            0,
+            |_| {},
+            &ChecksumCapabilities::default(),
+        );
+
+        assert_eq!(packet.dispatch_field(), DISPATCH_UDP_HEADER);
+        assert_eq!(packet.src_port(), 0xf0b1);
+        assert_eq!(packet.dst_port(), 0xf0be);
     }
 }

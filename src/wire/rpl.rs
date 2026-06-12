@@ -6,7 +6,7 @@ use byteorder::{ByteOrder, NetworkEndian};
 
 use super::{Error, Result};
 use crate::wire::icmpv6::Packet;
-use crate::wire::ipv6::{Address, AddressExt};
+use crate::wire::ipv6::Address;
 
 #[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Clone, Copy)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
@@ -231,7 +231,7 @@ impl<T: AsRef<[u8]> + AsMut<[u8]>> Packet<T> {
     }
 }
 
-impl<'p, T: AsRef<[u8]> + AsMut<[u8]> + ?Sized> Packet<&'p mut T> {
+impl<T: AsRef<[u8]> + AsMut<[u8]> + ?Sized> Packet<&mut T> {
     /// Return a pointer to the options.
     pub fn options_mut(&mut self) -> &mut [u8] {
         match RplControlMessage::from(self.msg_code()) {
@@ -302,17 +302,13 @@ impl<T: AsRef<[u8]> + AsMut<[u8]>> Packet<T> {
 }
 
 enum_with_unknown! {
+    #[derive(Default)]
     pub enum ModeOfOperation(u8) {
         NoDownwardRoutesMaintained = 0x00,
         NonStoringMode = 0x01,
+        #[default]
         StoringModeWithoutMulticast = 0x02,
         StoringModeWithMulticast = 0x03,
-    }
-}
-
-impl Default for ModeOfOperation {
-    fn default() -> Self {
-        Self::StoringModeWithoutMulticast
     }
 }
 
@@ -869,7 +865,7 @@ pub mod options {
     use byteorder::{ByteOrder, NetworkEndian};
 
     use super::{Error, InstanceId, Result};
-    use crate::wire::ipv6::{Address, AddressExt};
+    use crate::wire::ipv6::Address;
 
     /// A read/write wrapper around a RPL Control Message Option.
     #[derive(Debug, Clone)]
@@ -922,7 +918,7 @@ pub mod options {
         pub const ROUTE_INFO_PREFIX_LENGTH: usize = 2;
         pub const ROUTE_INFO_RESERVED: usize = 3;
         pub const ROUTE_INFO_PREFERENCE: usize = 3;
-        pub const ROUTE_INFO_LIFETIME: Field = 4..9;
+        pub const ROUTE_INFO_LIFETIME: Field = 4..8;
 
         // DODAG Configuration fields.
         pub const DODAG_CONF_FLAGS: usize = 2;
@@ -983,11 +979,46 @@ pub mod options {
 
         #[inline]
         pub fn new_checked(buffer: T) -> Result<Self> {
-            if buffer.as_ref().is_empty() {
+            let packet = Packet { buffer };
+            packet.check_len()?;
+            Ok(packet)
+        }
+
+        /// Ensure that no accessor method will panic if called.
+        pub fn check_len(&self) -> Result<()> {
+            let buffer = self.buffer.as_ref();
+            if buffer.is_empty() {
                 return Err(Error);
             }
 
-            Ok(Packet { buffer })
+            let option_data_len = match self.option_type() {
+                OptionType::Pad1 => return Ok(()),
+                OptionType::Unknown(_) | OptionType::DagMetricContainer => return Err(Error),
+                _ if buffer.len() < 2 => return Err(Error),
+                _ => self.option_length() as usize,
+            };
+
+            if 2 + option_data_len > buffer.len() {
+                return Err(Error);
+            }
+
+            match self.option_type() {
+                OptionType::Pad1 => Ok(()),
+                OptionType::PadN => Ok(()),
+                OptionType::DagMetricContainer => Err(Error),
+                OptionType::RouteInformation if option_data_len >= 6 => Ok(()),
+                OptionType::DodagConfiguration if option_data_len >= 14 => Ok(()),
+                // RPL Target prefixes are currently represented as full IPv6
+                // addresses by Repr::RplTarget, so reject shorter/longer forms.
+                OptionType::RplTarget if option_data_len == 18 => Ok(()),
+                OptionType::TransitInformation if option_data_len == 4 || option_data_len >= 20 => {
+                    Ok(())
+                }
+                OptionType::SolicitedInformation if option_data_len >= 19 => Ok(()),
+                OptionType::PrefixInformation if option_data_len >= 30 => Ok(()),
+                OptionType::RplTargetDescriptor if option_data_len >= 4 => Ok(()),
+                _ => Err(Error),
+            }
         }
 
         /// Return the type field.
@@ -1007,17 +1038,15 @@ pub mod options {
         /// Return a pointer to the next option.
         #[inline]
         pub fn next_option(&self) -> Option<&'p [u8]> {
-            if !self.buffer.as_ref().is_empty() {
-                match self.option_type() {
-                    OptionType::Pad1 => Some(&self.buffer.as_ref()[1..]),
-                    OptionType::Unknown(_) => unreachable!(),
-                    _ => {
-                        let len = self.option_length();
-                        Some(&self.buffer.as_ref()[2 + len as usize..])
-                    }
-                }
-            } else {
-                None
+            let buffer = self.buffer.as_ref();
+            if buffer.is_empty() {
+                return None;
+            }
+
+            match self.option_type() {
+                OptionType::Pad1 => buffer.get(1..),
+                _ if buffer.len() < 2 => None,
+                _ => buffer.get(2 + self.option_length() as usize..),
             }
         }
     }
@@ -1044,8 +1073,6 @@ pub mod options {
             }
         }
     }
-
-    /// Getters for the DAG Metric Container Option Message.
 
     /// Getters for the Route Information Option Message.
     ///
@@ -1087,8 +1114,7 @@ pub mod options {
         #[inline]
         pub fn prefix(&self) -> &'p [u8] {
             let option_len = self.option_length();
-            &self.buffer.as_ref()[field::ROUTE_INFO_LIFETIME.end..]
-                [..option_len as usize - field::ROUTE_INFO_LIFETIME.end]
+            &self.buffer.as_ref()[field::ROUTE_INFO_LIFETIME.end..2 + option_len as usize]
         }
     }
 
@@ -1102,8 +1128,9 @@ pub mod options {
 
         /// Set the Route Preference field.
         #[inline]
-        pub fn set_route_info_route_preference(&mut self, _value: u8) {
-            todo!();
+        pub fn set_route_info_route_preference(&mut self, value: u8) {
+            let value = value & 0b11;
+            set!(self.buffer, value, field: field::ROUTE_INFO_PREFERENCE, shift: 3, mask: 0b11)
         }
 
         /// Set the Route Lifetime field.
@@ -1114,8 +1141,9 @@ pub mod options {
 
         /// Set the prefix field.
         #[inline]
-        pub fn set_route_info_prefix(&mut self, _prefix: &[u8]) {
-            todo!();
+        pub fn set_route_info_prefix(&mut self, prefix: &[u8]) {
+            self.buffer.as_mut()[field::ROUTE_INFO_LIFETIME.end..][..prefix.len()]
+                .copy_from_slice(prefix);
         }
 
         /// Clear the reserved field.
@@ -2035,10 +2063,12 @@ pub mod options {
 
     impl<'p> Repr<'p> {
         pub fn parse<T: AsRef<[u8]> + ?Sized>(packet: &Packet<&'p T>) -> Result<Self> {
+            packet.check_len()?;
+
             match packet.option_type() {
                 OptionType::Pad1 => Ok(Repr::Pad1),
                 OptionType::PadN => Ok(Repr::PadN(packet.option_length())),
-                OptionType::DagMetricContainer => todo!(),
+                OptionType::DagMetricContainer => Err(Error),
                 OptionType::RouteInformation => Ok(Repr::RouteInformation {
                     prefix_length: packet.prefix_length(),
                     preference: packet.route_preference(),
@@ -2060,7 +2090,7 @@ pub mod options {
                 OptionType::RplTarget => Ok(Repr::RplTarget {
                     prefix_length: packet.target_prefix_length(),
                     prefix: crate::wire::Ipv6Address::from_octets(
-                        packet.target_prefix().try_into().unwrap(),
+                        packet.target_prefix().try_into().map_err(|_| Error)?,
                     ),
                 }),
                 OptionType::TransitInformation => Ok(Repr::TransitInformation {
@@ -2404,6 +2434,80 @@ mod tests {
     use crate::wire::{icmpv6::*, *};
 
     #[test]
+    fn rpl_option_rejects_malformed_lengths() {
+        let truncated_dodag_conf = [0x04, 14, 0x00];
+        assert!(OptionPacket::new_checked(&truncated_dodag_conf[..]).is_err());
+        assert!(
+            OptionRepr::parse(&OptionPacket::new_unchecked(&truncated_dodag_conf[..])).is_err()
+        );
+
+        let unsupported_dag_metric = [0x02, 0x00];
+        assert!(OptionPacket::new_checked(&unsupported_dag_metric[..]).is_err());
+        assert!(
+            OptionRepr::parse(&OptionPacket::new_unchecked(&unsupported_dag_metric[..])).is_err()
+        );
+
+        let short_target_prefix = [0x05, 0x02, 0x00, 64];
+        assert!(OptionPacket::new_checked(&short_target_prefix[..]).is_err());
+        assert!(OptionRepr::parse(&OptionPacket::new_unchecked(&short_target_prefix[..])).is_err());
+    }
+
+    #[test]
+    fn rpl_route_information_option() {
+        // RFC 6550 §6.7.5: Type(1) Length(1) PrefixLength(1) Resvd|Prf|Resvd(1)
+        // RouteLifetime(4) Prefix(variable) — here a /64 prefix in 8 octets.
+        let data = [
+            0x03, 14, 64, 0x08, 0x12, 0x34, 0x56, 0x78, 0x20, 0x01, 0x0d, 0xb8, 0x00, 0x00, 0x00,
+            0x00,
+        ];
+
+        let packet = OptionPacket::new_checked(&data[..]).unwrap();
+        let repr = OptionRepr::parse(&packet).unwrap();
+        assert_eq!(
+            repr,
+            OptionRepr::RouteInformation {
+                prefix_length: 64,
+                preference: 1,
+                lifetime: 0x1234_5678,
+                prefix: &data[8..],
+            }
+        );
+        assert_eq!(repr.buffer_len(), data.len());
+
+        let mut buffer = [0xffu8; 16];
+        repr.emit(&mut OptionPacket::new_unchecked(&mut buffer[..]));
+        assert_eq!(buffer, data);
+
+        let high_preference = OptionRepr::RouteInformation {
+            prefix_length: 0,
+            preference: 0xff,
+            lifetime: 0,
+            prefix: &[],
+        };
+        let mut buffer = [0u8; 8];
+        high_preference.emit(&mut OptionPacket::new_unchecked(&mut buffer[..]));
+        assert_eq!(buffer[3], 0x18);
+
+        // The six fixed octets alone are a valid zero-length-prefix option ...
+        let no_prefix = [0x03, 6, 0, 0x00, 0x00, 0x00, 0x00, 0x2a];
+        let packet = OptionPacket::new_checked(&no_prefix[..]).unwrap();
+        assert_eq!(
+            OptionRepr::parse(&packet).unwrap(),
+            OptionRepr::RouteInformation {
+                prefix_length: 0,
+                preference: 0,
+                lifetime: 42,
+                prefix: &[],
+            }
+        );
+
+        // ... but a truncated lifetime is not.
+        let truncated = [0x03, 5, 64, 0x08, 0x00, 0x00, 0x00];
+        assert!(OptionPacket::new_checked(&truncated[..]).is_err());
+        assert!(OptionRepr::parse(&OptionPacket::new_unchecked(&truncated[..])).is_err());
+    }
+
+    #[test]
     fn dis_packet() {
         let data = [0x7a, 0x3b, 0x3a, 0x1a, 0x9b, 0x00, 0x00, 0x00, 0x00, 0x00];
 
@@ -2440,8 +2544,8 @@ mod tests {
             &mut buffer[..repr.buffer_len()],
         ));
         icmp_repr.emit(
-            &repr.src_addr.into(),
-            &repr.dst_addr.into(),
+            &repr.src_addr,
+            &repr.dst_addr,
             &mut Icmpv6Packet::new_unchecked(
                 &mut buffer[repr.buffer_len()..][..icmp_repr.buffer_len()],
             ),

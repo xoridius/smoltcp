@@ -228,7 +228,10 @@ pub(crate) enum IpPayload<'p> {
 
 impl<'p> IpPayload<'p> {
     #[cfg(feature = "proto-sixlowpan")]
-    pub(crate) fn as_sixlowpan_next_header(&self) -> SixlowpanNextHeader {
+    pub(crate) fn as_sixlowpan_next_header(
+        &self,
+        uncompressed_next_header: IpProtocol,
+    ) -> SixlowpanNextHeader {
         match self {
             #[cfg(feature = "proto-ipv4")]
             Self::Icmpv4(_) => unreachable!(),
@@ -245,7 +248,7 @@ impl<'p> IpPayload<'p> {
             #[cfg(any(feature = "socket-udp", feature = "socket-dns"))]
             Self::Udp(..) => SixlowpanNextHeader::Compressed,
             #[cfg(feature = "socket-raw")]
-            Self::Raw(_) => todo!(),
+            Self::Raw(_) => SixlowpanNextHeader::Uncompressed(uncompressed_next_header),
         }
     }
 }
