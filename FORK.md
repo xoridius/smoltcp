@@ -29,7 +29,8 @@ git push origin main
 ```
 
 Prefer fast-forward when possible. Never rebase published commits. Never
-force-push `main`.
+force-push `main`. §16 records which post-0.13.1 upstream PRs are already
+backported — do not re-apply those.
 
 After every sync, re-check `Cargo.toml`'s feature list against the test matrix
 in §3 — upstream occasionally adds or renames features.
@@ -1019,3 +1020,35 @@ netsim across 16 seeds at 32 KiB buffers — mean ±0% at 2% loss, +6% at
 with the RTO tail eliminated, byte-exact. Clean-path throughput
 unchanged. RACK-TLP and pacing remain out of scope (§11) until profile
 evidence demands them.
+
+## 16. Backported post-0.13.1 upstream changes
+
+The fork was seeded from `v0.13.1`. The changes below were cherry-picked
+from upstream commits that landed on `upstream/main` after that tag. A
+future maintainer reconciling against upstream should treat these as
+already present and avoid re-applying them. Each fork commit names the
+upstream PR/commit it came from.
+
+| Upstream PR | What | Fork adaptation |
+|---|---|---|
+| #1150 | `PacketBuffer`: reserve metadata slot before payload closure | verbatim |
+| #1152 | `#[collapse_debuginfo]` on logging macros | verbatim |
+| #1159 | deterministic `config.rs` via `BTreeMap` | verbatim |
+| #1162 + #1164 | out-of-window RX: drop OOW RST, exempt OOW data ACKs from rate limiting | verbatim production change; netsim snapshot rebaselined |
+| #1161 | effective MSS subtracts options length; `MIN_REMOTE_MSS` clamp | adapted for `remote_mss: u32`; preserves the adjacent SACK clamp |
+| #1154 / #1156 / #1157 + RTT parts of #1155 | RFC-compliant congestion-control redesign (new Controller API, Reno/CUBIC fast recovery, RTT estimator `on_rto`/`on_retransmit` split, `smoothed_rtt`) | u32 window fields, RFC 6928 IW10, and RFC 793 rwnd-shrink re-applied on top; static-dispatch `AnyController` wrappers retained; CUBIC CA increment computed in u64 to avoid u32 overflow |
+
+Deliberately **not** taken:
+
+- The dispatch-side fast-retransmit rework in #1155
+  (`pending_fast_retransmit` + single-segment resend from `flight_size()`).
+  The fork's SACK selective retransmission (§15) is a strictly more
+  capable loss-recovery path occupying the same dispatch region; the new
+  congestion controllers supply the cwnd dynamics that recovery defers to.
+- The fuzz-suite revamp (#1143) — the fork carries its own suite (§7.1).
+- The netsim harness rewrite / multiflow test (#1153) — its snapshots are
+  upstream-stack throughput fingerprints that do not match this fork.
+
+Still ahead of upstream (candidates to upstream per §12): RFC 793 rwnd
+shrink tracking in `set_remote_window` (upstream's redesigned Reno/CUBIC
+are still grow-only) and RFC 6928 IW10 in `set_mss`.
