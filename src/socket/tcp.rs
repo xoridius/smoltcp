@@ -202,6 +202,11 @@ impl RttEstimator {
         Duration::from_millis(self.rto as _)
     }
 
+    #[cfg(feature = "socket-tcp-cubic")]
+    fn smoothed_rtt(&self) -> u32 {
+        if self.have_measurement { self.srtt } else { 0 }
+    }
+
     fn sample(&mut self, new_rtt: u32) {
         if self.have_measurement {
             // RFC 6298 (2.3) When a subsequent RTT measurement R' is made, a host MUST set (...)
@@ -253,12 +258,7 @@ impl RttEstimator {
         }
     }
 
-    fn on_retransmit(&mut self) {
-        if self.timestamp.is_some() {
-            tcp_trace!("rtte: abort sampling due to retransmit");
-        }
-        self.timestamp = None;
-
+    fn on_rto(&mut self) {
         // RFC 6298 (5.5) The host MUST set RTO <- RTO * 2 ("back off the timer").  The
         // maximum value discussed in (2.5) above may be used to provide
         // an upper bound to this doubling operation.
@@ -276,6 +276,13 @@ impl RttEstimator {
             self.have_measurement = false;
             tcp_trace!("rtte: too many retransmissions, clearing srtt, rttvar.");
         }
+    }
+
+    fn on_retransmit(&mut self) {
+        if self.timestamp.is_some() {
+            tcp_trace!("rtte: abort sampling due to retransmit");
+        }
+        self.timestamp = None;
     }
 }
 
@@ -2374,10 +2381,6 @@ impl<'a> Socket<'a> {
 
                 ack_all = self.remote_last_seq <= ack_number;
             }
-
-            self.rtte.on_ack(cx.now(), ack_number);
-            self.congestion_controller
-                .on_ack(cx.now(), ack_len, &self.rtte);
         }
 
         // Disregard control flags we don't care about or shouldn't act on yet.
@@ -2634,9 +2637,6 @@ impl<'a> Socket<'a> {
                     // Increment duplicate ACK count
                     self.local_rx_dup_acks = self.local_rx_dup_acks.saturating_add(1);
 
-                    // Inform congestion controller of duplicate ACK
-                    self.congestion_controller.on_duplicate_ack(cx.now());
-
                     net_debug!(
                         "received duplicate ACK for seq {} (duplicate nr {}{})",
                         ack_number,
@@ -2656,14 +2656,32 @@ impl<'a> Socket<'a> {
                         self.flags.remove(Flags::SACK_REDUNDANT_PASS);
                         net_debug!("started fast retransmit");
                     }
+
+                    // Inform the congestion controller of the duplicate ACK.
+                    // While in fast recovery it inflates cwnd by one segment per
+                    // dup ack (RFC 5681); before recovery is entered (by on_loss
+                    // when the fast-retransmit timer fires) it is a no-op.
+                    let in_flight = self.flight_size();
+                    self.congestion_controller
+                        .on_dup_ack(cx.now(), self.remote_mss as usize, in_flight);
                 }
-                // No duplicate ACK -> Reset state and update last received ACK
+                // No duplicate ACK -> Reset state, update last received ACK, and
+                // notify the congestion controller of the freshly ACKed data.
                 _ => {
                     if self.local_rx_dup_acks > 0 {
                         self.local_rx_dup_acks = 0;
                         net_debug!("reset duplicate ACK count");
                     }
                     self.local_rx_last_ack = Some(ack_number);
+
+                    self.rtte.on_ack(cx.now(), ack_number);
+                    let new_flight_size = self.flight_size().saturating_sub(ack_len);
+                    self.congestion_controller.on_ack(
+                        cx.now(),
+                        ack_len,
+                        new_flight_size,
+                        &self.rtte,
+                    );
                 }
             };
             // The scoreboard stores offsets relative to SND.UNA; slide its
@@ -2948,6 +2966,18 @@ impl<'a> Socket<'a> {
         self.remote_last_seq = self.local_seq_no;
     }
 
+    /// Number of octets transmitted but not yet cumulatively ACKed.
+    fn flight_size(&self) -> usize {
+        self.remote_last_seq - self.local_seq_no
+    }
+
+    /// Octets the congestion window still permits, beyond what is in flight.
+    fn cwnd_remaining(&self) -> usize {
+        self.congestion_controller
+            .window()
+            .saturating_sub(self.flight_size())
+    }
+
     fn seq_to_transmit(&self, cx: &mut Context) -> bool {
         let ip_header_len = match self.tuple.unwrap().local.addr {
             #[cfg(feature = "proto-ipv4")]
@@ -2993,15 +3023,16 @@ impl<'a> Socket<'a> {
         let max_send_seq =
             self.local_seq_no + core::cmp::min(self.remote_win_len as usize, self.tx_buffer.len());
 
-        // Max amount of octets we can send.
-        let max_send = if max_send_seq >= self.remote_last_seq {
+        // Max amount of octets we can send, limited by the remote window.
+        let capped_send_seq = if max_send_seq >= self.remote_last_seq {
             max_send_seq - self.remote_last_seq
         } else {
             0
         };
 
-        // Compare max_send with the congestion window.
-        let max_send = max_send.min(self.congestion_controller.window());
+        // Compare the remote-window allowance with what the congestion window
+        // still permits beyond the bytes already in flight.
+        let max_send = capped_send_seq.min(self.cwnd_remaining());
 
         // Can we send at least 1 octet?
         let mut can_send = max_send != 0;
@@ -3238,8 +3269,10 @@ impl<'a> Socket<'a> {
             net_debug!("timeout exceeded");
             self.set_state(State::Closed);
         } else if !want_send && self.timer.should_retransmit(cx.now()) {
-            // If a retransmit timer expired, we should resend data starting at the last ACK.
-            net_debug!("retransmitting");
+            // Octets in flight, measured before the cursor rewind below resets
+            // flight_size() to zero — the congestion controller needs the real
+            // value to size ssthresh.
+            let in_flight = self.flight_size();
 
             // RFC 2018 §8: after a retransmission timeout, discard the SACK
             // scoreboard and retransmit conservatively from SND.UNA — an RTO
@@ -3247,6 +3280,14 @@ impl<'a> Socket<'a> {
             // receiver. Fast retransmit keeps the scoreboard: the rewound
             // cursor then walks only the holes between SACKed ranges.
             if matches!(self.timer, Timer::Retransmit { .. }) {
+                net_debug!("retransmitting after rto");
+
+                // RFC 5681: an RTO collapses cwnd to the loss window and
+                // re-enters slow start.
+                self.congestion_controller.on_rto(cx.now(), in_flight);
+                // Back off the RTO timer (RFC 6298 §5.5).
+                self.rtte.on_rto();
+
                 self.sack_scoreboard.clear();
                 // RFC 6582 §3: (re)arm the recovery point on timeout as
                 // well. SACK blocks arriving during the go-back-N walk
@@ -3255,6 +3296,14 @@ impl<'a> Socket<'a> {
                 // waiting out further exponentially backed-off RTOs.
                 self.recovery_point = Some(self.remote_last_seq);
                 self.flags.remove(Flags::SACK_REDUNDANT_PASS);
+            } else {
+                net_debug!("retransmitting for fast-retransmit");
+
+                // RFC 5681: a fast retransmit enters fast recovery, halving
+                // ssthresh and inflating cwnd by the dup-ack'd segments. The
+                // cursor rewind below then resends the lost data; subsequent
+                // dup ACKs inflate cwnd further via on_dup_ack.
+                self.congestion_controller.on_loss(cx.now(), in_flight);
             }
 
             // Rewind "last sequence number sent", as if we never
@@ -3270,9 +3319,6 @@ impl<'a> Socket<'a> {
 
             // Inform RTTE, so that it can avoid bogus measurements.
             self.rtte.on_retransmit();
-
-            // Inform the congestion controller that we're retransmitting.
-            self.congestion_controller.on_retransmit(cx.now());
 
             // Skip the rewound cursor past any leading SACKed range
             // (invariant I1), then recompute whether anything needs sending.
@@ -3425,19 +3471,29 @@ impl<'a> Socket<'a> {
                     is_zero_window_probe = true;
                 }
 
-                // Maximum size we're allowed to send. This can be limited by 3 factors:
+                // Maximum size we're allowed to send. This can be limited by 4 factors:
                 // 1. remote window
                 // 2. MSS the remote is willing to accept, probably determined by their MTU
                 // 3. MSS we can send, determined by our MTU, minus the TCP options
                 //    actually emitted on this segment (timestamps, ...). Without
                 //    this a timestamp-bearing full segment would overshoot the
                 //    negotiated MSS.
+                // 4. our congestion window
                 let options_len = repr.header_len() - TCP_HEADER_LEN;
                 let local_mss = cx.ip_mtu() - ip_repr.header_len() - TCP_HEADER_LEN;
                 let effective_mss = local_mss
                     .min(self.remote_mss as usize)
                     .saturating_sub(options_len);
-                let mut size = win_limit.min(effective_mss);
+                let mut size = if is_zero_window_probe {
+                    // Zero-window probes are exempt from the congestion window:
+                    // they are sent precisely when normal transmission is
+                    // impossible, and an empty segment elicits no reply, so
+                    // capping the probe to zero length would stall the
+                    // connection if a window update from the remote got lost.
+                    win_limit.min(effective_mss)
+                } else {
+                    win_limit.min(effective_mss).min(self.cwnd_remaining())
+                };
 
                 let offset = self.remote_last_seq - self.local_seq_no;
 
