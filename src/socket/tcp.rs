@@ -574,6 +574,11 @@ pub struct Socket<'a> {
 
 const DEFAULT_MSS: usize = 536;
 
+/// Lower bound on the remote's advertised MSS (Linux `TCP_MIN_SND_MSS`). A peer
+/// advertising a tiny MSS is clamped up to this so it can't stall the
+/// connection by forcing us into near-empty segments.
+const MIN_REMOTE_MSS: usize = 48;
+
 bitflags::bitflags! {
     /// Packed bool fields on `Socket`. Packing them into one byte saves
     /// ~8 bytes of inter-field padding the compiler would otherwise emit
@@ -2294,10 +2299,48 @@ impl<'a> Socket<'a> {
                         overlap_start - window_start,
                     )
                 } else {
+                    // Out-of-window RSTs are silently dropped, per RFC 9293
+                    // (3.10.7.4) and RFC 5961 (3.2): no reply is sent, and the
+                    // TIME-WAIT timer below is not refreshed. RST senders don't
+                    // need a reply to make progress.
+                    if repr.control == TcpControl::Rst {
+                        net_debug!("dropping out-of-window RST");
+                        return None;
+                    }
+
                     // If we're in the TIME-WAIT state, restart the TIME-WAIT timeout, since
                     // the remote end may not have realized we've closed the connection.
                     if self.state == State::TimeWait {
                         self.timer.set_for_close(cx.now());
+                    }
+
+                    // Segments carrying data are exempt from challenge ACK rate
+                    // limiting: an out-of-window data segment is a retransmission
+                    // whose ACK was lost, or a window probe, and per RFC 9293
+                    // (3.10.7.4, 3.8.6.1) it should elicit an ACK so the remote
+                    // can make progress. Withholding these ACKs strands the
+                    // remote in retransmission backoff or persist state. The
+                    // rate limit exists to break ACK loops between desynced
+                    // peers, and exempting data segments cannot sustain such a
+                    // loop: the remote paces them with its retransmission and
+                    // persist timers, and the data it may send in response to a
+                    // duplicate ACK of ours (fast recovery) is bounded by its
+                    // send window, which never advances during a desync.
+                    //
+                    // The exemption covers FIN (a retransmitted final segment is
+                    // the same lost-ACK situation) but not SYN: a SYN in a
+                    // synchronized state is a challenge ACK situation (RFC 5961
+                    // 4.2), and challenge ACKs should be throttled (RFC 5961 7).
+                    // One per second is ample for a restarted peer to complete
+                    // the challenge exchange, since it retransmits its SYN on
+                    // its own timer.
+                    if !repr.payload.is_empty()
+                        && matches!(
+                            repr.control,
+                            TcpControl::None | TcpControl::Psh | TcpControl::Fin
+                        )
+                    {
+                        return Some(self.ack_reply(ip_repr, repr));
                     }
 
                     return self.challenge_ack_reply(cx, ip_repr, repr);
@@ -2382,12 +2425,13 @@ impl<'a> Socket<'a> {
             (State::Listen, TcpControl::Syn) => {
                 tcp_trace!("received SYN");
                 if let Some(max_seg_size) = repr.max_seg_size {
-                    if max_seg_size == 0 {
-                        tcp_trace!("received SYNACK with zero MSS, ignoring");
-                        return None;
+                    // A zero MSS is treated as if the option were absent (keep
+                    // the default); a tiny nonzero MSS is clamped up to
+                    // MIN_REMOTE_MSS.
+                    if max_seg_size != 0 {
+                        self.remote_mss = (max_seg_size as usize).max(MIN_REMOTE_MSS) as u32;
+                        self.congestion_controller.set_mss(self.remote_mss as usize);
                     }
-                    self.congestion_controller.set_mss(max_seg_size as usize);
-                    self.remote_mss = max_seg_size as u32
                 }
 
                 self.tuple = Some(Tuple {
@@ -2436,12 +2480,12 @@ impl<'a> Socket<'a> {
                     tcp_trace!("received SYN");
                 }
                 if let Some(max_seg_size) = repr.max_seg_size {
-                    if max_seg_size == 0 {
-                        tcp_trace!("received SYNACK with zero MSS, ignoring");
-                        return None;
+                    // See the LISTEN handler: zero MSS keeps the default, a tiny
+                    // nonzero MSS is clamped up to MIN_REMOTE_MSS.
+                    if max_seg_size != 0 {
+                        self.remote_mss = (max_seg_size as usize).max(MIN_REMOTE_MSS) as u32;
+                        self.congestion_controller.set_mss(self.remote_mss as usize);
                     }
-                    self.remote_mss = max_seg_size as u32;
-                    self.congestion_controller.set_mss(self.remote_mss as usize);
                 }
 
                 self.remote_seq_no = repr.seq_number + 1;
@@ -2912,11 +2956,19 @@ impl<'a> Socket<'a> {
             IpAddress::Ipv6(_) => crate::wire::IPV6_HEADER_LEN,
         };
 
+        // Per-segment TCP option overhead that eats into the payload budget.
+        // Timestamps (RFC 7323) cost 12 bytes (10 + 2 NOP for alignment). This
+        // is an approximation of the exact accounting in the dispatch path,
+        // which subtracts the actual emitted option length.
+        let options_len = if self.tsval_generator.is_some() { 12 } else { 0 };
+
         // Max segment size we're able to send due to MTU limitations.
         let local_mss = cx.ip_mtu() - ip_header_len - TCP_HEADER_LEN;
 
         // The effective max segment size, taking into account our and remote's limits.
-        let effective_mss = local_mss.min(self.remote_mss as usize);
+        let effective_mss = local_mss
+            .min(self.remote_mss as usize)
+            .saturating_sub(options_len);
 
         // Have we sent data that hasn't been ACKed yet?
         let data_in_flight = self.remote_last_seq != self.local_seq_no;
@@ -3376,10 +3428,16 @@ impl<'a> Socket<'a> {
                 // Maximum size we're allowed to send. This can be limited by 3 factors:
                 // 1. remote window
                 // 2. MSS the remote is willing to accept, probably determined by their MTU
-                // 3. MSS we can send, determined by our MTU.
-                let mut size = win_limit
+                // 3. MSS we can send, determined by our MTU, minus the TCP options
+                //    actually emitted on this segment (timestamps, ...). Without
+                //    this a timestamp-bearing full segment would overshoot the
+                //    negotiated MSS.
+                let options_len = repr.header_len() - TCP_HEADER_LEN;
+                let local_mss = cx.ip_mtu() - ip_repr.header_len() - TCP_HEADER_LEN;
+                let effective_mss = local_mss
                     .min(self.remote_mss as usize)
-                    .min(cx.ip_mtu() - ip_repr.header_len() - TCP_HEADER_LEN);
+                    .saturating_sub(options_len);
+                let mut size = win_limit.min(effective_mss);
 
                 let offset = self.remote_last_seq - self.local_seq_no;
 
@@ -6013,12 +6071,43 @@ mod test {
     #[test]
     fn test_established_rst_bad_seq() {
         let mut s = socket_established();
+        // Out-of-window RSTs are dropped silently, per RFC 9293 (3.10.7.4)
+        // and RFC 5961 (3.2).
         send!(
             s,
             TcpRepr {
                 control: TcpControl::Rst,
                 seq_number: REMOTE_SEQ, // Wrong seq
                 ack_number: None,
+                ..SEND_TEMPL
+            }
+        );
+
+        assert_eq!(s.state, State::Established);
+
+        // An in-window RST still resets the connection.
+        send!(
+            s,
+            time 2000,
+            TcpRepr {
+                control: TcpControl::Rst,
+                seq_number: REMOTE_SEQ + 1, // Correct seq
+                ack_number: None,
+                ..SEND_TEMPL
+            }
+        );
+
+        assert_eq!(s.state, State::Closed);
+    }
+
+    #[test]
+    fn test_established_bad_seq_challenge_ack_updated() {
+        let mut s = socket_established();
+        send!(
+            s,
+            TcpRepr {
+                seq_number: REMOTE_SEQ, // Wrong seq
+                ack_number: Some(LOCAL_SEQ + 1),
                 ..SEND_TEMPL
             },
             Some(TcpRepr {
@@ -6041,16 +6130,15 @@ mod test {
             }
         );
 
-        // Send wrong rst again, check that the challenge ack is correctly updated
+        // Send the wrong seq again, check that the challenge ack is correctly updated
         // The ack number must be updated even if we don't call dispatch on the socket
         // See https://github.com/smoltcp-rs/smoltcp/issues/338
         send!(
             s,
             time 2000,
             TcpRepr {
-                control: TcpControl::Rst,
                 seq_number: REMOTE_SEQ, // Wrong seq
-                ack_number: None,
+                ack_number: Some(LOCAL_SEQ + 1),
                 ..SEND_TEMPL
             },
             Some(TcpRepr {
@@ -6059,6 +6147,437 @@ mod test {
                 window_len: 63,
                 ..RECV_TEMPL
             })
+        );
+    }
+
+    #[test]
+    fn test_old_data_ack_not_rate_limited() {
+        let mut s = socket_established();
+        send!(
+            s,
+            TcpRepr {
+                seq_number: REMOTE_SEQ + 1,
+                ack_number: Some(LOCAL_SEQ + 1),
+                payload: &b"abcdef"[..],
+                ..SEND_TEMPL
+            }
+        );
+        recv!(
+            s,
+            [TcpRepr {
+                seq_number: LOCAL_SEQ + 1,
+                ack_number: Some(REMOTE_SEQ + 1 + 6),
+                window_len: 58,
+                ..RECV_TEMPL
+            }]
+        );
+        s.recv(|data| {
+            assert_eq!(data, b"abcdef");
+            (6, ())
+        })
+        .unwrap();
+        // The remote retransmits data we already acknowledged, e.g. because
+        // the ACK above was lost. Each retransmission must elicit a duplicate
+        // ACK, even within the challenge ACK rate limit window: withholding it
+        // strands the remote in retransmission backoff.
+        send!(
+            s,
+            time 100,
+            TcpRepr {
+                seq_number: REMOTE_SEQ + 1,
+                ack_number: Some(LOCAL_SEQ + 1),
+                payload: &b"abcdef"[..],
+                ..SEND_TEMPL
+            },
+            Some(TcpRepr {
+                seq_number: LOCAL_SEQ + 1,
+                ack_number: Some(REMOTE_SEQ + 1 + 6),
+                ..RECV_TEMPL
+            })
+        );
+        send!(
+            s,
+            time 200,
+            TcpRepr {
+                seq_number: REMOTE_SEQ + 1,
+                ack_number: Some(LOCAL_SEQ + 1),
+                payload: &b"abcdef"[..],
+                ..SEND_TEMPL
+            },
+            Some(TcpRepr {
+                seq_number: LOCAL_SEQ + 1,
+                ack_number: Some(REMOTE_SEQ + 1 + 6),
+                ..RECV_TEMPL
+            })
+        );
+    }
+
+    #[test]
+    fn test_zero_window_ack_not_rate_limited() {
+        let mut s = socket_established();
+        s.rx_buffer = SocketBuffer::new(vec![0; 6]);
+        s.assembler = Assembler::new();
+        send!(
+            s,
+            TcpRepr {
+                seq_number: REMOTE_SEQ + 1,
+                ack_number: Some(LOCAL_SEQ + 1),
+                payload: &b"abcdef"[..],
+                ..SEND_TEMPL
+            }
+        );
+        recv!(
+            s,
+            [TcpRepr {
+                seq_number: LOCAL_SEQ + 1,
+                ack_number: Some(REMOTE_SEQ + 1 + 6),
+                window_len: 0,
+                ..RECV_TEMPL
+            }]
+        );
+        send!(
+            s,
+            TcpRepr {
+                seq_number: REMOTE_SEQ + 1 + 6,
+                ack_number: Some(LOCAL_SEQ + 1),
+                payload: &b"123456"[..],
+                ..SEND_TEMPL
+            },
+            Some(TcpRepr {
+                seq_number: LOCAL_SEQ + 1,
+                ack_number: Some(REMOTE_SEQ + 1 + 6),
+                window_len: 0,
+                ..RECV_TEMPL
+            })
+        );
+        // The remote retransmits into the zero window again within a second,
+        // e.g. because the ACK above was lost. The ACK must not be withheld by
+        // challenge ACK rate limiting: it is the remote's only way to learn
+        // the window state, and a data segment cannot cause an ACK loop.
+        send!(
+            s,
+            time 100,
+            TcpRepr {
+                seq_number: REMOTE_SEQ + 1 + 6,
+                ack_number: Some(LOCAL_SEQ + 1),
+                payload: &b"123456"[..],
+                ..SEND_TEMPL
+            },
+            Some(TcpRepr {
+                seq_number: LOCAL_SEQ + 1,
+                ack_number: Some(REMOTE_SEQ + 1 + 6),
+                window_len: 0,
+                ..RECV_TEMPL
+            })
+        );
+    }
+
+    #[test]
+    fn test_bad_seq_rst_dropped_silently() {
+        let mut s = socket_established();
+        // Out-of-window RSTs are silently dropped, per RFC 9293 (3.10.7.4)
+        // and RFC 5961 (3.2): no challenge ACK, no state change.
+        send!(
+            s,
+            TcpRepr {
+                control: TcpControl::Rst,
+                seq_number: REMOTE_SEQ + 1 + 256,
+                ack_number: Some(LOCAL_SEQ + 1),
+                ..SEND_TEMPL
+            }
+        );
+        assert_eq!(s.state, State::Established);
+
+        // A payload doesn't make it eligible for the data segment exemption
+        // from challenge ACK rate limiting either: still no reply.
+        send!(
+            s,
+            time 100,
+            TcpRepr {
+                control: TcpControl::Rst,
+                seq_number: REMOTE_SEQ + 1 + 256,
+                ack_number: Some(LOCAL_SEQ + 1),
+                payload: &b"abcdef"[..],
+                ..SEND_TEMPL
+            }
+        );
+        assert_eq!(s.state, State::Established);
+    }
+
+    #[test]
+    fn test_bad_seq_syn_with_data_rate_limited() {
+        let mut s = socket_established();
+        // An out-of-window SYN carrying data must not be exempt from challenge
+        // ACK rate limiting: RFC 5961 (4.2) says challenge ACKs sent in
+        // response to SYNs should be throttled.
+        send!(
+            s,
+            TcpRepr {
+                control: TcpControl::Syn,
+                seq_number: REMOTE_SEQ + 1 + 256,
+                ack_number: Some(LOCAL_SEQ + 1),
+                payload: &b"abcdef"[..],
+                ..SEND_TEMPL
+            },
+            Some(TcpRepr {
+                seq_number: LOCAL_SEQ + 1,
+                ack_number: Some(REMOTE_SEQ + 1),
+                ..RECV_TEMPL
+            })
+        );
+
+        // The second one within the rate limit window gets no reply.
+        send!(
+            s,
+            time 100,
+            TcpRepr {
+                control: TcpControl::Syn,
+                seq_number: REMOTE_SEQ + 1 + 256,
+                ack_number: Some(LOCAL_SEQ + 1),
+                payload: &b"abcdef"[..],
+                ..SEND_TEMPL
+            }
+        );
+        assert_eq!(s.state, State::Established);
+    }
+
+    #[test]
+    fn test_listen_syn_tiny_mss_is_clamped() {
+        let mut s = socket_listen();
+        send!(
+            s,
+            TcpRepr {
+                control: TcpControl::Syn,
+                seq_number: REMOTE_SEQ,
+                ack_number: None,
+                max_seg_size: Some(10),
+                ..SEND_TEMPL
+            }
+        );
+        assert_eq!(s.state, State::SynReceived);
+        assert_eq!(s.remote_mss, MIN_REMOTE_MSS as u32);
+    }
+
+    #[test]
+    fn test_listen_syn_zero_mss_is_ignored() {
+        let mut s = socket_listen();
+        send!(
+            s,
+            TcpRepr {
+                control: TcpControl::Syn,
+                seq_number: REMOTE_SEQ,
+                ack_number: None,
+                max_seg_size: Some(0),
+                ..SEND_TEMPL
+            }
+        );
+        assert_eq!(s.state, State::SynReceived);
+        assert_eq!(s.remote_mss, DEFAULT_MSS as u32);
+    }
+
+    #[test]
+    fn test_connect_synack_tiny_mss_is_clamped() {
+        let mut s = socket();
+        s.local_seq_no = LOCAL_SEQ;
+        s.socket
+            .connect(&mut s.cx, REMOTE_END, LOCAL_END.port)
+            .unwrap();
+        recv!(
+            s,
+            [TcpRepr {
+                control: TcpControl::Syn,
+                seq_number: LOCAL_SEQ,
+                ack_number: None,
+                max_seg_size: Some(BASE_MSS),
+                window_scale: Some(0),
+                sack_permitted: true,
+                ..RECV_TEMPL
+            }]
+        );
+        send!(
+            s,
+            TcpRepr {
+                control: TcpControl::Syn,
+                seq_number: REMOTE_SEQ,
+                ack_number: Some(LOCAL_SEQ + 1),
+                max_seg_size: Some(10),
+                window_scale: Some(0),
+                ..SEND_TEMPL
+            }
+        );
+        assert_eq!(s.state, State::Established);
+        assert_eq!(s.remote_mss, MIN_REMOTE_MSS as u32);
+    }
+
+    #[test]
+    fn test_connect_synack_zero_mss_is_ignored() {
+        let mut s = socket();
+        s.local_seq_no = LOCAL_SEQ;
+        s.socket
+            .connect(&mut s.cx, REMOTE_END, LOCAL_END.port)
+            .unwrap();
+        recv!(
+            s,
+            [TcpRepr {
+                control: TcpControl::Syn,
+                seq_number: LOCAL_SEQ,
+                ack_number: None,
+                max_seg_size: Some(BASE_MSS),
+                window_scale: Some(0),
+                sack_permitted: true,
+                ..RECV_TEMPL
+            }]
+        );
+        send!(
+            s,
+            TcpRepr {
+                control: TcpControl::Syn,
+                seq_number: REMOTE_SEQ,
+                ack_number: Some(LOCAL_SEQ + 1),
+                max_seg_size: Some(0),
+                window_scale: Some(0),
+                ..SEND_TEMPL
+            }
+        );
+        assert_eq!(s.state, State::Established);
+        assert_eq!(s.remote_mss, DEFAULT_MSS as u32);
+    }
+
+    #[test]
+    fn test_established_options_reduce_payload_when_local_mss_limited() {
+        const EFFECTIVE_MSS: usize = 64;
+
+        // construct socket where remote MSS is less than local MSS
+        let mut s = socket_established();
+        s.set_tsval_generator(Some(|| 1));
+        s.remote_mss = EFFECTIVE_MSS as u32;
+
+        // Payload should contain 12 bytes less due to timestamp
+        s.send_slice(&[0; EFFECTIVE_MSS]).unwrap();
+        recv!(
+            s,
+            [TcpRepr {
+                seq_number: LOCAL_SEQ + 1,
+                ack_number: Some(REMOTE_SEQ + 1),
+                payload: &[0; EFFECTIVE_MSS - 12],
+                timestamp: Some(TcpTimestampRepr::new(1, 0)),
+                ..RECV_TEMPL
+            }]
+        );
+    }
+
+    #[test]
+    fn test_established_options_reduce_payload_when_remote_mss_limited() {
+        const EFFECTIVE_MSS: usize = BASE_MSS as usize;
+
+        // construct socket where remote MSS is more than local MSS
+        let mut s = socket_established_with_buffer_sizes(EFFECTIVE_MSS, 64);
+        s.set_tsval_generator(Some(|| 1));
+        s.remote_mss = 9999;
+        s.remote_win_len = 9999;
+
+        // Payload should contain 12 bytes less due to timestamp
+        s.send_slice(&[0; EFFECTIVE_MSS]).unwrap();
+        recv!(
+            s,
+            [TcpRepr {
+                seq_number: LOCAL_SEQ + 1,
+                ack_number: Some(REMOTE_SEQ + 1),
+                payload: &[0; EFFECTIVE_MSS - 12],
+                timestamp: Some(TcpTimestampRepr::new(1, 0)),
+                ..RECV_TEMPL
+            }]
+        );
+    }
+
+    #[test]
+    fn test_established_tiny_mss_with_options_makes_progress() {
+        // Connect with timestamps enabled to a remote advertising an absurdly
+        // small MSS. Without the MIN_REMOTE_MSS clamp, an MSS smaller than the
+        // options length would result in an effective MSS of zero, sending
+        // empty segments in a loop without ever making progress.
+        let mut s = socket();
+        s.set_tsval_generator(Some(|| 1));
+        s.local_seq_no = LOCAL_SEQ;
+        s.socket
+            .connect(&mut s.cx, REMOTE_END, LOCAL_END.port)
+            .unwrap();
+        recv!(
+            s,
+            [TcpRepr {
+                control: TcpControl::Syn,
+                seq_number: LOCAL_SEQ,
+                ack_number: None,
+                max_seg_size: Some(BASE_MSS),
+                window_scale: Some(0),
+                sack_permitted: true,
+                timestamp: Some(TcpTimestampRepr::new(1, 0)),
+                ..RECV_TEMPL
+            }]
+        );
+        send!(
+            s,
+            TcpRepr {
+                control: TcpControl::Syn,
+                seq_number: REMOTE_SEQ,
+                ack_number: Some(LOCAL_SEQ + 1),
+                max_seg_size: Some(10),
+                window_scale: Some(0),
+                timestamp: Some(TcpTimestampRepr::new(500, 1)),
+                ..SEND_TEMPL
+            }
+        );
+        assert_eq!(s.state, State::Established);
+        assert_eq!(s.remote_mss, MIN_REMOTE_MSS as u32);
+
+        s.send_slice(&[0; 64]).unwrap();
+        recv!(
+            s,
+            [TcpRepr {
+                seq_number: LOCAL_SEQ + 1,
+                ack_number: Some(REMOTE_SEQ + 1),
+                payload: &[0; MIN_REMOTE_MSS - 12],
+                timestamp: Some(TcpTimestampRepr::new(1, 500)),
+                ..RECV_TEMPL
+            }]
+        );
+    }
+
+    #[test]
+    fn test_nagle_works_with_reduced_payload_from_options() {
+        const EFFECTIVE_MSS: usize = 64;
+
+        let mut s = socket_established_with_buffer_sizes(256, 64);
+        s.set_nagle_enabled(true);
+        s.set_tsval_generator(Some(|| 1));
+        s.remote_mss = EFFECTIVE_MSS as u32;
+
+        // Send small segment to "arm" Nagle's
+        s.send_slice(b"abcdef").unwrap();
+        recv!(
+            s,
+            [TcpRepr {
+                seq_number: LOCAL_SEQ + 1,
+                ack_number: Some(REMOTE_SEQ + 1),
+                payload: &b"abcdef"[..],
+                timestamp: Some(TcpTimestampRepr::new(1, 0)),
+                ..RECV_TEMPL
+            }]
+        );
+
+        // A full segment (once options are accounted for) should not be delayed
+        // and contain 12 bytes less due to timestamp
+        s.send_slice(&[0; EFFECTIVE_MSS - 12]).unwrap();
+        recv!(
+            s,
+            time 0,
+            [TcpRepr {
+                seq_number: LOCAL_SEQ + 1 + 6,
+                ack_number: Some(REMOTE_SEQ + 1),
+                payload: &[0; EFFECTIVE_MSS - 12],
+                timestamp: Some(TcpTimestampRepr::new(1, 0)),
+                ..RECV_TEMPL
+            }]
         );
     }
 
