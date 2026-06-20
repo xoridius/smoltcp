@@ -9,22 +9,19 @@ const C: f64 = 0.4;
 // RFC 9438 §4.3: α_cubic = 3(1-β)/(1+β). ~0.5294 for β=0.7.
 const ALPHA_CUBIC: f64 = 3.0 * (1.0 - BETA_CUBIC) / (1.0 + BETA_CUBIC);
 
-const DEFAULT_MSS: u32 = 1024;
+const DEFAULT_MSS: usize = 1024;
 
-/// RFC 9438 Cubic congestion controller. Window-sized fields use u32 (RFC 1323
-/// caps the effective window at 2^30), halving their footprint on 64-bit
-/// targets versus usize.
 #[derive(Debug)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct Cubic {
-    w_max: u32, // window size prior to loss
-    cwnd: u32,
-    mss: u32,
-    ssthresh: u32,
-    rwnd: u32,
-    k: f64,         // cubic curve offset in seconds; depends only on w_max and mss
-    w_est: f64,     // RFC 9438 §4.3 reno-friendly window, integrated per ACK
-    cwnd_prior: u32, // cwnd at the most recent congestion event; gates α_cubic
+    w_max: usize, // window size prior to loss
+    cwnd: usize,
+    mss: usize,
+    ssthresh: usize,
+    rwnd: usize,
+    k: f64,            // cubic curve offset in seconds; depends only on w_max and mss
+    w_est: f64,        // RFC 9438 §4.3 reno-friendly window, integrated per ACK
+    cwnd_prior: usize, // cwnd at the most recent congestion event; gates α_cubic
 
     recovery_start: Option<Instant>,
     in_fast_recovery: bool,
@@ -42,7 +39,7 @@ impl Cubic {
             cwnd: DEFAULT_MSS * 2,
             mss: DEFAULT_MSS,
             rwnd: 64 * DEFAULT_MSS,
-            ssthresh: u32::MAX,
+            ssthresh: usize::MAX,
             k: 0.0,
             w_est: (DEFAULT_MSS * 2) as f64,
             cwnd_prior: DEFAULT_MSS * 2,
@@ -77,11 +74,11 @@ impl Cubic {
 
 impl Controller for Cubic {
     fn window(&self) -> usize {
-        self.cwnd as usize
+        self.cwnd
     }
 
     fn on_ack(&mut self, now: Instant, len: usize, in_flight: usize, rtt: &RttEstimator) {
-        let segment = len.min(self.mss as usize) as u32;
+        let segment = len.min(self.mss);
 
         self.absorb_idle(now);
 
@@ -156,7 +153,7 @@ impl Controller for Cubic {
 
         // RFC 9438 §4.3: use the suggested window that grows fastest.
         if w_cubic < w_est {
-            self.cwnd = (w_est as u32).min(self.rwnd).max(self.mss);
+            self.cwnd = (w_est as usize).min(self.rwnd).max(self.mss);
             return;
         }
 
@@ -171,23 +168,13 @@ impl Controller for Cubic {
         };
 
         // TODO: clamps to 0 on small w_cubic_target (i.e. close to plateau)
-        // add additional counter (linux `cwnd_cnt`?) to track "lost" bytes.
-        //
-        // The intermediate product `(target - cwnd) * segment` is computed in
-        // u64 because cwnd (up to 2^30) times segment (up to 2^16) overflows u32.
-        let target = w_cubic_target as u64;
-        let increment =
-            (target.saturating_sub(self.cwnd as u64) * segment as u64 / self.cwnd as u64) as u32;
-        self.cwnd = self
-            .cwnd
-            .saturating_add(increment)
-            .min(self.rwnd)
-            .max(self.mss);
+        // add additional counter (linux `cwnd_cnt`?) to track "lost" bytes
+        let increment = (w_cubic_target as usize).saturating_sub(self.cwnd) * segment / self.cwnd;
+        self.cwnd = (self.cwnd + increment).min(self.rwnd).max(self.mss);
     }
 
     fn on_dup_ack(&mut self, _now: Instant, len: usize, _in_flight: usize) {
         if self.in_fast_recovery {
-            let len = len.min(u32::MAX as usize) as u32;
             self.cwnd = self.cwnd.saturating_add(len).min(self.rwnd).max(self.mss);
         }
     }
@@ -211,12 +198,12 @@ impl Controller for Cubic {
             // If loss happened at a smaller cwnd than before, it indicates a new flow.
             // Reduce the cubic plateau more than usual to create headroom.
             self.w_max = if self.cwnd < self.w_max {
-                ((self.cwnd as f64) * (1.0 + BETA_CUBIC) / 2.0) as u32
+                ((self.cwnd as f64) * (1.0 + BETA_CUBIC) / 2.0) as usize
             } else {
                 self.cwnd
             };
 
-            self.ssthresh = ((in_flight as f64 * BETA_CUBIC) as u32).max(2 * self.mss);
+            self.ssthresh = ((in_flight as f64 * BETA_CUBIC) as usize).max(2 * self.mss);
             self.cwnd = self.ssthresh.min(self.rwnd).saturating_add(3 * self.mss);
 
             self.recovery_start = Some(now);
@@ -230,12 +217,12 @@ impl Controller for Cubic {
         // already been retransmitted by the timer (no new data was ACKed since
         // the previous RTO), ssthresh is held constant.
         if !self.in_rto_recovery {
-            self.ssthresh = ((in_flight as f64 * BETA_CUBIC) as u32).max(2 * self.mss);
+            self.ssthresh = ((in_flight as f64 * BETA_CUBIC) as usize).max(2 * self.mss);
             self.in_rto_recovery = true;
         }
 
         self.cwnd = self.mss;
-        self.cwnd_prior = in_flight.min(u32::MAX as usize) as u32;
+        self.cwnd_prior = in_flight;
 
         // RFC 9438 §4.8: defer W_max and K reset to the start of the next CA stage.
         self.recovery_start = None;
@@ -244,21 +231,16 @@ impl Controller for Cubic {
     }
 
     fn set_mss(&mut self, mss: usize) {
-        let mss = mss.min(u32::MAX as usize) as u32;
         self.mss = mss;
-        // RFC 6928 IW = min(10*MSS, max(2*MSS, 14600)). Opened here (on SYN,
-        // when the peer's MSS is learned) so the first flight ramps fast. mss
-        // fits in 16 bits, so 10*mss never overflows u32.
+        // Fork delta (FORK.md §16): open the window at RFC 6928 IW10 —
+        // min(10*MSS, max(2*MSS, 14600)) — when the peer's MSS is learned on
+        // the SYN, rather than upstream's flat 2*MSS. Faster first-RTT ramp for
+        // short flows.
         self.cwnd = self.cwnd.max((10 * mss).min((2 * mss).max(14_600)));
         self.recompute_k();
     }
 
     fn set_remote_window(&mut self, remote_window: usize) {
-        // High-water mark of the peer's advertised window, used only to bound
-        // cwnd growth — the live receive window is enforced separately at the
-        // socket layer. Grow-only (as upstream) so a transient receiver-window
-        // shrink does not drag the congestion window down with it.
-        let remote_window = remote_window.min(u32::MAX as usize) as u32;
         if self.rwnd < remote_window {
             self.rwnd = remote_window;
         }
@@ -347,11 +329,11 @@ mod test {
     fn congestion_avoidance_works() {
         let mut cubic = Cubic::new();
         cubic.set_mss(MSS);
-        cubic.w_max = (MSS * 32) as u32;
+        cubic.w_max = MSS * 32;
         cubic.recompute_k();
 
         // Post-fast-recovery state: cwnd = ssthresh ≈ w_max * beta.
-        cubic.cwnd = ((MSS * 32 * 7) / 10) as u32;
+        cubic.cwnd = (MSS * 32 * 7) / 10;
         cubic.ssthresh = cubic.cwnd;
         cubic.recovery_start = Some(Instant::from_millis(0));
 
@@ -367,7 +349,7 @@ mod test {
         for i in 0..60 {
             ack(&mut cubic, MSS, Instant::from_millis(i * 100));
         }
-        assert!(cubic.window() >= cubic.w_max as usize);
+        assert!(cubic.window() >= cubic.w_max);
         assert!(cubic.window() > pre);
 
         // RFC 9438 §4.2: the target is clamped to 1.5 * cwnd
@@ -379,14 +361,14 @@ mod test {
         for i in 0..200 {
             ack(&mut cubic, MSS, Instant::from_millis(100_000 + i * 100));
         }
-        assert_eq!(cubic.window(), cubic.rwnd as usize);
+        assert_eq!(cubic.window(), cubic.rwnd);
     }
 
     #[test]
     fn fast_recovery_works() {
         let mut cubic = Cubic::new();
         cubic.set_mss(MSS);
-        cubic.cwnd = (MSS * 32) as u32;
+        cubic.cwnd = MSS * 32;
 
         // duplicate ACKs before fast recovery should do nothing
         let initial_cwnd = cubic.window();
@@ -401,9 +383,9 @@ mod test {
         let in_flight = initial_cwnd / 2;
         let expected_ssthresh = (in_flight as f64 * BETA_CUBIC) as usize;
         cubic.on_loss(Instant::from_millis(0), in_flight);
-        assert_eq!(cubic.ssthresh as usize, expected_ssthresh);
-        assert_eq!(cubic.cwnd as usize, expected_ssthresh + 3 * MSS);
-        assert_eq!(cubic.w_max as usize, initial_cwnd);
+        assert_eq!(cubic.ssthresh, expected_ssthresh);
+        assert_eq!(cubic.cwnd, expected_ssthresh + 3 * MSS);
+        assert_eq!(cubic.w_max, initial_cwnd);
         assert!(cubic.in_fast_recovery);
         assert_eq!(cubic.recovery_start, Some(Instant::from_millis(0)));
 
@@ -429,7 +411,7 @@ mod test {
 
         // a non-duplicate ACK exits fast recovery and deflates cwnd to ssthresh
         ack(&mut cubic, MSS, Instant::from_millis(10));
-        assert_eq!(cubic.window(), cubic.ssthresh as usize);
+        assert_eq!(cubic.window(), cubic.ssthresh);
         assert!(!cubic.in_fast_recovery);
     }
 
@@ -437,9 +419,9 @@ mod test {
     fn zero_length_ack_does_not_exit_fast_recovery() {
         let mut cubic = Cubic::new();
         cubic.set_mss(MSS);
-        cubic.cwnd = (MSS * 32) as u32;
+        cubic.cwnd = MSS * 32;
 
-        cubic.on_loss(Instant::from_millis(0), cubic.cwnd as usize);
+        cubic.on_loss(Instant::from_millis(0), cubic.cwnd);
         assert!(cubic.in_fast_recovery);
 
         let cwnd = cubic.window();
@@ -456,19 +438,19 @@ mod test {
         // The first ACK of new data still exits and deflates.
         ack(&mut cubic, MSS, Instant::from_millis(2));
         assert!(!cubic.in_fast_recovery);
-        assert_eq!(cubic.window(), ssthresh as usize);
+        assert_eq!(cubic.window(), ssthresh);
     }
 
     #[test]
     fn repeated_rto_holds_ssthresh() {
         let mut cubic = Cubic::new();
         cubic.set_mss(MSS);
-        cubic.cwnd = (MSS * 32) as u32;
+        cubic.cwnd = MSS * 32;
 
         // First RTO reduces ssthresh based on the flight size.
         cubic.on_rto(Instant::from_millis(0), MSS * 32);
         let ssthresh = cubic.ssthresh;
-        assert_eq!(ssthresh as usize, (32.0 * MSS as f64 * BETA_CUBIC) as usize);
+        assert_eq!(ssthresh, (32.0 * MSS as f64 * BETA_CUBIC) as usize);
 
         // Until new data is ACKed, further RTOs are retransmissions of the
         // same segment and must hold ssthresh constant instead of collapsing
@@ -480,15 +462,15 @@ mod test {
         // and reduces ssthresh again.
         ack(&mut cubic, MSS, Instant::from_millis(2));
         cubic.on_rto(Instant::from_millis(3), MSS * 4);
-        assert_eq!(cubic.ssthresh as usize, (4.0 * MSS as f64 * BETA_CUBIC) as usize);
+        assert_eq!(cubic.ssthresh, (4.0 * MSS as f64 * BETA_CUBIC) as usize);
     }
 
     #[test]
     fn slow_start_works() {
         let mut cubic = Cubic::new();
         cubic.set_mss(MSS);
-        cubic.cwnd = (MSS * 32) as u32;
-        cubic.ssthresh = (MSS * 16) as u32;
+        cubic.cwnd = MSS * 32;
+        cubic.ssthresh = MSS * 16;
 
         // we enter slow start upon major loss (an RTO)
         // window resets to MSS, ssthresh becomes a fraction of the inflight bytes,
@@ -497,7 +479,7 @@ mod test {
         let w_max_before_rto = cubic.w_max;
         let inflight = cubic.window();
         cubic.on_rto(Instant::from_millis(0), inflight);
-        assert_eq!(cubic.ssthresh as usize, (inflight as f64 * BETA_CUBIC) as usize);
+        assert_eq!(cubic.ssthresh, (inflight as f64 * BETA_CUBIC) as usize);
         assert_eq!(cubic.window(), MSS);
         assert!(!cubic.in_fast_recovery);
         assert_eq!(cubic.recovery_start, None);
@@ -525,10 +507,10 @@ mod test {
 
         // slow start transitions to congestion avoidance at ssthresh
         let initial_cwnd = cubic.window();
-        cubic.ssthresh = (initial_cwnd + MSS) as u32;
+        cubic.ssthresh = initial_cwnd + MSS;
         ack(&mut cubic, MSS, Instant::from_millis(30));
         assert_eq!(cubic.window(), initial_cwnd + MSS);
-        assert_eq!(cubic.ssthresh as usize, initial_cwnd + MSS);
+        assert_eq!(cubic.ssthresh, initial_cwnd + MSS);
     }
 
     #[test]
@@ -545,29 +527,29 @@ mod test {
             ack(&mut cubic, MSS, Instant::from_millis(time));
         }
         assert_eq!(cubic.window(), initial_cwnd + MSS * 30);
-        assert!(cubic.window() < cubic.ssthresh as usize);
+        assert!(cubic.window() < cubic.ssthresh);
 
         // rto: cwnd resets to MSS and sstresh reduces
         let rto_cwnd = cubic.window();
         cubic.on_rto(Instant::from_millis(time), rto_cwnd);
         assert_eq!(cubic.window(), MSS);
-        assert_eq!(cubic.ssthresh as usize, (rto_cwnd as f64 * BETA_CUBIC) as usize);
+        assert_eq!(cubic.ssthresh, (rto_cwnd as f64 * BETA_CUBIC) as usize);
 
         // slow start again until cwnd reaches new ssthresh
-        while cubic.window() < cubic.ssthresh as usize {
+        while cubic.window() < cubic.ssthresh {
             time += 1;
             let initial_cwnd = cubic.window();
             ack(&mut cubic, MSS, Instant::from_millis(time));
             assert_eq!(cubic.window(), initial_cwnd + MSS);
         }
-        assert!(cubic.window() >= cubic.ssthresh as usize);
-        assert!(cubic.window() < cubic.ssthresh as usize + MSS);
+        assert!(cubic.window() >= cubic.ssthresh);
+        assert!(cubic.window() < cubic.ssthresh + MSS);
 
         // ca: first CA ACK starts a fresh epoch with W_max = cwnd and K = 0.
         time += 1;
         let cwnd_at_ca_entry = cubic.window();
         ack(&mut cubic, MSS, Instant::from_millis(time));
-        assert_eq!(cubic.w_max as usize, cwnd_at_ca_entry);
+        assert_eq!(cubic.w_max, cwnd_at_ca_entry);
         assert_eq!(cubic.k, 0.0);
         assert!(cubic.window() >= cwnd_at_ca_entry);
     }
@@ -586,14 +568,14 @@ mod test {
             ack(&mut cubic, MSS, Instant::from_millis(time));
         }
         assert_eq!(cubic.window(), initial_cwnd + MSS * 30);
-        assert!(cubic.window() < cubic.ssthresh as usize);
+        assert!(cubic.window() < cubic.ssthresh);
 
         // dup ACKs: ssthresh = cwnd * beta, cwnd = ssthresh + 3*MSS, recovery_start = now
         time += 1;
         let loss_cwnd = cubic.window();
         let expected_ssthresh = (loss_cwnd as f64 * BETA_CUBIC) as usize;
         cubic.on_loss(Instant::from_millis(time), loss_cwnd);
-        assert_eq!(cubic.ssthresh as usize, expected_ssthresh);
+        assert_eq!(cubic.ssthresh, expected_ssthresh);
         assert_eq!(cubic.window(), expected_ssthresh + 3 * MSS);
         assert!(cubic.in_fast_recovery);
         assert_eq!(cubic.recovery_start, Some(Instant::from_millis(time)));
@@ -602,7 +584,7 @@ mod test {
         for _ in 0..9 {
             time += 1;
             let initial_cwnd = cubic.window();
-            cubic.on_dup_ack(Instant::from_millis(time), MSS, cubic.cwnd as usize);
+            cubic.on_dup_ack(Instant::from_millis(time), MSS, cubic.cwnd);
             assert_eq!(cubic.window(), initial_cwnd + MSS);
         }
 
@@ -623,33 +605,13 @@ mod test {
     fn fast_convergence_reduces_w_max() {
         let mut cubic = Cubic::new();
         cubic.set_mss(MSS);
-        cubic.w_max = (MSS * 50) as u32;
-        cubic.cwnd = (MSS * 30) as u32;
+        cubic.w_max = MSS * 50;
+        cubic.cwnd = MSS * 30;
 
         // Loss while cwnd < w_max (a new competing flow) should pull w_max down.
         let w_max_prev = cubic.w_max;
-        cubic.on_loss(Instant::from_millis(0), cubic.cwnd as usize);
+        cubic.on_loss(Instant::from_millis(0), cubic.cwnd);
         assert!(cubic.w_max < w_max_prev);
-    }
-
-    // RFC 6928: IW = min(10*MSS, max(2*MSS, 14600)). Opened on set_mss.
-    #[test]
-    fn cubic_iw10_on_set_mss() {
-        let mut cubic = Cubic::new();
-        cubic.set_remote_window(64 * 1024);
-        cubic.set_mss(1460);
-        assert_eq!(cubic.window(), 14_600);
-    }
-
-    // The CC's rwnd is a grow-only high-water mark: a smaller advertised
-    // window must not pull it (and thus cwnd) down. The live receive window is
-    // enforced at the socket layer, not here.
-    #[test]
-    fn cubic_rwnd_is_grow_only() {
-        let mut cubic = Cubic::new();
-        cubic.set_remote_window(64 * 1024);
-        cubic.set_remote_window(4 * 1024);
-        assert_eq!(cubic.rwnd, 64 * 1024);
     }
 
     #[test]
@@ -676,5 +638,26 @@ mod test {
             max_err < 0.0005,
             "cube_root({max_err_at}) = {max_err_found}, expected ~{max_err_expected}, rel err {max_err:.3e}"
         );
+    }
+
+    // Fork delta (FORK.md §16): set_mss opens the window at RFC 6928 IW10
+    // = min(10*MSS, max(2*MSS, 14600)).
+    #[test]
+    fn cubic_iw10_on_set_mss() {
+        let mut cubic = Cubic::new();
+        cubic.set_remote_window(64 * 1024);
+        cubic.set_mss(1460);
+        assert_eq!(cubic.window(), 14_600);
+    }
+
+    // The controller's rwnd is a grow-only high-water mark bounding cwnd; the
+    // live receive window is enforced at the socket layer, so a shrink here must
+    // not drag cwnd down.
+    #[test]
+    fn cubic_rwnd_is_grow_only() {
+        let mut cubic = Cubic::new();
+        cubic.set_remote_window(64 * 1024);
+        cubic.set_remote_window(4 * 1024);
+        assert_eq!(cubic.rwnd, 64 * 1024);
     }
 }

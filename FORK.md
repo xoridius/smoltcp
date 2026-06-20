@@ -1045,6 +1045,14 @@ Design, in `src/socket/tcp.rs`:
   solicits a fresh ACK (lost-cumACK repair in one RTT). Under Reno/Cubic
   (`AnyController::manages_window`) the pass is skipped.
 
+The `in_flight` signal handed to the congestion controller is the simple
+`flight_size()` = `remote_last_seq - local_seq_no`, i.e. the send cursor, not
+an RFC 6675 pipe estimate. During the selective walk the cursor is rewound, so
+this can transiently under-report bytes genuinely outstanding above the holes;
+the only consequence is mildly conservative cwnd growth (e.g. Cubic may treat a
+recovery lull as idle and slide its epoch). A true pipe estimate is the RFC 6675
+work that stays out of scope here.
+
 Evidence gates (re-measure per host; see §13 policy): deterministic
 netsim across 16 seeds at 32 KiB buffers — mean ±0% at 2% loss, +6% at
 5%, +36% at 10%; real-kernel TUN interop at 5% loss — multi-fold faster
@@ -1067,7 +1075,7 @@ upstream PR/commit it came from.
 | #1159 | deterministic `config.rs` via `BTreeMap` | verbatim |
 | #1162 + #1164 | out-of-window RX: drop OOW RST, exempt OOW data ACKs from rate limiting | verbatim production change; netsim snapshot rebaselined |
 | #1161 | effective MSS subtracts options length; `MIN_REMOTE_MSS` clamp | adapted for `remote_mss: u32`; preserves the adjacent SACK clamp |
-| #1154 / #1156 / #1157 + RTT parts of #1155 | RFC-compliant congestion-control redesign (new Controller API, Reno/CUBIC fast recovery, RTT estimator `on_rto`/`on_retransmit` split, `smoothed_rtt`) | u32 window fields and RFC 6928 IW10 re-applied on top; static-dispatch `AnyController` wrappers retained; CUBIC CA increment computed in u64 to avoid u32 overflow. The pre-redesign fork carried a controller-level rwnd-shrink in `set_remote_window`; it was **dropped** here (kept grow-only, as upstream) because, with the now-correct cwnd-vs-in-flight accounting, following the receive window down collapses cwnd on transient dips. The live receive window is enforced at the socket layer, so no correctness is lost. |
+| #1154 / #1156 / #1157 + RTT parts of #1155 | RFC-compliant congestion-control redesign (new Controller API, Reno/CUBIC fast recovery, RTT estimator `on_rto`/`on_retransmit` split, `smoothed_rtt`) | `reno.rs`/`cubic.rs` are taken **verbatim from upstream** save for one fork delta: `set_mss` opens the window at RFC 6928 IW10 instead of upstream's 2*MSS (faster first-RTT ramp; guarded by `*_iw10_on_set_mss`/`*_rwnd_is_grow_only` tests). The fork's static-dispatch `AnyController` wrappers live in `congestion.rs` and are unaffected. The pre-redesign fork shrank these window fields to `u32` and tracked rwnd shrinks in the controller; both were **dropped** — the `u32` shrink saved ~24 B/socket (negligible vs the buffer pool) at the cost of pervasive casts and heavy divergence, and the controller rwnd-shrink collapsed cwnd on transient receive-window dips once the cwnd-vs-in-flight accounting was corrected. The live receive window is still enforced at the socket layer. |
 
 Deliberately **not** taken:
 
