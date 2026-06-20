@@ -610,6 +610,16 @@ Operational notes:
   coverage has plateaued; bumping `-max_len` or expanding the
   discriminator usually re-opens it.
 
+Coverage gap (tracked): every target above is wire-level (parse/emit). The
+TCP socket state machine — and with it the congestion controllers, the
+`cwnd_remaining`/`flight_size` accounting, and SACK recovery (§15) — has no
+coverage-guided target; it is exercised only by the unit-test matrix and the
+per-controller netsim sweeps. A state-machine target that drives a `Socket`
+through `process`/`dispatch` with mutated `TcpRepr` segments (upstream's #1143
+`iface` fuzzer is the reference, though it must be adapted to this fork's
+retained `tcp_headers`/`FuzzInjector` setup) would close it. Worth a dedicated
+run.
+
 ### 7.2 MIRI
 
 ```
