@@ -56,7 +56,11 @@ test() {
 }
 
 netsim() {
-    cargo test --release --features _netsim netsim
+    # NoControl baseline, then the SACK x RFC-compliant-controller loss sweeps
+    # (netsim_cubic / netsim_reno). Serialized: the tests share a global CLOCK
+    # and the process-wide logger.
+    cargo test --release --features _netsim netsim -- --test-threads=1
+    cargo test --release --features "_netsim socket-tcp-cubic socket-tcp-reno" netsim -- --test-threads=1
 }
 
 check() {

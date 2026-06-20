@@ -1060,6 +1060,14 @@ with the RTO tail eliminated, byte-exact. Clean-path throughput
 unchanged. RACK-TLP and pacing remain out of scope (§11) until profile
 evidence demands them.
 
+In-tree regression coverage: `tests/netsim.rs` runs the buffer×loss sweep
+under each controller — `netsim` (NoControl), `netsim_cubic`, `netsim_reno`
+(the last two gated on their features) — each pinned to its own snapshot. The
+snapshots confirm SACK + the RFC-compliant controllers degrade monotonically
+and deterministically with loss; NoControl blasts-and-SACK-repairs (highest raw
+throughput, no back-off) while Cubic/Reno throttle on loss as a real controller
+must. Run via `./ci.sh netsim`.
+
 ## 16. Backported post-0.13.1 upstream changes
 
 The fork branches from `v0.13.1` (see §2). The changes below were
