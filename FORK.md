@@ -663,6 +663,24 @@ hides the actual commit in `Cargo.lock`, where it silently drifts on
   specific commit.
 - Profiling harness or sizecheck-test bug → file in this repo.
 
+### 10.1 Known upstream latent bug: window-update SWS deadlock
+
+`Socket::window_to_update` (identical to upstream) only advertises a reopened
+receive window when it has *doubled* (`new_win / 2 >= last_win`). Once the last
+advertised window exceeds half the receive buffer this can never fire, so a
+**unidirectional bulk receiver with delayed ACK disabled** (`ack_delay = None`)
+can deadlock: the sender blocks on a stale window and no return data carries the
+update, until a zero-window probe inches it forward. The `firehose` harness
+shape hits this (it sets `ack_delay = None`); a fixed-time-step poll loop is
+also a factor — a one-line `window_to_update` SWS relaxation alone did not clear
+it.
+
+Not a real-consumer hazard: with the default 10 ms delayed ACK the periodic ACKs
+carry the reopened window, so `tests/netsim.rs` (same unidirectional bulk shape,
+default config) transfers at full throughput at 0 loss. Route per the table
+above — file upstream; the proper fix is RFC 1122 §4.2.3.3 receiver-side SWS
+avoidance (advertise once the window opens by ≥ min(MSS, buffer/2)).
+
 ## 11. Out of scope
 
 Things deliberately not addressed in this fork. Don't sink time here without
