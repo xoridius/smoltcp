@@ -18,18 +18,50 @@ git fetch upstream
 
 ## 2. Sync from upstream
 
+This fork branches from upstream at the **`v0.13.1`** tag — that commit is the
+merge-base. The full ancestry is shared with `smoltcp-rs/smoltcp` all the way
+back to its first commit; the fork's own work is the commits in
+`v0.13.1..HEAD`.
+
+**Shallow-clone gotcha.** CI / cloud / agent checkouts of this repo are often
+*shallow*, which truncates local history above `v0.13.1`. In that state
+`git merge-base HEAD upstream/main` returns nothing and `git merge` / `git
+rebase` onto upstream misbehave — not because the histories are unrelated, but
+because the common ancestor is below the fetch horizon. Restore it first:
+
 ```
-git fetch upstream main
-git log --oneline HEAD..upstream/main
-git merge --ff-only upstream/main || git merge upstream/main
-# resolve conflicts (most likely in src/socket/tcp.rs and
-# src/socket/tcp/congestion*.rs — these have the most local edits)
-# run the test matrix in §3
-git push origin main
+git fetch --unshallow origin     # no-op if already a full clone
+git remote add upstream https://github.com/smoltcp-rs/smoltcp.git  # if missing
+git fetch upstream
+git merge-base HEAD upstream/main # should print the v0.13.1 commit
 ```
 
-Prefer fast-forward when possible. Never rebase published commits. Never
-force-push `main`.
+Recommended sync is **cherry-pick**, not a wholesale merge: the local edits to
+`src/socket/tcp.rs` and `src/socket/tcp/congestion*.rs` are heavy enough that a
+full `git merge upstream/main` conflicts across most of those files. Pull only
+the PRs you want:
+
+```
+# 1. See what is new upstream and not yet triaged (adds + fetches the
+#    `upstream` remote automatically; cross-references §16). Works even in a
+#    shallow clone — it only needs the upstream side, which is fetched fully.
+tools/upstream-delta.sh
+
+# 2. For each PR marked NEW, on the dev branch, cherry-pick its commits:
+git log --oneline v0.13.1..upstream/main      # find the commit SHAs for the PR
+git cherry-pick <sha>...                        # or hand-port if it conflicts
+
+# 3. Conflicts cluster in src/socket/tcp.rs and src/socket/tcp/congestion*.rs
+#    (the most locally-edited files). Re-apply the local hooks; see §16 for
+#    which fork adaptations sit on top of upstream there.
+
+# 4. Run the full test matrix in §3 (+ the harness regression sweep in §4 for
+#    anything touching the data path), then record the outcome in §16.
+```
+
+Never rebase published commits. Never force-push the published branch. §16
+records which post-0.13.1 upstream PRs are already backported or deliberately
+skipped — `tools/upstream-delta.sh` flags anything not in that list as `NEW`.
 
 After every sync, re-check `Cargo.toml`'s feature list against the test matrix
 in §3 — upstream occasionally adds or renames features.
@@ -52,6 +84,9 @@ cargo test --release --lib --no-default-features \
 
 cargo test --release --lib --no-default-features \
   --features "alloc,medium-ethernet,proto-ipv4,proto-ipv6,socket-raw,socket-udp,socket-tcp,socket-icmp,proto-ipv6-slaac"
+
+cargo test --release --lib --no-default-features \
+  --features "alloc,medium-ethernet,proto-ipv4,proto-ipv6,socket-raw,socket-udp,socket-tcp,socket-icmp,proto-ipv6-slaac,socket-tcp-cubic,socket-tcp-reno"
 
 cargo clippy --release --lib --tests
 cargo +nightly bench --bench bench
@@ -419,6 +454,11 @@ Interpretation rules:
 - **`RSS verdict: bounded`** when final RSS stays within the harness threshold
   relative to the median. `GROWTH` flags a possible leak; drop into
   massif/heaptrack to confirm.
+- **`reserved total` in lane stats is profiling-harness memory**, not smoltcp
+  socket memory. The paired in-memory link preallocates packet buffers so
+  trace-mode runs avoid allocator noise. For iOS packet-tunnel budget claims,
+  use the TCP pool readings and `dynbuf_memcompare`; the lane reservation is
+  a local transport artifact that `NEPacketTunnelFlow` does not allocate.
 - **`bytes allocated` should closely track `bytes freed`** in steady state. A persistent imbalance
   means a buffer that isn't returning to its pool, a held reference, or a
   growing data structure.
@@ -578,6 +618,16 @@ Operational notes:
   coverage has plateaued; bumping `-max_len` or expanding the
   discriminator usually re-opens it.
 
+Coverage gap (tracked): every target above is wire-level (parse/emit). The
+TCP socket state machine — and with it the congestion controllers, the
+`cwnd_remaining`/`flight_size` accounting, and SACK recovery (§15) — has no
+coverage-guided target; it is exercised only by the unit-test matrix and the
+per-controller netsim sweeps. A state-machine target that drives a `Socket`
+through `process`/`dispatch` with mutated `TcpRepr` segments (upstream's #1143
+`iface` fuzzer is the reference, though it must be adapted to this fork's
+retained `tcp_headers`/`FuzzInjector` setup) would close it. Worth a dedicated
+run.
+
 ### 7.2 MIRI
 
 ```
@@ -631,6 +681,24 @@ hides the actual commit in `Cargo.lock`, where it silently drifts on
   specific commit.
 - Profiling harness or sizecheck-test bug → file in this repo.
 
+### 10.1 Known upstream latent bug: window-update SWS deadlock
+
+`Socket::window_to_update` (identical to upstream) only advertises a reopened
+receive window when it has *doubled* (`new_win / 2 >= last_win`). Once the last
+advertised window exceeds half the receive buffer this can never fire, so a
+**unidirectional bulk receiver with delayed ACK disabled** (`ack_delay = None`)
+can deadlock: the sender blocks on a stale window and no return data carries the
+update, until a zero-window probe inches it forward. The `firehose` harness
+shape hits this (it sets `ack_delay = None`); a fixed-time-step poll loop is
+also a factor — a one-line `window_to_update` SWS relaxation alone did not clear
+it.
+
+Not a real-consumer hazard: with the default 10 ms delayed ACK the periodic ACKs
+carry the reopened window, so `tests/netsim.rs` (same unidirectional bulk shape,
+default config) transfers at full throughput at 0 loss. Route per the table
+above — file upstream; the proper fix is RFC 1122 §4.2.3.3 receiver-side SWS
+avoidance (advertise once the window opens by ≥ min(MSS, buffer/2)).
+
 ## 11. Out of scope
 
 Things deliberately not addressed in this fork. Don't sink time here without
@@ -670,7 +738,7 @@ map for triage:
 |---|---|
 | Wire-layer perf (vectorized checksum, single-buffer pseudo-header) | Yes; low-controversy, file as perf PRs. |
 | Bug fixes (big-endian checksum, IPv6 zero-csum reject, BPF length) | Yes; file as bug-fix PRs with the failing case. |
-| RFC compliance (PAWS, IW10, rwnd-shrink) | Yes; file with RFC citation. |
+| RFC compliance (PAWS, IW10) | Yes; file with RFC citation. |
 | SACK-based selective retransmission (§15) | Yes; RFC 2018/6675/6582 citations plus the netsim multi-seed evidence. The NoControl redundant pass needs design discussion. |
 | Phy hardening (panic → log+drop) | Likely; brief design discussion. |
 | Field-type shrink (`usize → u32`) | Low-controversy; easy PR. |
@@ -738,7 +806,7 @@ current isolated runs on the same host and revision. The durable gates are:
 | `multi_tcp` | per-thread Jain >= 0.95, bounded pool CAS retries, `pool used (end)` returns to 0, trace-mode lane fallback allocs 0. |
 | `multi_tcp_sink` | same pool and lane gates as `multi_tcp`; compare Time/CPU Profiler hotspots against `multi_tcp` for lower app-side copy pressure before claiming a copy win. |
 | `churn` | achieved close rate tracks target rate, post-teardown `pool used (end) == 0` (the at-deadline reading may be small and bounded), net heap delta does not grow with connection rate. |
-| `idle_hot` | `pool used post-create == 0`; steady pool charge is proportional only to active client/server sockets; `n_active=0` is valid and should keep steady pool use at 0. |
+| `idle_hot` | `pool used post-create == 0`; steady pool charge is proportional only to active client/server sockets; lane `reserved total` is harness-only and must be kept separate from iOS socket-budget claims; `n_active=0` is valid and should keep steady pool use at 0. |
 
 Sub-linear scaling at higher thread counts is expected once every worker is
 CPU-bound. Jain below the gate across threads suggests `MemoryPool` contention
@@ -982,7 +1050,11 @@ goes to reassembly holes — where `NoControl` deliberately falls back to a
 redundant in-order pass after the holes.
 
 Validate a configuration change with `pool_capacity_floor_*`-style tests,
-`dynbuf_memcompare`, and the `churn`/`idle_hot` shapes (§4.2.1).
+`dynbuf_memcompare`, and the `churn`/`idle_hot` shapes (§4.2.1). When using
+`profile_loopback` on macOS, keep the printed lane `reserved total` out of the
+iOS memory budget: it is the harness's preallocated paired-link packet pool,
+not memory that dynamic TCP sockets or `NEPacketTunnelFlow` consume in a packet
+tunnel extension.
 
 ## 15. SACK-based selective retransmission
 
@@ -1013,9 +1085,56 @@ Design, in `src/socket/tcp.rs`:
   solicits a fresh ACK (lost-cumACK repair in one RTT). Under Reno/Cubic
   (`AnyController::manages_window`) the pass is skipped.
 
+The `in_flight` signal handed to the congestion controller is the simple
+`flight_size()` = `remote_last_seq - local_seq_no`, i.e. the send cursor, not
+an RFC 6675 pipe estimate. During the selective walk the cursor is rewound, so
+this can transiently under-report bytes genuinely outstanding above the holes;
+the only consequence is mildly conservative cwnd growth (e.g. Cubic may treat a
+recovery lull as idle and slide its epoch). A true pipe estimate is the RFC 6675
+work that stays out of scope here.
+
 Evidence gates (re-measure per host; see §13 policy): deterministic
 netsim across 16 seeds at 32 KiB buffers — mean ±0% at 2% loss, +6% at
 5%, +36% at 10%; real-kernel TUN interop at 5% loss — multi-fold faster
 with the RTO tail eliminated, byte-exact. Clean-path throughput
 unchanged. RACK-TLP and pacing remain out of scope (§11) until profile
 evidence demands them.
+
+In-tree regression coverage: `tests/netsim.rs` runs the buffer×loss sweep
+under each controller — `netsim` (NoControl), `netsim_cubic`, `netsim_reno`
+(the last two gated on their features) — each pinned to its own snapshot. The
+snapshots confirm SACK + the RFC-compliant controllers degrade monotonically
+and deterministically with loss; NoControl blasts-and-SACK-repairs (highest raw
+throughput, no back-off) while Cubic/Reno throttle on loss as a real controller
+must. Run via `./ci.sh netsim`.
+
+## 16. Backported post-0.13.1 upstream changes
+
+The fork branches from `v0.13.1` (see §2). The changes below were
+cherry-picked from upstream commits that landed on `upstream/main` after that
+tag. A future maintainer reconciling against upstream should treat these as
+already present and avoid re-applying them. Each fork commit names the
+upstream PR/commit it came from.
+
+| Upstream PR | What | Fork adaptation |
+|---|---|---|
+| #1150 | `PacketBuffer`: reserve metadata slot before payload closure | verbatim |
+| #1152 | `#[collapse_debuginfo]` on logging macros | verbatim |
+| #1159 | deterministic `config.rs` via `BTreeMap` | verbatim |
+| #1162 + #1164 | out-of-window RX: drop OOW RST, exempt OOW data ACKs from rate limiting | verbatim production change; netsim snapshot rebaselined |
+| #1161 | effective MSS subtracts options length; `MIN_REMOTE_MSS` clamp | adapted for `remote_mss: u32`; preserves the adjacent SACK clamp |
+| #1154 / #1156 / #1157 + RTT parts of #1155 | RFC-compliant congestion-control redesign (new Controller API, Reno/CUBIC fast recovery, RTT estimator `on_rto`/`on_retransmit` split, `smoothed_rtt`) | `reno.rs`/`cubic.rs` are taken **verbatim from upstream** save for one fork delta: `set_mss` opens the window at RFC 6928 IW10 instead of upstream's 2*MSS (faster first-RTT ramp; guarded by `*_iw10_on_set_mss`/`*_rwnd_is_grow_only` tests). The fork's static-dispatch `AnyController` wrappers live in `congestion.rs` and are unaffected. The pre-redesign fork shrank these window fields to `u32` and tracked rwnd shrinks in the controller; both were **dropped** — the `u32` shrink saved ~24 B/socket (negligible vs the buffer pool) at the cost of pervasive casts and heavy divergence, and the controller rwnd-shrink collapsed cwnd on transient receive-window dips once the cwnd-vs-in-flight accounting was corrected. The live receive window is still enforced at the socket layer. |
+
+Deliberately **not** taken:
+
+- The dispatch-side fast-retransmit rework in #1155
+  (`pending_fast_retransmit` + single-segment resend from `flight_size()`).
+  The fork's SACK selective retransmission (§15) is a strictly more
+  capable loss-recovery path occupying the same dispatch region; the new
+  congestion controllers supply the cwnd dynamics that recovery defers to.
+- The fuzz-suite revamp (#1143) — the fork carries its own suite (§7.1).
+- The netsim harness rewrite / multiflow test (#1153) — its snapshots are
+  upstream-stack throughput fingerprints that do not match this fork.
+
+Still ahead of upstream (candidate to upstream per §12): RFC 6928 IW10 in
+`set_mss` (upstream's redesigned Reno/CUBIC open at 2*MSS).

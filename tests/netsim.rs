@@ -22,10 +22,10 @@ const BYTES: usize = 10 * 1024 * 1024;
 
 static CLOCK: Mutex<(Instant, char)> = Mutex::new((Instant::ZERO, ' '));
 
-#[test]
-fn netsim() {
-    setup_logging();
-
+// A buffer-size x loss-rate throughput sweep under one congestion controller.
+// The sender (socket_b) runs `cc`; the deterministic ChaCha20 link seeds keep
+// the table reproducible across runs.
+fn run_sweep(cc: tcp::CongestionControl) -> String {
     let buffers = [128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768];
     let losses = [0.0, 0.001, 0.01, 0.02, 0.05, 0.10, 0.20, 0.30];
 
@@ -33,7 +33,7 @@ fn netsim() {
 
     write!(&mut s, "buf\\loss").unwrap();
     for loss in losses {
-        write!(&mut s, "{loss:9.3} ").unwrap();
+        write!(&mut s, " {loss:9.3}").unwrap();
     }
     writeln!(&mut s).unwrap();
 
@@ -44,19 +44,44 @@ fn netsim() {
                 rtt: Duration::from_millis(100),
                 buffer,
                 loss,
+                cc,
             });
             write!(&mut s, " {r:9.2}").unwrap();
         }
         writeln!(&mut s).unwrap();
     }
 
-    insta::assert_snapshot!(s);
+    s
+}
+
+#[test]
+fn netsim() {
+    setup_logging();
+    insta::assert_snapshot!(run_sweep(tcp::CongestionControl::None));
+}
+
+// SACK selective retransmission (always on) under the RFC-compliant
+// controllers: confirms loss recovery degrades gracefully and deterministically
+// once a real congestion controller drives cwnd, not just NoControl.
+#[cfg(feature = "socket-tcp-cubic")]
+#[test]
+fn netsim_cubic() {
+    setup_logging();
+    insta::assert_snapshot!(run_sweep(tcp::CongestionControl::Cubic));
+}
+
+#[cfg(feature = "socket-tcp-reno")]
+#[test]
+fn netsim_reno() {
+    setup_logging();
+    insta::assert_snapshot!(run_sweep(tcp::CongestionControl::Reno));
 }
 
 struct TestCase {
     rtt: Duration,
     loss: f64,
     buffer: usize,
+    cc: tcp::CongestionControl,
 }
 
 fn run_test(case: TestCase) -> f64 {
@@ -99,6 +124,11 @@ fn run_test(case: TestCase) -> f64 {
     let mut sockets_b: [_; 2] = Default::default();
     let mut sockets_b = SocketSet::new(&mut sockets_b[..]);
     let socket_b_handle = sockets_b.add(socket_b);
+
+    // socket_b is the data sender; the controller only matters there.
+    sockets_b
+        .get_mut::<tcp::Socket>(socket_b_handle)
+        .set_congestion_control(case.cc);
 
     let mut did_listen = false;
     let mut did_connect = false;
@@ -360,5 +390,8 @@ pub fn setup_logging() {
             }
         })
         .parse_env("RUST_LOG")
-        .init();
+        // try_init (not init): several netsim tests share one binary and each
+        // calls setup_logging; the global logger may only be set once.
+        .try_init()
+        .ok();
 }
