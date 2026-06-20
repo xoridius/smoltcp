@@ -116,9 +116,14 @@ impl Controller for Reno {
     }
 
     fn set_remote_window(&mut self, remote_window: usize) {
-        // Track the peer's currently advertised window, including shrinks
-        // (RFC 793 allows the receiver to reduce its window).
-        self.rwnd = remote_window.min(u32::MAX as usize) as u32;
+        // High-water mark of the peer's advertised window, used only to bound
+        // cwnd growth — the live receive window is enforced separately at the
+        // socket layer. Grow-only (as upstream) so a transient receiver-window
+        // shrink does not drag the congestion window down with it.
+        let remote_window = remote_window.min(u32::MAX as usize) as u32;
+        if self.rwnd < remote_window {
+            self.rwnd = remote_window;
+        }
     }
 }
 
@@ -430,15 +435,15 @@ mod test {
         assert_eq!(reno.window(), 17_920);
     }
 
-    // set_remote_window must track the current advertised window, including shrinks.
+    // The CC's rwnd is a grow-only high-water mark: a smaller advertised
+    // window must not pull it (and thus cwnd) down. The live receive window is
+    // enforced at the socket layer, not here.
     #[test]
-    fn reno_rwnd_can_shrink() {
+    fn reno_rwnd_is_grow_only() {
         let mut reno = Reno::new();
         reno.set_remote_window(64 * 1024);
         reno.set_remote_window(4 * 1024);
-        reno.set_mss(1460);
-        reno.on_ack(Instant::from_millis(0), 100_000, 0, &RttEstimator::default());
-        assert!(reno.window() <= 4 * 1024);
+        assert_eq!(reno.rwnd, 64 * 1024);
     }
 
     #[test]

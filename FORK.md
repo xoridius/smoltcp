@@ -671,7 +671,7 @@ map for triage:
 |---|---|
 | Wire-layer perf (vectorized checksum, single-buffer pseudo-header) | Yes; low-controversy, file as perf PRs. |
 | Bug fixes (big-endian checksum, IPv6 zero-csum reject, BPF length) | Yes; file as bug-fix PRs with the failing case. |
-| RFC compliance (PAWS, IW10, rwnd-shrink) | Yes; file with RFC citation. |
+| RFC compliance (PAWS, IW10) | Yes; file with RFC citation. |
 | SACK-based selective retransmission (§15) | Yes; RFC 2018/6675/6582 citations plus the netsim multi-seed evidence. The NoControl redundant pass needs design discussion. |
 | Phy hardening (panic → log+drop) | Likely; brief design discussion. |
 | Field-type shrink (`usize → u32`) | Low-controversy; easy PR. |
@@ -1036,7 +1036,7 @@ upstream PR/commit it came from.
 | #1159 | deterministic `config.rs` via `BTreeMap` | verbatim |
 | #1162 + #1164 | out-of-window RX: drop OOW RST, exempt OOW data ACKs from rate limiting | verbatim production change; netsim snapshot rebaselined |
 | #1161 | effective MSS subtracts options length; `MIN_REMOTE_MSS` clamp | adapted for `remote_mss: u32`; preserves the adjacent SACK clamp |
-| #1154 / #1156 / #1157 + RTT parts of #1155 | RFC-compliant congestion-control redesign (new Controller API, Reno/CUBIC fast recovery, RTT estimator `on_rto`/`on_retransmit` split, `smoothed_rtt`) | u32 window fields, RFC 6928 IW10, and RFC 793 rwnd-shrink re-applied on top; static-dispatch `AnyController` wrappers retained; CUBIC CA increment computed in u64 to avoid u32 overflow |
+| #1154 / #1156 / #1157 + RTT parts of #1155 | RFC-compliant congestion-control redesign (new Controller API, Reno/CUBIC fast recovery, RTT estimator `on_rto`/`on_retransmit` split, `smoothed_rtt`) | u32 window fields and RFC 6928 IW10 re-applied on top; static-dispatch `AnyController` wrappers retained; CUBIC CA increment computed in u64 to avoid u32 overflow. The pre-redesign fork carried a controller-level rwnd-shrink in `set_remote_window`; it was **dropped** here (kept grow-only, as upstream) because, with the now-correct cwnd-vs-in-flight accounting, following the receive window down collapses cwnd on transient dips. The live receive window is enforced at the socket layer, so no correctness is lost. |
 
 Deliberately **not** taken:
 
@@ -1049,6 +1049,5 @@ Deliberately **not** taken:
 - The netsim harness rewrite / multiflow test (#1153) — its snapshots are
   upstream-stack throughput fingerprints that do not match this fork.
 
-Still ahead of upstream (candidates to upstream per §12): RFC 793 rwnd
-shrink tracking in `set_remote_window` (upstream's redesigned Reno/CUBIC
-are still grow-only) and RFC 6928 IW10 in `set_mss`.
+Still ahead of upstream (candidate to upstream per §12): RFC 6928 IW10 in
+`set_mss` (upstream's redesigned Reno/CUBIC open at 2*MSS).
