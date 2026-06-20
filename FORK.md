@@ -18,19 +18,34 @@ git fetch upstream
 
 ## 2. Sync from upstream
 
+This fork has an **independent git history** — it was seeded from a `v0.13.1`
+snapshot, not branched from upstream, so there is *no merge-base* with
+`upstream/main`. `git merge upstream/main` is therefore not usable (it would
+try to join two unrelated histories). Sync by **cherry-picking** specific
+upstream commits.
+
+Workflow:
+
 ```
-git fetch upstream main
-git log --oneline HEAD..upstream/main
-git merge --ff-only upstream/main || git merge upstream/main
-# resolve conflicts (most likely in src/socket/tcp.rs and
-# src/socket/tcp/congestion*.rs — these have the most local edits)
-# run the test matrix in §3
-git push origin main
+# 1. See what is new upstream and not yet triaged (adds + fetches the
+#    `upstream` remote automatically; cross-references §16):
+tools/upstream-delta.sh
+
+# 2. For each PR marked NEW, on the dev branch, cherry-pick its commits:
+git log --oneline v0.13.1..upstream/main      # find the commit SHAs for the PR
+git cherry-pick <sha>...                        # or hand-port if it conflicts
+
+# 3. Conflicts cluster in src/socket/tcp.rs and src/socket/tcp/congestion*.rs
+#    (the most locally-edited files). Re-apply the local hooks; see §16 for
+#    which fork adaptations sit on top of upstream there.
+
+# 4. Run the full test matrix in §3 (+ the harness regression sweep in §4 for
+#    anything touching the data path), then record the outcome in §16.
 ```
 
-Prefer fast-forward when possible. Never rebase published commits. Never
-force-push `main`. §16 records which post-0.13.1 upstream PRs are already
-backported — do not re-apply those.
+Never rebase published commits. Never force-push the published branch. §16
+records which post-0.13.1 upstream PRs are already backported or deliberately
+skipped — `tools/upstream-delta.sh` flags anything not in that list as `NEW`.
 
 After every sync, re-check `Cargo.toml`'s feature list against the test matrix
 in §3 — upstream occasionally adds or renames features.
