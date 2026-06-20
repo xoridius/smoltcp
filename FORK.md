@@ -18,17 +18,33 @@ git fetch upstream
 
 ## 2. Sync from upstream
 
-This fork has an **independent git history** — it was seeded from a `v0.13.1`
-snapshot, not branched from upstream, so there is *no merge-base* with
-`upstream/main`. `git merge upstream/main` is therefore not usable (it would
-try to join two unrelated histories). Sync by **cherry-picking** specific
-upstream commits.
+This fork branches from upstream at the **`v0.13.1`** tag — that commit is the
+merge-base. The full ancestry is shared with `smoltcp-rs/smoltcp` all the way
+back to its first commit; the fork's own work is the commits in
+`v0.13.1..HEAD`.
 
-Workflow:
+**Shallow-clone gotcha.** CI / cloud / agent checkouts of this repo are often
+*shallow*, which truncates local history above `v0.13.1`. In that state
+`git merge-base HEAD upstream/main` returns nothing and `git merge` / `git
+rebase` onto upstream misbehave — not because the histories are unrelated, but
+because the common ancestor is below the fetch horizon. Restore it first:
+
+```
+git fetch --unshallow origin     # no-op if already a full clone
+git remote add upstream https://github.com/smoltcp-rs/smoltcp.git  # if missing
+git fetch upstream
+git merge-base HEAD upstream/main # should print the v0.13.1 commit
+```
+
+Recommended sync is **cherry-pick**, not a wholesale merge: the local edits to
+`src/socket/tcp.rs` and `src/socket/tcp/congestion*.rs` are heavy enough that a
+full `git merge upstream/main` conflicts across most of those files. Pull only
+the PRs you want:
 
 ```
 # 1. See what is new upstream and not yet triaged (adds + fetches the
-#    `upstream` remote automatically; cross-references §16):
+#    `upstream` remote automatically; cross-references §16). Works even in a
+#    shallow clone — it only needs the upstream side, which is fetched fully.
 tools/upstream-delta.sh
 
 # 2. For each PR marked NEW, on the dev branch, cherry-pick its commits:
@@ -1038,9 +1054,9 @@ evidence demands them.
 
 ## 16. Backported post-0.13.1 upstream changes
 
-The fork was seeded from `v0.13.1`. The changes below were cherry-picked
-from upstream commits that landed on `upstream/main` after that tag. A
-future maintainer reconciling against upstream should treat these as
+The fork branches from `v0.13.1` (see §2). The changes below were
+cherry-picked from upstream commits that landed on `upstream/main` after that
+tag. A future maintainer reconciling against upstream should treat these as
 already present and avoid re-applying them. Each fork commit names the
 upstream PR/commit it came from.
 

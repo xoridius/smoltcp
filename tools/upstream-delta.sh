@@ -4,9 +4,12 @@
 # fork's base tag and are NOT yet recorded in FORK.md §16 (backported or
 # deliberately skipped).
 #
-# This fork has an INDEPENDENT git history (no merge-base with upstream), so
-# `git merge upstream/main` is not usable — changes are cherry-picked. This
-# script answers "what is new upstream that we haven't triaged yet?".
+# The fork branches from upstream at v0.13.1, but changes are cherry-picked
+# rather than merged (the local edits to tcp.rs / congestion*.rs make a full
+# merge conflict-heavy). This script answers "what is new upstream that we
+# haven't triaged yet?". It only inspects the upstream side, so it works even
+# in a shallow clone where `git merge-base` against upstream would fail. See
+# FORK.md §2 for the shallow-clone caveat.
 #
 # Usage:
 #   tools/upstream-delta.sh [base-tag]      # default base tag: v0.13.1
