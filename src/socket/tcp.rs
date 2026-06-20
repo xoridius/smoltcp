@@ -2321,18 +2321,19 @@ impl<'a> Socket<'a> {
                         self.timer.set_for_close(cx.now());
                     }
 
-                    // Segments carrying data are exempt from challenge ACK rate
-                    // limiting: an out-of-window data segment is a retransmission
-                    // whose ACK was lost, or a window probe, and per RFC 9293
-                    // (3.10.7.4, 3.8.6.1) it should elicit an ACK so the remote
-                    // can make progress. Withholding these ACKs strands the
-                    // remote in retransmission backoff or persist state. The
-                    // rate limit exists to break ACK loops between desynced
-                    // peers, and exempting data segments cannot sustain such a
-                    // loop: the remote paces them with its retransmission and
-                    // persist timers, and the data it may send in response to a
-                    // duplicate ACK of ours (fast recovery) is bounded by its
-                    // send window, which never advances during a desync.
+                    // Segments carrying data or FIN are exempt from challenge
+                    // ACK rate limiting: an out-of-window retransmission whose
+                    // ACK was lost, or a window probe, should elicit an ACK so
+                    // the remote can make progress (RFC 9293 3.10.7.4,
+                    // 3.8.6.1). Withholding these ACKs strands the remote in
+                    // retransmission backoff or persist state. The rate limit
+                    // exists to break ACK loops between desynced peers, and
+                    // exempting sequence-space-consuming retransmissions cannot
+                    // sustain such a loop: the remote paces them with its
+                    // retransmission and persist timers, and the data it may
+                    // send in response to a duplicate ACK of ours (fast
+                    // recovery) is bounded by its send window, which never
+                    // advances during a desync.
                     //
                     // The exemption covers FIN (a retransmitted final segment is
                     // the same lost-ACK situation) but not SYN: a SYN in a
@@ -2341,7 +2342,9 @@ impl<'a> Socket<'a> {
                     // One per second is ample for a restarted peer to complete
                     // the challenge exchange, since it retransmits its SYN on
                     // its own timer.
-                    if !repr.payload.is_empty()
+                    let consumes_sequence =
+                        !repr.payload.is_empty() || matches!(repr.control, TcpControl::Fin);
+                    if consumes_sequence
                         && matches!(
                             repr.control,
                             TcpControl::None | TcpControl::Psh | TcpControl::Fin
@@ -6270,6 +6273,64 @@ mod test {
             Some(TcpRepr {
                 seq_number: LOCAL_SEQ + 1,
                 ack_number: Some(REMOTE_SEQ + 1 + 6),
+                ..RECV_TEMPL
+            })
+        );
+    }
+
+    #[test]
+    fn test_old_fin_ack_not_rate_limited() {
+        let mut s = socket_established();
+        send!(
+            s,
+            TcpRepr {
+                control: TcpControl::Fin,
+                seq_number: REMOTE_SEQ + 1,
+                ack_number: Some(LOCAL_SEQ + 1),
+                ..SEND_TEMPL
+            }
+        );
+        recv!(
+            s,
+            [TcpRepr {
+                seq_number: LOCAL_SEQ + 1,
+                ack_number: Some(REMOTE_SEQ + 2),
+                ..RECV_TEMPL
+            }]
+        );
+        assert_eq!(s.state, State::CloseWait);
+
+        // The remote retransmits the bare FIN because our ACK was lost.
+        // FIN consumes one sequence-space byte even without payload, so each
+        // retransmission must receive the duplicate ACK that lets the peer
+        // leave FIN retransmission backoff.
+        send!(
+            s,
+            time 100,
+            TcpRepr {
+                control: TcpControl::Fin,
+                seq_number: REMOTE_SEQ + 1,
+                ack_number: Some(LOCAL_SEQ + 1),
+                ..SEND_TEMPL
+            },
+            Some(TcpRepr {
+                seq_number: LOCAL_SEQ + 1,
+                ack_number: Some(REMOTE_SEQ + 2),
+                ..RECV_TEMPL
+            })
+        );
+        send!(
+            s,
+            time 200,
+            TcpRepr {
+                control: TcpControl::Fin,
+                seq_number: REMOTE_SEQ + 1,
+                ack_number: Some(LOCAL_SEQ + 1),
+                ..SEND_TEMPL
+            },
+            Some(TcpRepr {
+                seq_number: LOCAL_SEQ + 1,
+                ack_number: Some(REMOTE_SEQ + 2),
                 ..RECV_TEMPL
             })
         );
