@@ -85,6 +85,9 @@ cargo test --release --lib --no-default-features \
 cargo test --release --lib --no-default-features \
   --features "alloc,medium-ethernet,proto-ipv4,proto-ipv6,socket-raw,socket-udp,socket-tcp,socket-icmp,proto-ipv6-slaac"
 
+cargo test --release --lib --no-default-features \
+  --features "alloc,medium-ethernet,proto-ipv4,proto-ipv6,socket-raw,socket-udp,socket-tcp,socket-icmp,proto-ipv6-slaac,socket-tcp-cubic,socket-tcp-reno"
+
 cargo clippy --release --lib --tests
 cargo +nightly bench --bench bench
 ```
@@ -451,6 +454,11 @@ Interpretation rules:
 - **`RSS verdict: bounded`** when final RSS stays within the harness threshold
   relative to the median. `GROWTH` flags a possible leak; drop into
   massif/heaptrack to confirm.
+- **`reserved total` in lane stats is profiling-harness memory**, not smoltcp
+  socket memory. The paired in-memory link preallocates packet buffers so
+  trace-mode runs avoid allocator noise. For iOS packet-tunnel budget claims,
+  use the TCP pool readings and `dynbuf_memcompare`; the lane reservation is
+  a local transport artifact that `NEPacketTunnelFlow` does not allocate.
 - **`bytes allocated` should closely track `bytes freed`** in steady state. A persistent imbalance
   means a buffer that isn't returning to its pool, a held reference, or a
   growing data structure.
@@ -798,7 +806,7 @@ current isolated runs on the same host and revision. The durable gates are:
 | `multi_tcp` | per-thread Jain >= 0.95, bounded pool CAS retries, `pool used (end)` returns to 0, trace-mode lane fallback allocs 0. |
 | `multi_tcp_sink` | same pool and lane gates as `multi_tcp`; compare Time/CPU Profiler hotspots against `multi_tcp` for lower app-side copy pressure before claiming a copy win. |
 | `churn` | achieved close rate tracks target rate, post-teardown `pool used (end) == 0` (the at-deadline reading may be small and bounded), net heap delta does not grow with connection rate. |
-| `idle_hot` | `pool used post-create == 0`; steady pool charge is proportional only to active client/server sockets; `n_active=0` is valid and should keep steady pool use at 0. |
+| `idle_hot` | `pool used post-create == 0`; steady pool charge is proportional only to active client/server sockets; lane `reserved total` is harness-only and must be kept separate from iOS socket-budget claims; `n_active=0` is valid and should keep steady pool use at 0. |
 
 Sub-linear scaling at higher thread counts is expected once every worker is
 CPU-bound. Jain below the gate across threads suggests `MemoryPool` contention
@@ -1042,7 +1050,11 @@ goes to reassembly holes — where `NoControl` deliberately falls back to a
 redundant in-order pass after the holes.
 
 Validate a configuration change with `pool_capacity_floor_*`-style tests,
-`dynbuf_memcompare`, and the `churn`/`idle_hot` shapes (§4.2.1).
+`dynbuf_memcompare`, and the `churn`/`idle_hot` shapes (§4.2.1). When using
+`profile_loopback` on macOS, keep the printed lane `reserved total` out of the
+iOS memory budget: it is the harness's preallocated paired-link packet pool,
+not memory that dynamic TCP sockets or `NEPacketTunnelFlow` consume in a packet
+tunnel extension.
 
 ## 15. SACK-based selective retransmission
 

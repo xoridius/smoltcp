@@ -36,7 +36,13 @@ if ! git rev-parse -q --verify "${BASE_TAG}^{commit}" >/dev/null; then
 fi
 
 # PR numbers already recorded in FORK.md §16 (backported OR deliberately skipped).
-recorded="$(grep -oE '#[0-9]+' FORK.md | tr -d '#' | sort -u)"
+recorded="$(
+    awk '
+        /^## 16[. ]/ { in_section = 1; next }
+        in_section && /^## [0-9]+[. ]/ { exit }
+        in_section { print }
+    ' FORK.md | grep -oE '#[0-9]+' | tr -d '#' | sort -u || true
+)"
 
 total=0
 new=0

@@ -2,15 +2,25 @@ use crate::{socket::tcp::RttEstimator, time::Instant};
 
 use super::Controller;
 
-const DEFAULT_MSS: usize = 1024;
+const DEFAULT_MSS: u32 = 1024;
+
+#[inline]
+fn window_to_u32(window: usize) -> u32 {
+    window.min(u32::MAX as usize) as u32
+}
+
+#[inline]
+fn half_window(in_flight: usize, mss: u32) -> u32 {
+    (window_to_u32(in_flight) >> 1).max(mss.saturating_mul(2))
+}
 
 #[derive(Debug)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct Reno {
-    cwnd: usize,
-    mss: usize,
-    ssthresh: usize,
-    rwnd: usize,
+    cwnd: u32,
+    mss: u32,
+    ssthresh: u32,
+    rwnd: u32,
 
     in_fast_recovery: bool,
     // Set on RTO, cleared when new data is ACKed. While set, further RTOs
@@ -24,7 +34,7 @@ impl Reno {
         Reno {
             cwnd: DEFAULT_MSS * 2,
             mss: DEFAULT_MSS,
-            ssthresh: usize::MAX,
+            ssthresh: u32::MAX,
             rwnd: 64 * DEFAULT_MSS,
             in_fast_recovery: false,
             in_rto_recovery: false,
@@ -34,7 +44,7 @@ impl Reno {
 
 impl Controller for Reno {
     fn window(&self) -> usize {
-        self.cwnd
+        self.cwnd as usize
     }
 
     fn on_ack(&mut self, _now: Instant, len: usize, _in_flight: usize, _rtt: &RttEstimator) {
@@ -58,10 +68,16 @@ impl Controller for Reno {
 
         let inc = if self.cwnd < self.ssthresh {
             // Slow start: increase `cwnd` by 1 MSS per ACK.
-            len.min(self.mss)
+            window_to_u32(len).min(self.mss)
         } else {
             // Congestion avoidance: increase by ~1 MSS per RTT.
-            (self.mss * self.mss / self.cwnd).max(1)
+            if self.cwnd == 0 {
+                1
+            } else {
+                ((self.mss as u64 * self.mss as u64) / self.cwnd as u64)
+                    .max(1)
+                    .min(u32::MAX as u64) as u32
+            }
         };
 
         self.cwnd = self.cwnd.saturating_add(inc).min(self.rwnd).max(self.mss);
@@ -69,15 +85,22 @@ impl Controller for Reno {
 
     fn on_dup_ack(&mut self, _now: Instant, len: usize, _in_flight: usize) {
         if self.in_fast_recovery {
-            self.cwnd = self.cwnd.saturating_add(len).min(self.rwnd).max(self.mss);
+            self.cwnd = self
+                .cwnd
+                .saturating_add(window_to_u32(len))
+                .min(self.rwnd)
+                .max(self.mss);
         }
     }
 
     fn on_loss(&mut self, _now: Instant, in_flight: usize) {
         // Only cut window size on first entrance to fast recovery.
         if !self.in_fast_recovery {
-            self.ssthresh = (in_flight >> 1).max(2 * self.mss);
-            self.cwnd = self.ssthresh.min(self.rwnd).saturating_add(3 * self.mss);
+            self.ssthresh = half_window(in_flight, self.mss);
+            self.cwnd = self
+                .ssthresh
+                .min(self.rwnd)
+                .saturating_add(self.mss.saturating_mul(3));
 
             self.in_fast_recovery = true;
         }
@@ -88,7 +111,7 @@ impl Controller for Reno {
         // already been retransmitted by the timer (no new data was ACKed since
         // the previous RTO), ssthresh is held constant.
         if !self.in_rto_recovery {
-            self.ssthresh = (in_flight >> 1).max(2 * self.mss);
+            self.ssthresh = half_window(in_flight, self.mss);
             self.in_rto_recovery = true;
         }
 
@@ -100,15 +123,20 @@ impl Controller for Reno {
     }
 
     fn set_mss(&mut self, mss: usize) {
+        let mss = window_to_u32(mss);
         self.mss = mss;
         // Fork delta (FORK.md §16): open the window at RFC 6928 IW10 —
         // min(10*MSS, max(2*MSS, 14600)) — when the peer's MSS is learned on
         // the SYN, rather than upstream's flat 2*MSS. Faster first-RTT ramp for
         // short flows.
-        self.cwnd = self.cwnd.max((10 * mss).min((2 * mss).max(14_600)));
+        self.cwnd = self.cwnd.max(
+            mss.saturating_mul(10)
+                .min(mss.saturating_mul(2).max(14_600)),
+        );
     }
 
     fn set_remote_window(&mut self, remote_window: usize) {
+        let remote_window = window_to_u32(remote_window);
         if self.rwnd < remote_window {
             self.rwnd = remote_window;
         }
@@ -131,12 +159,16 @@ mod test {
         RttEstimator::default()
     }
 
+    fn stored(window: usize) -> u32 {
+        window_to_u32(window)
+    }
+
     #[test]
     fn congestion_avoidance_works() {
         let mut reno = Reno::new();
         reno.set_mss(MSS);
-        reno.cwnd = MSS * 32;
-        reno.ssthresh = MSS * 16;
+        reno.cwnd = stored(MSS * 32);
+        reno.ssthresh = stored(MSS * 16);
 
         // CA should grow at less than 1 MSS per ACK.
         for i in 0..10 {
@@ -148,14 +180,14 @@ mod test {
         // CA should cap at the receive window
         reno.cwnd = reno.rwnd - 1;
         ack(&mut reno, MSS, Instant::from_millis(20));
-        assert_eq!(reno.window(), reno.rwnd);
+        assert_eq!(reno.window(), reno.rwnd as usize);
     }
 
     #[test]
     fn fast_recovery_works() {
         let mut reno = Reno::new();
         reno.set_mss(MSS);
-        reno.cwnd = MSS * 32;
+        reno.cwnd = stored(MSS * 32);
 
         // duplicate ACKs before fast recovery should do nothing
         let initial_cwnd = reno.window();
@@ -169,8 +201,8 @@ mod test {
         // sstresh should be the reduced cwnd, advanced by MSS for the 3 dup ACKs
         let inflight = initial_cwnd / 2;
         reno.on_loss(Instant::from_millis(0), inflight);
-        assert_eq!(reno.ssthresh, inflight / 2);
-        assert_eq!(reno.cwnd, inflight / 2 + 3 * MSS);
+        assert_eq!(reno.ssthresh as usize, inflight / 2);
+        assert_eq!(reno.cwnd as usize, inflight / 2 + 3 * MSS);
 
         // in fast recovery, each dup-ACK should increase  the cwnd by 1 MSS
         let initial_cwnd = reno.window();
@@ -192,7 +224,7 @@ mod test {
 
         // a non-duplicate ACK exits fast recovery and enters congestion avoidance
         ack(&mut reno, MSS, Instant::from_millis(10));
-        assert_eq!(reno.window(), reno.ssthresh);
+        assert_eq!(reno.window(), reno.ssthresh as usize);
 
         // CA is slower growth so should be less than 1MSS per ACK
         let initial_cwnd = reno.window();
@@ -204,8 +236,8 @@ mod test {
     fn slow_start_works() {
         let mut reno = Reno::new();
         reno.set_mss(MSS);
-        reno.cwnd = MSS * 32;
-        reno.ssthresh = MSS * 16;
+        reno.cwnd = stored(MSS * 32);
+        reno.ssthresh = stored(MSS * 16);
 
         // we enter recovery upon major loss (an RTO)
         // window should become to 1MSS
@@ -213,7 +245,7 @@ mod test {
         let initial_cwnd = reno.window();
         let inflight = initial_cwnd;
         reno.on_rto(Instant::from_millis(0), initial_cwnd);
-        assert_eq!(reno.ssthresh, inflight / 2);
+        assert_eq!(reno.ssthresh as usize, inflight / 2);
         assert_eq!(reno.window(), MSS);
 
         // slow start grows by at most the MSS per ack
@@ -238,10 +270,10 @@ mod test {
 
         // slow start transitions to congestion avoidance at ssthresh
         let initial_cwnd = reno.window();
-        reno.ssthresh = initial_cwnd + MSS;
+        reno.ssthresh = stored(initial_cwnd + MSS);
         ack(&mut reno, MSS, Instant::from_millis(30));
         assert_eq!(reno.window(), initial_cwnd + MSS);
-        assert_eq!(reno.ssthresh, initial_cwnd + MSS);
+        assert_eq!(reno.ssthresh as usize, initial_cwnd + MSS);
 
         // slow start transitions to congestion avoidance at ssthresh
         // CA is slower growth so should be less than 1MSS per ACK
@@ -264,22 +296,22 @@ mod test {
             ack(&mut reno, MSS, Instant::from_millis(time));
         }
         assert_eq!(reno.window(), initial_cwnd + MSS * 30);
-        assert!(reno.window() < reno.ssthresh);
+        assert!(reno.window() < reno.ssthresh as usize);
 
         // rto: cwnd resets to MSS, ssthresh becomes half in-flight bytes
         let rto_cwnd = reno.window();
         reno.on_rto(Instant::from_millis(time), rto_cwnd);
         assert_eq!(reno.window(), MSS);
-        assert_eq!(reno.ssthresh, rto_cwnd / 2);
+        assert_eq!(reno.ssthresh as usize, rto_cwnd / 2);
 
         // slow start again until cwnd reaches new ssthresh
-        while reno.window() < reno.ssthresh {
+        while reno.window() < reno.ssthresh as usize {
             time += 1;
             let initial_cwnd = reno.window();
             ack(&mut reno, MSS, Instant::from_millis(time));
             assert_eq!(reno.window(), initial_cwnd + MSS);
         }
-        assert_eq!(reno.window(), reno.ssthresh);
+        assert_eq!(reno.window(), reno.ssthresh as usize);
 
         // ca: each ack at or above ssthresh grows by less than MSS
         time += 1;
@@ -303,14 +335,14 @@ mod test {
             ack(&mut reno, MSS, Instant::from_millis(time));
         }
         assert_eq!(reno.window(), initial_cwnd + MSS * 30);
-        assert!(reno.window() < reno.ssthresh);
+        assert!(reno.window() < reno.ssthresh as usize);
 
         // dup ACKs: cwnd and sstresh become half in-flight bytes AND cwnd gets advanced for each dup-ack it had received
         time += 1;
         let loss_cwnd = reno.window();
         let expected_ssthresh = loss_cwnd / 2;
         reno.on_loss(Instant::from_millis(time), loss_cwnd);
-        assert_eq!(reno.ssthresh, expected_ssthresh);
+        assert_eq!(reno.ssthresh as usize, expected_ssthresh);
         assert_eq!(reno.window(), expected_ssthresh + 3 * MSS);
         assert!(reno.in_fast_recovery);
 
@@ -318,7 +350,7 @@ mod test {
         for _ in 0..9 {
             time += 1;
             let initial_cwnd = reno.window();
-            reno.on_dup_ack(Instant::from_millis(time), MSS, reno.cwnd);
+            reno.on_dup_ack(Instant::from_millis(time), MSS, reno.cwnd as usize);
             assert_eq!(reno.window(), initial_cwnd + MSS);
         }
 
@@ -340,9 +372,9 @@ mod test {
     fn zero_length_ack_does_not_exit_fast_recovery() {
         let mut reno = Reno::new();
         reno.set_mss(MSS);
-        reno.cwnd = MSS * 32;
+        reno.cwnd = stored(MSS * 32);
 
-        reno.on_loss(Instant::from_millis(0), reno.cwnd);
+        reno.on_loss(Instant::from_millis(0), reno.cwnd as usize);
         assert!(reno.in_fast_recovery);
 
         let cwnd = reno.window();
@@ -359,7 +391,7 @@ mod test {
         // The first ACK of new data still exits and deflates.
         ack(&mut reno, MSS, Instant::from_millis(2));
         assert!(!reno.in_fast_recovery);
-        assert_eq!(reno.window(), ssthresh);
+        assert_eq!(reno.window(), ssthresh as usize);
     }
 
     #[test]
@@ -373,8 +405,8 @@ mod test {
         assert_eq!(reno.window(), cwnd);
 
         // Congestion avoidance.
-        reno.cwnd = MSS * 32;
-        reno.ssthresh = MSS * 16;
+        reno.cwnd = stored(MSS * 32);
+        reno.ssthresh = stored(MSS * 16);
         ack(&mut reno, 0, Instant::from_millis(1));
         assert_eq!(reno.window(), MSS * 32);
     }
@@ -383,25 +415,25 @@ mod test {
     fn repeated_rto_holds_ssthresh() {
         let mut reno = Reno::new();
         reno.set_mss(MSS);
-        reno.cwnd = MSS * 32;
+        reno.cwnd = stored(MSS * 32);
 
         // First RTO halves ssthresh based on the flight size.
         reno.on_rto(Instant::from_millis(0), MSS * 32);
-        assert_eq!(reno.ssthresh, MSS * 16);
+        assert_eq!(reno.ssthresh as usize, MSS * 16);
         assert_eq!(reno.window(), MSS);
 
         // Until new data is ACKed, further RTOs are retransmissions of the
         // same segment and must hold ssthresh constant instead of collapsing
         // it towards the minimum.
         reno.on_rto(Instant::from_millis(1), MSS);
-        assert_eq!(reno.ssthresh, MSS * 16);
+        assert_eq!(reno.ssthresh as usize, MSS * 16);
         assert_eq!(reno.window(), MSS);
 
         // Once new data is ACKed, the next RTO is a fresh loss detection
         // and reduces ssthresh again.
         ack(&mut reno, MSS, Instant::from_millis(2));
         reno.on_rto(Instant::from_millis(3), MSS * 4);
-        assert_eq!(reno.ssthresh, MSS * 2);
+        assert_eq!(reno.ssthresh as usize, MSS * 2);
     }
 
     #[test]
@@ -436,7 +468,7 @@ mod test {
                 let cwnd = reno.window();
                 println!("Reno: elapsed = {}, cwnd = {}", elapsed, cwnd);
 
-                assert!(cwnd >= reno.mss);
+                assert!(cwnd >= reno.mss as usize);
                 assert!(reno.window() <= remote_window);
             }
         }
@@ -452,7 +484,7 @@ mod test {
 
         for _ in 0..100 {
             reno.on_rto(now, reno.window());
-            assert!(reno.window() >= reno.mss);
+            assert!(reno.window() >= reno.mss as usize);
         }
     }
 
@@ -487,6 +519,6 @@ mod test {
         let mut reno = Reno::new();
         reno.set_remote_window(64 * 1024);
         reno.set_remote_window(4 * 1024);
-        assert_eq!(reno.rwnd, 64 * 1024);
+        assert_eq!(reno.rwnd as usize, 64 * 1024);
     }
 }

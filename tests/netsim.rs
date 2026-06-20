@@ -33,7 +33,7 @@ fn run_sweep(cc: tcp::CongestionControl) -> String {
 
     write!(&mut s, "buf\\loss").unwrap();
     for loss in losses {
-        write!(&mut s, "{loss:9.3} ").unwrap();
+        write!(&mut s, " {loss:9.3}").unwrap();
     }
     writeln!(&mut s).unwrap();
 

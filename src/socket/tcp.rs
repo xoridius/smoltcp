@@ -2662,8 +2662,11 @@ impl<'a> Socket<'a> {
                     // dup ack (RFC 5681); before recovery is entered (by on_loss
                     // when the fast-retransmit timer fires) it is a no-op.
                     let in_flight = self.flight_size();
-                    self.congestion_controller
-                        .on_dup_ack(cx.now(), self.remote_mss as usize, in_flight);
+                    self.congestion_controller.on_dup_ack(
+                        cx.now(),
+                        self.remote_mss as usize,
+                        in_flight,
+                    );
                 }
                 // No duplicate ACK -> Reset state, update last received ACK, and
                 // notify the congestion controller of the freshly ACKed data.
@@ -2990,7 +2993,11 @@ impl<'a> Socket<'a> {
         // Timestamps (RFC 7323) cost 12 bytes (10 + 2 NOP for alignment). This
         // is an approximation of the exact accounting in the dispatch path,
         // which subtracts the actual emitted option length.
-        let options_len = if self.tsval_generator.is_some() { 12 } else { 0 };
+        let options_len = if self.tsval_generator.is_some() {
+            12
+        } else {
+            0
+        };
 
         // Max segment size we're able to send due to MTU limitations.
         let local_mss = cx.ip_mtu() - ip_header_len - TCP_HEADER_LEN;

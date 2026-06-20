@@ -596,6 +596,8 @@ struct LaneStats {
     pool_misses: u64,
     max_queue_depth: usize,
     max_pool_depth: usize,
+    reserved_payload_bytes: usize,
+    reserved_packet_slot_bytes: usize,
 }
 
 impl LaneStats {
@@ -604,6 +606,12 @@ impl LaneStats {
         self.pool_misses += other.pool_misses;
         self.max_queue_depth = self.max_queue_depth.max(other.max_queue_depth);
         self.max_pool_depth = self.max_pool_depth.max(other.max_pool_depth);
+        self.reserved_payload_bytes += other.reserved_payload_bytes;
+        self.reserved_packet_slot_bytes += other.reserved_packet_slot_bytes;
+    }
+
+    fn reserved_total_bytes(&self) -> usize {
+        self.reserved_payload_bytes + self.reserved_packet_slot_bytes
     }
 }
 
@@ -666,7 +674,20 @@ impl Lane {
     }
 
     fn stats(&self) -> LaneStats {
-        self.stats
+        let reserved_payload_bytes = self
+            .queue
+            .iter()
+            .chain(self.pool.iter())
+            .map(|pkt| pkt.buf.capacity())
+            .sum();
+        let reserved_packet_slot_bytes =
+            (self.queue.capacity() + self.pool.capacity()) * core::mem::size_of::<Packet>();
+
+        LaneStats {
+            reserved_payload_bytes,
+            reserved_packet_slot_bytes,
+            ..self.stats
+        }
     }
 }
 
@@ -687,6 +708,40 @@ fn print_lane_stats(label: &str, stats: LaneStats) {
     println!("    pool misses:          {}", stats.pool_misses);
     println!("    max queue depth:      {}", stats.max_queue_depth);
     println!("    max pool depth:       {}", stats.max_pool_depth);
+    println!(
+        "    reserved payload:     {} KiB",
+        stats.reserved_payload_bytes / 1024
+    );
+    println!(
+        "    reserved pkt slots:   {} KiB",
+        stats.reserved_packet_slot_bytes / 1024
+    );
+    println!(
+        "    reserved total:       {} KiB  (harness packet pool, not smoltcp socket memory)",
+        stats.reserved_total_bytes() / 1024
+    );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lane_stats_reports_reserved_packet_memory() {
+        let lane = Lane::new(1500, 3, RunMode::Bench);
+        let stats = lane.stats();
+        let packet_slot_bytes =
+            (lane.queue.capacity() + lane.pool.capacity()) * core::mem::size_of::<Packet>();
+
+        assert_eq!(stats.reserved_payload_bytes, 3 * 1500);
+        assert_eq!(stats.reserved_packet_slot_bytes, packet_slot_bytes);
+        assert_eq!(
+            stats.reserved_total_bytes(),
+            stats.reserved_payload_bytes + stats.reserved_packet_slot_bytes
+        );
+        assert_eq!(stats.fallback_allocs, 0);
+        assert_eq!(stats.pool_misses, 0);
+    }
 }
 
 /// A `Device` that sends to one queue and receives from another. Two of these
@@ -3010,6 +3065,10 @@ fn shape_idle_hot(seconds: u64, n_idle: usize, n_active: usize, offload: bool, m
     let alloc_after = AllocSnap::now();
     let pool_steady = pool.used();
     let rss_end = rss_bytes();
+    let lane_stats = collect_lane_stats(&[&lane_a, &lane_b]);
+    let harness_reserved = lane_stats.reserved_total_bytes() as u64;
+    let rss_after_create_less_harness = rss_after_create.saturating_sub(harness_reserved);
+    let rss_end_less_harness = rss_end.saturating_sub(harness_reserved);
     let gbps = (recvd as f64 * 8.0) / elapsed / 1e9;
 
     println!("\n========== shape: idle_hot ==========");
@@ -3023,6 +3082,10 @@ fn shape_idle_hot(seconds: u64, n_idle: usize, n_active: usize, offload: bool, m
     println!("  pool budget:            {} KiB", pool_bytes / 1024);
     println!("  RSS post-create:        {} KiB", rss_after_create / 1024);
     println!(
+        "  RSS post-create less harness: {} KiB  (excludes harness packet pool)",
+        rss_after_create_less_harness / 1024
+    );
+    println!(
         "  pool used post-create:  {} KiB  (expect ~0)",
         pool_after_create / 1024
     );
@@ -3031,6 +3094,10 @@ fn shape_idle_hot(seconds: u64, n_idle: usize, n_active: usize, offload: bool, m
     println!("  active throughput:      {gbps:.3} Gbps");
     println!("  pool used steady:       {} KiB", pool_steady / 1024);
     println!("  RSS end:                {} KiB", rss_end / 1024);
+    println!(
+        "  RSS end less harness:   {} KiB  (excludes harness packet pool)",
+        rss_end_less_harness / 1024
+    );
     let alloc_bytes = alloc_after.alloc_bytes - alloc_before.alloc_bytes;
     let free_bytes = alloc_after.free_bytes - alloc_before.free_bytes;
     let alloc_count = alloc_after.alloc_count - alloc_before.alloc_count;
@@ -3045,7 +3112,7 @@ fn shape_idle_hot(seconds: u64, n_idle: usize, n_active: usize, offload: bool, m
         expected_steady_bytes / 1024
     );
     mem_trace.print();
-    print_lane_stats("idle_hot", collect_lane_stats(&[&lane_a, &lane_b]));
+    print_lane_stats("idle_hot", lane_stats);
 }
 
 fn print_socket_sizes() {
