@@ -4,7 +4,7 @@ version = "0.13.1"
 edition = "2024"
 rust-version = "1.91"
 authors = ["whitequark <whitequark@whitequark.org>"]
-description = "A TCP/IP stack designed for bare-metal, real-time systems without a heap."
+description = "A TCP/IP stack designed for bare-metal, real-time systems without requiring a heap."
 documentation = "https://docs.rs/smoltcp/"
 homepage = "https://github.com/smoltcp-rs/smoltcp"
 repository = "https://github.com/smoltcp-rs/smoltcp.git"
@@ -104,7 +104,7 @@ defmt = ["dep:defmt", "heapless/defmt"]
 "packetmeta-id" = []
 # Replaces the profiling harness's CountingAlloc with dhat::Alloc and writes
 # `dhat-heap.json` on exit; load it with https://nnethercote.github.io/dh_view/dh_view.html.
-"dhat-heap" = ["dep:dhat"]
+"dhat-heap" = ["std", "dep:dhat"]
 
 "async" = []
 
@@ -308,7 +308,7 @@ required-features = ["std"]
 
 [[example]]
 name = "profile_loopback"
-required-features = ["std", "medium-ip", "proto-ipv4", "socket-tcp", "socket-udp"]
+required-features = ["std", "libc", "medium-ip", "proto-ipv4", "socket-tcp", "socket-udp"]
 
 [[example]]
 name = "tcpdump"
@@ -340,7 +340,7 @@ required-features = ["std", "log", "medium-ethernet", "proto-ipv4", "socket-tcp"
 
 [[example]]
 name = "dynbuf_memcompare"
-required-features = ["std", "socket-tcp", "socket-tcp-dynamic-buffer"]
+required-features = ["std", "medium-ip", "proto-ipv4", "socket-tcp", "socket-tcp-dynamic-buffer"]
 
 [[example]]
 name = "multicast"

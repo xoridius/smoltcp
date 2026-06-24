@@ -42,7 +42,7 @@ impl RawSocketDesc {
         Ok(RawSocketDesc {
             protocol,
             lower,
-            ifreq: ifreq_for(name),
+            ifreq: ifreq_for(name)?,
         })
     }
 

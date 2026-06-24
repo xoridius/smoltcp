@@ -1206,8 +1206,13 @@ impl<'a> Socket<'a> {
         let last_ack = self.remote_last_ack?;
         let next_ack = self.remote_seq_no + self.rx_buffer.len();
 
-        let last_win = (self.remote_last_win as usize) << self.remote_win_shift;
-        let last_win_adjusted = last_ack + last_win - next_ack;
+        let last_win = self.remote_last_window_len();
+        let consumed = if next_ack >= last_ack {
+            next_ack - last_ack
+        } else {
+            0
+        };
+        let last_win_adjusted = last_win.saturating_sub(consumed);
 
         Some(u16::try_from(last_win_adjusted >> self.remote_win_shift).unwrap_or(u16::MAX))
     }
@@ -2627,6 +2632,7 @@ impl<'a> Socket<'a> {
             // 1. Check if duplicate ACK and change self.local_rx_dup_acks accordingly
             // 2. If exactly 3 duplicate ACKs received, set for fast retransmit
             // 3. Update the last received ACK (self.local_rx_last_ack)
+            let mut notify_congestion_ack = false;
             match self.local_rx_last_ack {
                 // Duplicate ACK if payload empty and ACK doesn't move send window ->
                 // Increment duplicate ACK count and set for retransmit if we just received
@@ -2681,13 +2687,7 @@ impl<'a> Socket<'a> {
                     self.local_rx_last_ack = Some(ack_number);
 
                     self.rtte.on_ack(cx.now(), ack_number);
-                    let new_flight_size = self.flight_size().saturating_sub(ack_len);
-                    self.congestion_controller.on_ack(
-                        cx.now(),
-                        ack_len,
-                        new_flight_size,
-                        &self.rtte,
-                    );
+                    notify_congestion_ack = true;
                 }
             };
             // The scoreboard stores offsets relative to SND.UNA; slide its
@@ -2725,6 +2725,13 @@ impl<'a> Socket<'a> {
                 net_debug!("ignoring SACK blocks because SACK was not locally advertised");
             }
 
+            let partial_recovery_ack = matches!(
+                self.recovery_point,
+                Some(recovery_point) if ack_len > 0
+                    && ack_number < recovery_point
+                    && !self.sack_scoreboard.is_empty()
+            );
+
             match self.recovery_point {
                 // The cumulative ACK reached the recovery point: loss
                 // recovery is complete.
@@ -2747,6 +2754,15 @@ impl<'a> Socket<'a> {
                     self.normalize_tx_cursor();
                 }
                 _ => {}
+            }
+
+            if notify_congestion_ack && !partial_recovery_ack {
+                self.congestion_controller.on_ack(
+                    cx.now(),
+                    ack_len,
+                    self.flight_size(),
+                    &self.rtte,
+                );
             }
         }
 
@@ -2974,7 +2990,22 @@ impl<'a> Socket<'a> {
 
     /// Number of octets transmitted but not yet cumulatively ACKed.
     fn flight_size(&self) -> usize {
-        self.remote_last_seq - self.local_seq_no
+        let mut flight = self.remote_last_seq - self.local_seq_no;
+
+        if self.flags.contains(Flags::SACK_REDUNDANT_PASS) || self.sack_scoreboard.is_empty() {
+            return flight;
+        }
+
+        let cursor = flight;
+        for (start, end) in self.sack_scoreboard.iter_data() {
+            if start >= cursor {
+                break;
+            }
+            let end = end.min(cursor);
+            flight = flight.saturating_sub(end.saturating_sub(start));
+        }
+
+        flight
     }
 
     /// Octets the congestion window still permits, beyond what is in flight.
@@ -4168,6 +4199,17 @@ mod test {
         assert!(result.is_ok());
         assert!(emitted);
         assert!(!s.socket.rx_window_update_dirty());
+    }
+
+    #[test]
+    fn test_last_scaled_window_respects_unscaled_syn_window() {
+        let mut s = socket_established_with_buffer_sizes(64, 1 << 20);
+        s.remote_last_ack = Some(s.remote_seq_no);
+        s.remote_last_win = u16::MAX;
+        s.flags.insert(Flags::REMOTE_LAST_WIN_UNSCALED);
+
+        assert_eq!(s.remote_win_shift, 5);
+        assert_eq!(s.last_scaled_window(), Some(u16::MAX >> 5));
     }
 
     #[test]
@@ -8120,6 +8162,10 @@ mod test {
     }
 
     /// Three duplicate ACKs reporting segments 2 and 4 as SACKed.
+    #[cfg(any(
+        feature = "socket-tcp-cubic",
+        not(any(feature = "socket-tcp-cubic", feature = "socket-tcp-reno"))
+    ))]
     fn send_three_dupacks_sacking_2_and_4(mut s: &mut TestSocket, times: [i64; 3]) {
         for t in times {
             send!(s, time t, TcpRepr {
@@ -8218,6 +8264,19 @@ mod test {
         assert_eq!(s.tx_buffer.len(), 0);
     }
 
+    #[test]
+    fn test_sack_flight_size_excludes_peer_sacked_bytes() {
+        let mut s = socket_with_four_segments_in_flight();
+        assert_eq!(s.flight_size(), 24);
+
+        let _ = s.sack_scoreboard.add(6, 6);
+        let _ = s.sack_scoreboard.add(18, 6);
+        assert_eq!(s.flight_size(), 12);
+
+        s.flags.insert(Flags::SACK_REDUNDANT_PASS);
+        assert_eq!(s.flight_size(), 24);
+    }
+
     #[cfg(feature = "socket-tcp-cubic")]
     #[test]
     fn test_sack_relost_hole_retransmits_on_partial_ack() {
@@ -8246,6 +8305,7 @@ mod test {
 
         // Partial ACK below the recovery point, segment 4 still SACKed:
         // hole 3's retransmission was lost again — resend it now.
+        let cwnd_before_partial_ack = s.congestion_controller.window();
         send!(s, time 1210, TcpRepr {
             seq_number: REMOTE_SEQ + 1,
             ack_number: Some(LOCAL_SEQ + 1 + 12),
@@ -8256,6 +8316,7 @@ mod test {
             ],
             ..SEND_TEMPL
         });
+        assert_eq!(s.congestion_controller.window(), cwnd_before_partial_ack);
         recv!(s, time 1215, Ok(TcpRepr {
             seq_number: LOCAL_SEQ + 1 + 12,
             ack_number: Some(REMOTE_SEQ + 1),

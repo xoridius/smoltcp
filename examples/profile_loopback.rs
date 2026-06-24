@@ -1575,8 +1575,7 @@ fn shape_pingpong(seconds: u64, offload: bool, mode: RunMode) {
 
 fn shape_udp_firehose(seconds: u64, offload: bool, mode: RunMode) {
     // Pure packet forwarding — no flow control, no cwnd. This is the closest
-    // analogue to a tunnel forwarding fully-formed packets between two peers
-    // (which is what tunnel-lib-rust wraps smoltcp for).
+    // analogue to a packet tunnel forwarding fully-formed packets between peers.
     const PAYLOAD: usize = 1400;
     const META_SLOTS: usize = 256;
     let lane_a: LaneRc = Rc::new(RefCell::new(Lane::new(1500, 256, mode)));
@@ -2444,8 +2443,9 @@ fn shape_multi_tcp_impl(
     const MAX_BUF: u32 = 32 * 1024;
     const PAYLOAD: usize = 1024;
     let total_flows = n_threads * flows_per_thread;
-    // Pool sized to hold every flow's full max — exercises CAS contention
-    // without forcing refusal (which would obscure the perf signal).
+    // One full rx+tx budget per logical flow. The paired endpoints share the
+    // pool, so this keeps the usual one-active-direction workload clear of
+    // growth refusal while still exercising allocator contention.
     let pool_bytes: usize = total_flows * 2 * MAX_BUF as usize;
     let pool = tcp::MemoryPool::new(pool_bytes);
 

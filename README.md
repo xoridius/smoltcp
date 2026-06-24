@@ -11,8 +11,8 @@ real-time systems. Its design goals are simplicity and robustness. Its design an
 include complicated compile-time computations, such as macro or type tricks, even
 at cost of performance degradation.
 
-_smoltcp_ does not need heap allocation *at all*, is [extensively documented][docs],
-and compiles on stable Rust 1.91 and later.
+_smoltcp_ does not need heap allocation in its default fixed-buffer configuration,
+is [extensively documented][docs], and compiles on stable Rust 1.91 and later.
 
 _smoltcp_ achieves [~Gbps of throughput](#examplesbenchmarkrs) when tested against
 the Linux TCP stack in loopback mode.
@@ -130,7 +130,8 @@ The TCP protocol is supported over IPv4 and IPv6, and server and client TCP sock
   * User timeout has a configurable interval.
   * Delayed acknowledgements are supported, with configurable delay.
   * Nagle's algorithm is implemented.
-  * Selective acknowledgements are **not** implemented.
+  * Selective acknowledgements are consumed by the sender; receiver-side SACK
+    generation is **not** implemented.
   * Silly window syndrome avoidance is **not** implemented.
   * Congestion control is optional, `CUBIC` and `Reno` are implemented.
   * Timestamping is **not** supported.

@@ -1,4 +1,3 @@
-#![allow(unsafe_code)]
 #![allow(unused)]
 
 #[derive(Debug)]

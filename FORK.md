@@ -96,6 +96,43 @@ The feature-gated rows guard against build-failure regressions in code paths
 that only some consumers enable. If clippy newly fires on a path you didn't
 touch, fix it rather than allowlisting.
 
+### 3.1 Tooling bootstrap
+
+Linux profiling and fuzz/coverage work assumes the following tools are present
+on the profiling host:
+
+```
+apt-get update
+apt-get install -y valgrind heaptrack heaptrack-gui kcachegrind linux-tools-generic
+
+rustup component add llvm-tools-preview
+rustup +nightly component add miri rust-src
+cargo install --locked cargo-fuzz cargo-llvm-cov flamegraph samply
+```
+
+`linux-tools-generic` provides the packaged `perf`; `valgrind` provides
+`ms_print`; `heaptrack-gui` and `kcachegrind` are optional GUI viewers but worth
+having on any workstation used for deep profiling. On macOS, use the Instruments
+recipes in §5.1.1 instead of the Linux-only tools.
+
+### 3.2 Evidence map
+
+Use this table to choose the first command to run. Detailed interpretation lives
+in the referenced sections; keep current numeric results in PRs or release
+notes, not as standing values in this file.
+
+| Question | First evidence to collect |
+|---|---|
+| Did the ordinary library matrix regress? | §3 test matrix. |
+| Did loss recovery or congestion control regress? | `./ci.sh netsim` (§15) plus targeted TCP tests. |
+| What is tunnel-like throughput? | `profile_loopback --mode bench udp <seconds>` and the same run with `offload` (§4.2, §4.3). |
+| Are many flows fair and bounded? | `many_tcp_fair`, `many_tcp`, and `many_udp` (§4.2). |
+| Are dynamic TCP buffers safe for packet-tunnel memory budgets? | `dynbuf_memcompare` plus `idle_hot` and `churn` (§4.2.1, §14.6). Subtract lane `reserved total`; it is harness memory. |
+| Where is CPU time going? | `perf record` / `perf report`, `cargo flamegraph`, or `samply` (§5). |
+| Where is heap growth coming from? | Built-in RSS/allocator fields first, then `heaptrack`, Massif, or `dhat-heap` (§6). |
+| Is parser hardening still covered? | `cargo fuzz build`, ASan-backed short `cargo fuzz run <target>` smoke runs, and Miri proof lanes (§7). |
+| Did codegen for checksum paths change? | Cross-target assembly checks (§5.3). |
+
 ## 4. Load-test workflows
 
 ### 4.1 Wire-level microbench
@@ -175,7 +212,7 @@ Report fields to read:
 
 ### 4.2.1 Dynamic-buffer / multi-thread shapes
 
-Three shapes that require `--features socket-tcp-dynamic-buffer`. They
+Four shapes require `--features socket-tcp-dynamic-buffer`. They
 exercise the pool-backed dynamic-buffer paths (§14) under workloads
 that the legacy `many_tcp` / `many_udp` shapes don't cover.
 
@@ -589,11 +626,14 @@ and IPv6 loopback handling.
 
 ```
 cargo install cargo-fuzz   # one-time
-cargo +nightly fuzz run wire_parsers   -- -max_total_time=120 -max_len=2000
-cargo +nightly fuzz run wire_roundtrip -- -max_total_time=60  -max_len=2000
-cargo +nightly fuzz run dhcp_header    -- -max_total_time=60  -max_len=2000
-cargo +nightly fuzz run ieee802154_header -- -max_total_time=60 -max_len=2000
-cargo +nightly fuzz run packet_parser  -- -max_total_time=60  -max_len=2000
+cargo +nightly fuzz build
+cargo +nightly fuzz run -s address wire_parsers      -- -max_total_time=120 -max_len=2000
+cargo +nightly fuzz run -s address wire_roundtrip    -- -max_total_time=60  -max_len=2000
+cargo +nightly fuzz run -s address tcp_headers       -- -max_total_time=60  -max_len=56
+cargo +nightly fuzz run -s address sixlowpan_packet  -- -max_total_time=60  -max_len=2000
+cargo +nightly fuzz run -s address dhcp_header       -- -max_total_time=60  -max_len=2000
+cargo +nightly fuzz run -s address ieee802154_header -- -max_total_time=60  -max_len=2000
+cargo +nightly fuzz run -s address packet_parser     -- -max_total_time=60  -max_len=2000
 ```
 
 Target map:
@@ -602,6 +642,8 @@ Target map:
 |---|---|
 | `wire_parsers` | IPv4/IPv6, TCP, UDP, IPsec AH, 6LoWPAN ExtHeader, ICMPv4/v6. Parse-only. Discriminates by `data[0] & 0x07`. |
 | `wire_roundtrip` | Differential round-trip: parse → emit → re-parse → assert equal. Catches "accepts but emits malformed" drift. |
+| `tcp_headers` | Established TCP socket pair plus a mutated TCP header. State-machine smoke target for TCP option parsing and ACK/recovery edges. |
+| `sixlowpan_packet` | 6LoWPAN dispatch plus fragmentation/IPHC parsing. |
 | `packet_parser` | `PrettyPrinter<EthernetFrame>` end-to-end. Survival check for the pretty-printer. |
 | `dhcp_header` | `DhcpPacket::new_checked` + `DhcpRepr::parse` + emit. |
 | `ieee802154_header` | `Ieee802154Frame` parse/emit. |
@@ -613,26 +655,39 @@ Operational notes:
 - A crash drops a reproducer at `fuzz/artifacts/<target>/crash-<sha>`.
   Convert to a unit test: `cat fuzz/artifacts/.../crash-... | xxd` and
   pin the bytes in the corresponding `wire::*::test` module.
+- Treat audit findings the same way: no vulnerability report and no fix without
+  an executable proof. Prefer a Miri-failing unit test for unsafe or aliasing
+  claims; otherwise use an ASan fuzz reproducer or a focused unit test. Keep
+  the proof as the first regression, then land the fix.
 - Run for tens of minutes per parser before treating the result as
   meaningful. New-units-added stalling near zero is the signal that
   coverage has plateaued; bumping `-max_len` or expanding the
   discriminator usually re-opens it.
-
-Coverage gap (tracked): every target above is wire-level (parse/emit). The
-TCP socket state machine — and with it the congestion controllers, the
-`cwnd_remaining`/`flight_size` accounting, and SACK recovery (§15) — has no
-coverage-guided target; it is exercised only by the unit-test matrix and the
-per-controller netsim sweeps. A state-machine target that drives a `Socket`
-through `process`/`dispatch` with mutated `TcpRepr` segments (upstream's #1143
-`iface` fuzzer is the reference, though it must be adapted to this fork's
-retained `tcp_headers`/`FuzzInjector` setup) would close it. Worth a dedicated
-run.
-
-### 7.2 MIRI
+- Keep a separate large-input run for size/overflow claims. The short smoke
+  commands above deliberately cap input size; deep runs should also exercise
+  large packets:
 
 ```
-cargo +nightly miri test --lib wire
-cargo +nightly miri test --lib socket::tcp
+cargo +nightly fuzz run -s address wire_parsers   -- -max_total_time=600 -max_len=65535
+cargo +nightly fuzz run -s address wire_roundtrip -- -max_total_time=300 -max_len=65535
+```
+
+Coverage gap (tracked): `tcp_headers` mutates TCP headers against an
+established socket pair, but it is still narrow compared with an arbitrary
+`Interface` state-machine target. Congestion controllers, dynamic-buffer
+growth/refusal, and SACK recovery (§15) are covered primarily by unit tests
+and per-controller netsim sweeps. A richer target based on upstream's #1143
+`iface` fuzzer, adapted to this fork's retained `tcp_headers`/`FuzzInjector`
+setup, would close it. Worth a dedicated run.
+
+### 7.2 Miri / proof lanes
+
+```
+rustup +nightly component add miri rust-src
+MIRIFLAGS="-Zmiri-tree-borrows" cargo +nightly miri test --lib socket::tcp
+MIRIFLAGS="-Zmiri-tree-borrows" cargo +nightly miri test --lib test_deconstruct
+MIRIFLAGS="-Zmiri-tree-borrows" cargo +nightly miri test --lib \
+  --features socket-tcp-dynamic-buffer socket::tcp::test::dyn_buf::next_capacity_math
 ```
 
 Detects UB, aliasing violations, out-of-bounds reads, and uninitialised
@@ -640,12 +695,47 @@ memory access — the things release builds compile away silently. Runs much
 slower than a normal test; restrict to the `wire` and `socket::tcp` modules in
 regular use. Add to a "deep" CI lane, not the default one.
 
+Use Tree Borrows (`-Zmiri-tree-borrows`) for audit proofs; it is the less
+false-positive-prone aliasing model for the sort of safe wrapper and buffer
+borrowing code smoltcp uses. Miri cannot model most host syscalls or C FFI, so
+it is not the right verifier for `phy::sys`, raw sockets, BPF, or the Mach RSS
+helpers in the profiling examples. For those, use ASan/LSan/TSan-capable fuzz
+or integration repros where practical.
+
 Smoltcp uses very little `unsafe`, so MIRI's value here is mostly
 catching slice-arithmetic mistakes in the wire parsers and TCP option
 walking — same surface as the property tests, with a different shaped
 detector.
 
+Deep lanes are useful before releases, but too slow for routine local gating:
+
+```
+MIRIFLAGS="-Zmiri-tree-borrows" cargo +nightly miri test --lib wire \
+  -- --skip wire::ip::checksum::tests::checksum_matches_reference
+MIRIFLAGS="-Zmiri-tree-borrows" cargo +nightly miri test --lib \
+  --features socket-tcp-dynamic-buffer socket::tcp::test::dyn_buf \
+  -- --skip socket::tcp::test::dyn_buf::pool_capacity_floor_300_sockets_24mib_budget
+```
+
 Do not delete these without an explicit justification in the same commit.
+
+### 7.3 32-bit and pointer-width audit
+
+The ordinary matrix includes a 16-bit pointer build, which is useful for
+compile-time truncation pressure, but it does not run the code. For any bug
+hypothesis involving `usize`, large lengths, or buffer caps, add a runnable
+32-bit Linux lane on a host/toolchain that supports it:
+
+```
+rustup target add i686-unknown-linux-gnu
+cargo test --target i686-unknown-linux-gnu --lib \
+  --features socket-tcp-dynamic-buffer socket::tcp::test::dyn_buf
+cargo test --target i686-unknown-linux-gnu --lib test_win_shift_capped_at_rfc7323_max
+```
+
+On non-x86 hosts, use the local equivalent 32-bit target plus its linker/runner
+(for example an ARMv7 target under QEMU). Keep this as an on-demand deep audit
+lane unless Linux 32-bit consumers become product-critical.
 
 ## 8. Harness tuning knobs
 
@@ -680,6 +770,14 @@ hides the actual commit in `Cargo.lock`, where it silently drifts on
 - Reproduces only on this fork → file in this repo's tracker. Bisect to a
   specific commit.
 - Profiling harness or sizecheck-test bug → file in this repo.
+
+When the reproducer is a Miri/sanitizer/unit proof, use it as the bisect
+driver instead of manual judgement:
+
+```
+git bisect start HEAD v0.13.1
+git bisect run bash -lc 'MIRIFLAGS="-Zmiri-tree-borrows" cargo +nightly miri test --lib <proof_test>'
+```
 
 ### 10.1 Known upstream latent bug: window-update SWS deadlock
 
@@ -1077,21 +1175,23 @@ Design, in `src/socket/tcp.rs`:
   retransmission at the next SACKed block.
 - **Recovery point** (RFC 6582 §3): armed at dupack #3 and on RTO.
   Partial ACKs below it rewind-and-walk the next hole immediately;
-  reaching it ends recovery. RTO discards the scoreboard and resends
-  conservatively (RFC 2018 §8).
+  reaching it ends recovery. During SACK-based recovery, partial ACKs do
+  not notify Reno/Cubic as ordinary new-data ACKs, so the controller stays
+  in fast recovery until the recovery point is cumulatively ACKed. RTO
+  discards the scoreboard and resends conservatively (RFC 2018 §8).
 - **Redundant pass, `NoControl` only**: when the selective walk exhausts
   while recovery is open, one bounded in-order resend of the window —
   holes always first, then redundancy fills the unmanaged pipe and
   solicits a fresh ACK (lost-cumACK repair in one RTT). Under Reno/Cubic
   (`AnyController::manages_window`) the pass is skipped.
 
-The `in_flight` signal handed to the congestion controller is the simple
-`flight_size()` = `remote_last_seq - local_seq_no`, i.e. the send cursor, not
-an RFC 6675 pipe estimate. During the selective walk the cursor is rewound, so
-this can transiently under-report bytes genuinely outstanding above the holes;
-the only consequence is mildly conservative cwnd growth (e.g. Cubic may treat a
-recovery lull as idle and slide its epoch). A true pipe estimate is the RFC 6675
-work that stays out of scope here.
+The `in_flight` signal handed to the congestion controller is still cursor
+based, but it subtracts SACKed ranges below `remote_last_seq` during the
+selective walk. That keeps peer-confirmed bytes from consuming cwnd when the
+cursor jumps over them, while deliberately counting the full window during
+the `NoControl` redundant pass. It is not a full RFC 6675 pipe estimator: bytes
+outstanding above the cursor are still outside this accounting, which remains
+slightly conservative for cwnd growth.
 
 Evidence gates (re-measure per host; see §13 policy): deterministic
 netsim across 16 seeds at 32 KiB buffers — mean ±0% at 2% loss, +6% at

@@ -44,6 +44,13 @@ pub use self::tuntap_interface::TunTapInterfaceDesc;
 
 /// Wait until given file descriptor becomes readable, but no longer than given timeout.
 pub fn wait(fd: RawFd, duration: Option<Duration>) -> io::Result<()> {
+    if fd < 0 || fd as usize >= libc::FD_SETSIZE as usize {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "file descriptor is outside fd_set bounds",
+        ));
+    }
+
     unsafe {
         let mut readfds = {
             let mut readfds = mem::MaybeUninit::<libc::fd_set>::uninit();
@@ -105,7 +112,14 @@ struct ifreq {
     any(feature = "phy-tuntap_interface", feature = "phy-raw_socket"),
     unix
 ))]
-fn ifreq_for(name: &str) -> ifreq {
+fn ifreq_for(name: &str) -> io::Result<ifreq> {
+    if name.len() >= libc::IF_NAMESIZE {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "interface name is too long",
+        ));
+    }
+
     let mut ifreq = ifreq {
         ifr_name: [0; libc::IF_NAMESIZE],
         ifr_data: 0,
@@ -113,7 +127,7 @@ fn ifreq_for(name: &str) -> ifreq {
     for (i, byte) in name.as_bytes().iter().enumerate() {
         ifreq.ifr_name[i] = *byte as libc::c_char
     }
-    ifreq
+    Ok(ifreq)
 }
 
 #[cfg(all(
@@ -133,4 +147,37 @@ fn ifreq_ioctl(
     }
 
     Ok(ifreq.ifr_data)
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[test]
+    fn wait_rejects_fd_outside_fd_set_bounds() {
+        assert_eq!(
+            wait(-1, None).unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+        assert_eq!(
+            wait(libc::FD_SETSIZE as RawFd, None).unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+    }
+
+    #[test]
+    #[cfg(all(
+        unix,
+        any(feature = "phy-tuntap_interface", feature = "phy-raw_socket")
+    ))]
+    fn ifreq_for_rejects_names_without_nul_room() {
+        let max_valid = "x".repeat(libc::IF_NAMESIZE - 1);
+        assert!(ifreq_for(&max_valid).is_ok());
+
+        let too_long = "x".repeat(libc::IF_NAMESIZE);
+        assert_eq!(
+            ifreq_for(&too_long).unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+    }
 }

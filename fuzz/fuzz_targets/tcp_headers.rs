@@ -122,23 +122,19 @@ fuzz_target!(|data: &[u8]| {
             .unwrap();
     });
 
+    let mut tcp_server_rx_data = [0; 1024];
+    let mut tcp_server_tx_data = [0; 1024];
     let server_socket = {
-        // It is not strictly necessary to use a `static mut` and unsafe code here, but
-        // on embedded systems that smoltcp targets it is far better to allocate the data
-        // statically to verify that it fits into RAM rather than get undefined behavior
-        // when stack overflows.
-        static mut TCP_SERVER_RX_DATA: [u8; 1024] = [0; 1024];
-        static mut TCP_SERVER_TX_DATA: [u8; 1024] = [0; 1024];
-        let tcp_rx_buffer = tcp::SocketBuffer::new(unsafe { &mut TCP_SERVER_RX_DATA[..] });
-        let tcp_tx_buffer = tcp::SocketBuffer::new(unsafe { &mut TCP_SERVER_TX_DATA[..] });
+        let tcp_rx_buffer = tcp::SocketBuffer::new(&mut tcp_server_rx_data[..]);
+        let tcp_tx_buffer = tcp::SocketBuffer::new(&mut tcp_server_tx_data[..]);
         tcp::Socket::new(tcp_rx_buffer, tcp_tx_buffer)
     };
 
+    let mut tcp_client_rx_data = [0; 1024];
+    let mut tcp_client_tx_data = [0; 1024];
     let client_socket = {
-        static mut TCP_CLIENT_RX_DATA: [u8; 1024] = [0; 1024];
-        static mut TCP_CLIENT_TX_DATA: [u8; 1024] = [0; 1024];
-        let tcp_rx_buffer = tcp::SocketBuffer::new(unsafe { &mut TCP_CLIENT_RX_DATA[..] });
-        let tcp_tx_buffer = tcp::SocketBuffer::new(unsafe { &mut TCP_CLIENT_TX_DATA[..] });
+        let tcp_rx_buffer = tcp::SocketBuffer::new(&mut tcp_client_rx_data[..]);
+        let tcp_tx_buffer = tcp::SocketBuffer::new(&mut tcp_client_tx_data[..]);
         tcp::Socket::new(tcp_rx_buffer, tcp_tx_buffer)
     };
 

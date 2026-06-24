@@ -25,7 +25,7 @@ impl TunTapInterfaceDesc {
             lower
         };
 
-        let mut ifreq = ifreq_for(name);
+        let mut ifreq = ifreq_for(name)?;
         Self::attach_interface_ifreq(lower, medium, &mut ifreq)?;
         let mtu = Self::mtu_ifreq(medium, &mut ifreq)?;
 

@@ -100,7 +100,7 @@ impl BpfDevice {
     pub fn new(name: &str, _medium: Medium) -> io::Result<BpfDevice> {
         Ok(BpfDevice {
             fd: open_device()?,
-            ifreq: ifreq_for(name),
+            ifreq: ifreq_for(name)?,
         })
     }
 
