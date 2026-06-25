@@ -134,6 +134,31 @@ notes, not as standing values in this file.
 | Did socket footprints change? | `./ci.sh sizecheck` (§4.4). |
 | Did codegen for checksum paths change? | Cross-target assembly checks (§5.3). |
 
+### 3.3 Apple behavior reference
+
+For behavior that matters on macOS or iOS, check Apple's XNU source alongside
+Linux and upstream smoltcp. Keep the clone out of this repository:
+
+```
+XNU_DIR="${TMPDIR:-/tmp}/xnu"
+git clone --depth=1 https://github.com/apple-oss-distributions/xnu "$XNU_DIR"
+```
+
+Useful starting points:
+
+- TCP receive/send behavior: `bsd/netinet/tcp_input.c`,
+  `bsd/netinet/tcp_output.c`, `bsd/netinet/tcp_subr.c`,
+  `bsd/netinet/tcp_timer.c`, `bsd/netinet/tcp_var.h`.
+- Congestion control: `bsd/netinet/tcp_cc.c`, `tcp_cubic.c`,
+  `tcp_newreno.c`, `tcp_rack.c`.
+- Socket-buffer and mbuf pressure: `bsd/kern/uipc_socket2.c`,
+  `bsd/kern/uipc_mbuf*.c`, `bsd/sys/socketvar.h`.
+- BPF/raw-device behavior: `bsd/net/bpf.c`, `bsd/net/bpf*.h`.
+
+When a change is Apple-facing and behavioral, quote the XNU file/function in
+the PR or commit notes. Do not copy XNU constants blindly when smoltcp's
+fixed-buffer model needs a smaller analogue; record the translation.
+
 ## 4. Load-test workflows
 
 ### 4.1 Wire-level microbench
