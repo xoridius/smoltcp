@@ -57,6 +57,10 @@ impl RawSocketDesc {
         ifreq_ioctl(self.as_raw_fd(), &mut self.ifreq, imp::SIOCGIFMTU).map(|mtu| mtu as usize)
     }
 
+    pub fn read_buffer_len(&mut self, frame_mtu: usize) -> io::Result<usize> {
+        Ok(frame_mtu)
+    }
+
     pub fn bind_interface(&mut self) -> io::Result<()> {
         let sockaddr = libc::sockaddr_ll {
             sll_family: libc::AF_PACKET as u16,
