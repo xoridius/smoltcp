@@ -159,6 +159,19 @@ When a change is Apple-facing and behavioral, quote the XNU file/function in
 the PR or commit notes. Do not copy XNU constants blindly when smoltcp's
 fixed-buffer model needs a smaller analogue; record the translation.
 
+### 3.4 Agent/device safety
+
+Default validation for this fork is non-device: cargo, netsim,
+`profile_loopback`, fuzz, size, and iOS target checks. Agents must not run
+`sudo`, open `/dev/*` or `/dev/bpf*`, inspect or bind host interfaces, or
+generate live host traffic with tools such as `route`, `ifconfig`,
+`networksetup`, `scutil`, `tcpdump`, `ping`, or `curl` unless the user
+explicitly reauthorizes device access in the same turn.
+
+If a real macOS BPF proof is requested, stop and state that it requires
+explicit host-device permission. Without that permission, report BPF runtime
+smoke as intentionally skipped, not proven.
+
 ## 4. Load-test workflows
 
 ### 4.1 Wire-level microbench

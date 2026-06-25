@@ -318,6 +318,7 @@ impl BpfDevice {
 }
 
 #[cfg(test)]
+#[cfg(any(target_os = "netbsd", target_os = "openbsd"))]
 mod test {
     use super::*;
 

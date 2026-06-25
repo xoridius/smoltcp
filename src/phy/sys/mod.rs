@@ -44,7 +44,7 @@ pub use self::tuntap_interface::TunTapInterfaceDesc;
 
 /// Wait until given file descriptor becomes readable, but no longer than given timeout.
 pub fn wait(fd: RawFd, duration: Option<Duration>) -> io::Result<()> {
-    if fd < 0 || fd as usize >= libc::FD_SETSIZE as usize {
+    if fd < 0 || fd as usize >= libc::FD_SETSIZE {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "file descriptor is outside fd_set bounds",
