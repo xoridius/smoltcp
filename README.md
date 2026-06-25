@@ -4,7 +4,6 @@
 [![crates.io](https://img.shields.io/crates/v/smoltcp.svg)](https://crates.io/crates/smoltcp)
 [![crates.io](https://img.shields.io/crates/d/smoltcp.svg)](https://crates.io/crates/smoltcp)
 [![crates.io](https://img.shields.io/matrix/smoltcp:matrix.org)](https://matrix.to/#/#smoltcp:matrix.org)
-[![codecov](https://codecov.io/github/smoltcp-rs/smoltcp/branch/master/graph/badge.svg?token=3KbAR9xH1t)](https://codecov.io/github/smoltcp-rs/smoltcp)
 
 _smoltcp_ is a standalone, event-driven TCP/IP stack that is designed for bare-metal,
 real-time systems. Its design goals are simplicity and robustness. Its design anti-goals
@@ -145,7 +144,7 @@ To use the _smoltcp_ library in your project, add the following to `Cargo.toml`:
 
 ```toml
 [dependencies]
-smoltcp = "0.10.0"
+smoltcp = "0.13.1"
 ```
 
 The default configuration assumes a hosted environment, for ease of evaluation.
@@ -153,7 +152,7 @@ You probably want to disable default features and configure them one by one:
 
 ```toml
 [dependencies]
-smoltcp = { version = "0.10.0", default-features = false, features = ["log"] }
+smoltcp = { version = "0.13.1", default-features = false, features = ["log"] }
 ```
 
 ## Feature flags
@@ -168,7 +167,7 @@ This feature is enabled by default.
 ### Feature `alloc`
 
 The `alloc` feature enables use of objects owned by the networking stack through a dependency
-on collections from the `alloc` crate. This only works on nightly rustc.
+on collections from the `alloc` crate.
 
 This feature is disabled by default.
 

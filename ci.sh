@@ -1,10 +1,16 @@
 #!/usr/bin/env bash
 
-set -eox pipefail
+set -euo pipefail
+
+if [[ "${TRACE:-1}" != "0" ]]; then
+    set -x
+fi
 
 export DEFMT_LOG=trace
 
 MSRV="1.91.0"
+IOS_FEATURES="alloc,medium-ip,proto-ipv4,proto-ipv6,socket-udp,socket-tcp,socket-tcp-dynamic-buffer,socket-tcp-cubic"
+HOST_PHY_FEATURES="phy-raw_socket,phy-tuntap_interface,medium-ip,medium-ethernet,proto-ipv4,socket-raw"
 
 RUSTC_VERSIONS=(
     $MSRV
@@ -48,21 +54,43 @@ FEATURES_CHECK=(
     "alloc,medium-ethernet,proto-ipv4,proto-ipv6,socket-raw,socket-udp,socket-tcp,socket-icmp,proto-ipv6-slaac,socket-tcp-cubic,socket-tcp-reno"
 )
 
+usage() {
+    cat <<'USAGE'
+usage: ./ci.sh <command> [args]
+
+Core commands:
+  check [msrv|stable|nightly]   Cargo check matrix.
+  test [msrv|stable|nightly]    Cargo test matrix.
+  clippy                        Clippy on tests/examples.
+  build_16bit                   Nightly build-std check for 16-bit pointers.
+  coverage                      cargo-llvm-cov matrix.
+  netsim                        Stable NoControl loss-recovery netsim sweep.
+  all                           Core matrix above.
+
+Local fork evidence:
+  quick                         Fast local smoke: fmt, iOS check, host phy check, iOS sizecheck.
+  sizecheck                     Print default and iOS-shaped footprint numbers.
+  ios-gate                      iOS Network Extension memory-shape proofs.
+  profile-smoke [seconds]       Short throughput/fairness/RSS harness smoke.
+  fuzz-build                    Build all fuzz targets on nightly.
+  fuzz-smoke [seconds] [target] Short ASan fuzz smoke, default wire_parsers.
+
+Set TRACE=0 for quieter local output.
+USAGE
+}
+
 test() {
     local version=$1
     rustup toolchain install $version
 
-    for features in ${FEATURES_TEST[@]}; do
+    for features in "${FEATURES_TEST[@]}"; do
         cargo +$version test --no-default-features --features "$features"
     done
 }
 
 netsim() {
-    # NoControl baseline, then the SACK x RFC-compliant-controller loss sweeps
-    # (netsim_cubic / netsim_reno). Serialized: the tests share a global CLOCK
-    # and the process-wide logger.
+    # Serialized: the test uses a global CLOCK and the process-wide logger.
     cargo test --release --features _netsim netsim -- --test-threads=1
-    cargo test --release --features "_netsim socket-tcp-cubic socket-tcp-reno" netsim -- --test-threads=1
 }
 
 check() {
@@ -71,7 +99,7 @@ check() {
 
     export DEFMT_LOG="trace"
 
-    for features in ${FEATURES_CHECK[@]}; do
+    for features in "${FEATURES_CHECK[@]}"; do
         cargo +$version check --no-default-features --features "$features"
     done
 
@@ -94,58 +122,142 @@ build_16bit() {
     rustup +nightly component add rust-src
 
     TARGET_WITH_16BIT_POINTER=msp430-none-elf
-    for features in ${FEATURES_CHECK[@]}; do
-        cargo +nightly build -Z build-std=core,alloc --target $TARGET_WITH_16BIT_POINTER --no-default-features --features=$features
+    for features in "${FEATURES_CHECK[@]}"; do
+        cargo +nightly build -Z build-std=core,alloc --target "$TARGET_WITH_16BIT_POINTER" --no-default-features --features="$features"
     done
 }
 
 coverage() {
-    for features in ${FEATURES_TEST[@]}; do
+    for features in "${FEATURES_TEST[@]}"; do
         cargo llvm-cov --no-report --no-default-features --features "$features"
     done
     cargo llvm-cov report --lcov --output-path lcov.info
 }
 
-if [[ $1 == "test" || $1 == "all" ]]; then
-    if [[ -n $2 ]]; then
-        if [[ $2 == "msrv" ]]; then
-            test $MSRV
-        else
-            test $2
-        fi
+version_arg() {
+    case "${1:-}" in
+        "") return 1 ;;
+        msrv) printf '%s\n' "$MSRV" ;;
+        *) printf '%s\n' "$1" ;;
+    esac
+}
+
+run_test_matrix() {
+    if version="$(version_arg "${1:-}")"; then
+        test "$version"
     else
-        for version in ${RUSTC_VERSIONS[@]}; do
-            test $version
+        for version in "${RUSTC_VERSIONS[@]}"; do
+            test "$version"
         done
     fi
-fi
+}
 
-if [[ $1 == "check" || $1 == "all" ]]; then
-    if [[ -n $2 ]]; then
-        if [[ $2 == "msrv" ]]; then
-            check $MSRV
-        else
-            check $2
-        fi
+run_check_matrix() {
+    if version="$(version_arg "${1:-}")"; then
+        check "$version"
     else
-        for version in ${RUSTC_VERSIONS[@]}; do
-            check $version
+        for version in "${RUSTC_VERSIONS[@]}"; do
+            check "$version"
         done
     fi
-fi
+}
 
-if [[ $1 == "clippy" || $1 == "all" ]]; then
+sizecheck() {
+    cargo test --release --test sizecheck -- --nocapture
+    cargo test --release --test sizecheck --no-default-features --features "$IOS_FEATURES" -- --nocapture
+}
+
+quick() {
+    cargo fmt --check
+    cargo check --no-default-features --features "$IOS_FEATURES"
+    cargo check --features "$HOST_PHY_FEATURES"
+    cargo test --release --test sizecheck --no-default-features --features "$IOS_FEATURES" -- --nocapture
+}
+
+ios_gate() {
+    cargo test --release --lib --no-default-features --features "std,$IOS_FEATURES" dyn_buf -- --test-threads=1
+    cargo test --release --test sizecheck --no-default-features --features "$IOS_FEATURES" -- --nocapture
+    cargo run --release --example dynbuf_memcompare --features socket-tcp-dynamic-buffer -- dynamic 300
+}
+
+profile_smoke() {
+    local seconds="${1:-1}"
+    cargo run --release --example profile_loopback -- --mode bench udp "$seconds"
+    cargo run --release --example profile_loopback -- --mode bench many_tcp_fair "$seconds" 8
+    cargo run --release --example profile_loopback --features socket-tcp-dynamic-buffer -- --mode bench idle_hot "$seconds" 50 2
+}
+
+fuzz_build() {
+    cargo +nightly fuzz build
+    cargo +nightly fuzz build --features log
+}
+
+fuzz_smoke() {
+    local seconds="${1:-30}"
+    local target="${2:-wire_parsers}"
+    cargo +nightly fuzz run -s address "$target" -- -max_len=1536 -max_total_time="$seconds"
+}
+
+run_all() {
+    run_test_matrix
+    run_check_matrix
     clippy
-fi
-
-if [[ $1 == "build_16bit" || $1 == "all" ]]; then
     build_16bit
-fi
-
-if [[ $1 == "coverage" || $1 == "all" ]]; then
     coverage
-fi
-
-if [[ $1 == "netsim" || $1 == "all" ]]; then
     netsim
-fi
+}
+
+cmd="${1:-help}"
+shift || true
+
+case "$cmd" in
+    help|-h|--help)
+        set +x
+        usage
+        ;;
+    test)
+        run_test_matrix "$@"
+        ;;
+    check)
+        run_check_matrix "$@"
+        ;;
+    clippy)
+        clippy
+        ;;
+    build_16bit)
+        build_16bit
+        ;;
+    coverage)
+        coverage
+        ;;
+    netsim)
+        netsim
+        ;;
+    all)
+        run_all
+        ;;
+    quick)
+        quick
+        ;;
+    sizecheck)
+        sizecheck
+        ;;
+    ios-gate)
+        ios_gate
+        ;;
+    profile-smoke)
+        profile_smoke "$@"
+        ;;
+    fuzz-build)
+        fuzz_build
+        ;;
+    fuzz-smoke)
+        fuzz_smoke "$@"
+        ;;
+    *)
+        set +x
+        usage >&2
+        echo "error: unknown command '$cmd'" >&2
+        exit 2
+        ;;
+esac

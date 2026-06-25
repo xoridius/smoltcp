@@ -1,11 +1,13 @@
 use std::io;
 use std::mem;
-use std::os::unix::io::{AsRawFd, RawFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 
 use libc;
 
+#[cfg(not(any(target_os = "macos", target_os = "ios")))]
 use super::{ifreq, ifreq_for};
 use crate::phy::Medium;
+#[cfg(not(any(target_os = "macos", target_os = "ios")))]
 use crate::wire::ETHERNET_HEADER_LEN;
 
 /// set interface
@@ -26,6 +28,9 @@ const BIOCSETIF: libc::c_ulong = 0x8020426c;
     target_os = "freebsd"
 ))]
 const BIOCGBLEN: libc::c_ulong = 0x40044266;
+/// set buffer length
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+const BIOCSBLEN: libc::c_ulong = 0xc0044266;
 /// set immediate/nonblocking read
 #[cfg(any(
     target_os = "macos",
@@ -35,6 +40,9 @@ const BIOCGBLEN: libc::c_ulong = 0x40044266;
     target_os = "freebsd"
 ))]
 const BIOCIMMEDIATE: libc::c_ulong = 0x80044270;
+/// get interface MTU
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+const SIOCGIFMTU: libc::c_ulong = 0xc0206933;
 /// set bpf_hdr struct size
 #[cfg(any(target_os = "macos", target_os = "ios", target_os = "netbsd"))]
 const SIZEOF_BPF_HDR: usize = 18;
@@ -43,19 +51,24 @@ const SIZEOF_BPF_HDR: usize = 18;
 const SIZEOF_BPF_HDR: usize = 24;
 /// The actual header length may be larger than the bpf_hdr struct due to aligning
 /// see <https://github.com/openbsd/src/blob/37ecb4d066e5566411cc16b362d3960c93b1d0be/sys/net/bpf.c#L1649>
-/// and <https://github.com/apple/darwin-xnu/blob/8f02f2a044b9bb1ad951987ef5bab20ec9486310/bsd/net/bpf.c#L3580>
 /// and <https://github.com/NetBSD/src/blob/13d937d9ba3db87c9a898a40a8ed9d2aab2b1b95/sys/net/bpf.c#L1988>
 /// for FreeBSD, core::mem::size_of::<libc::bpf_hdr>() = 32 when run on a FreeBSD system.
-#[cfg(any(
-    target_os = "macos",
-    target_os = "ios",
-    target_os = "netbsd",
-    target_os = "openbsd",
-    target_os = "freebsd"
-))]
+#[cfg(any(target_os = "netbsd", target_os = "openbsd", target_os = "freebsd"))]
 const BPF_HDRLEN: usize = (((SIZEOF_BPF_HDR + ETHERNET_HEADER_LEN) + mem::align_of::<u32>() - 1)
     & !(mem::align_of::<u32>() - 1))
     - ETHERNET_HEADER_LEN;
+
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+type BpfIfreq = libc::ifreq;
+#[cfg(not(any(target_os = "macos", target_os = "ios")))]
+type BpfIfreq = ifreq;
+
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+const BPF_HDR_CAPLEN_OFFSET: usize = 8;
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+const BPF_HDR_DATALEN_OFFSET: usize = 12;
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+const BPF_HDR_HDRLEN_OFFSET: usize = 16;
 
 macro_rules! try_ioctl {
     ($fd:expr,$cmd:expr,$req:expr) => {
@@ -69,17 +82,23 @@ macro_rules! try_ioctl {
 
 #[derive(Debug)]
 pub struct BpfDevice {
-    fd: libc::c_int,
-    ifreq: ifreq,
+    fd: OwnedFd,
+    ifreq: BpfIfreq,
+}
+
+impl AsFd for BpfDevice {
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        self.fd.as_fd()
+    }
 }
 
 impl AsRawFd for BpfDevice {
     fn as_raw_fd(&self) -> RawFd {
-        self.fd
+        self.fd.as_raw_fd()
     }
 }
 
-fn open_device() -> io::Result<libc::c_int> {
+fn open_device() -> io::Result<OwnedFd> {
     unsafe {
         for i in 0..256 {
             let dev = format!("/dev/bpf{}\0", i);
@@ -88,7 +107,7 @@ fn open_device() -> io::Result<libc::c_int> {
                 libc::O_RDWR | libc::O_NONBLOCK,
             ) {
                 -1 => continue,
-                fd => return Ok(fd),
+                fd => return Ok(OwnedFd::from_raw_fd(fd)),
             };
         }
     }
@@ -96,45 +115,158 @@ fn open_device() -> io::Result<libc::c_int> {
     Err(io::Error::last_os_error())
 }
 
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+fn bpf_ifreq_for(name: &str) -> io::Result<BpfIfreq> {
+    if name.len() >= libc::IF_NAMESIZE {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "interface name is too long",
+        ));
+    }
+
+    let mut ifreq = unsafe { mem::zeroed::<libc::ifreq>() };
+    for (i, byte) in name.as_bytes().iter().enumerate() {
+        ifreq.ifr_name[i] = *byte as libc::c_char
+    }
+    Ok(ifreq)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "ios")))]
+fn bpf_ifreq_for(name: &str) -> io::Result<BpfIfreq> {
+    ifreq_for(name)
+}
+
+fn invalid_bpf_header() -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, "invalid BPF packet header")
+}
+
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+fn truncated_bpf_packet() -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, "truncated BPF packet")
+}
+
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+fn native_u16_at(buffer: &[u8], offset: usize) -> u16 {
+    let mut bytes = [0; 2];
+    bytes.copy_from_slice(&buffer[offset..offset + 2]);
+    u16::from_ne_bytes(bytes)
+}
+
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+fn native_u32_at(buffer: &[u8], offset: usize) -> u32 {
+    let mut bytes = [0; 4];
+    bytes.copy_from_slice(&buffer[offset..offset + 4]);
+    u32::from_ne_bytes(bytes)
+}
+
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+fn bpf_packet_bounds(buffer: &[u8], len: usize) -> io::Result<(usize, usize)> {
+    if len < SIZEOF_BPF_HDR {
+        return Err(invalid_bpf_header());
+    }
+
+    let packet_len = native_u32_at(buffer, BPF_HDR_CAPLEN_OFFSET) as usize;
+    let original_len = native_u32_at(buffer, BPF_HDR_DATALEN_OFFSET) as usize;
+    let header_len = native_u16_at(buffer, BPF_HDR_HDRLEN_OFFSET) as usize;
+
+    if header_len < SIZEOF_BPF_HDR || header_len > len || packet_len > len - header_len {
+        return Err(invalid_bpf_header());
+    }
+    if packet_len < original_len {
+        return Err(truncated_bpf_packet());
+    }
+
+    Ok((header_len, packet_len))
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "ios")))]
+fn bpf_packet_bounds(_buffer: &[u8], len: usize) -> io::Result<(usize, usize)> {
+    if len < BPF_HDRLEN {
+        return Err(invalid_bpf_header());
+    }
+
+    Ok((BPF_HDRLEN, len - BPF_HDRLEN))
+}
+
 impl BpfDevice {
     pub fn new(name: &str, _medium: Medium) -> io::Result<BpfDevice> {
+        let ifreq = bpf_ifreq_for(name)?;
         Ok(BpfDevice {
             fd: open_device()?,
-            ifreq: ifreq_for(name)?,
+            ifreq,
         })
     }
 
     pub fn bind_interface(&mut self) -> io::Result<()> {
-        try_ioctl!(self.fd, BIOCSETIF, &mut self.ifreq);
+        try_ioctl!(self.as_raw_fd(), BIOCSETIF, &mut self.ifreq);
 
         Ok(())
     }
 
-    /// This in fact does not return the interface's mtu,
-    /// but it returns the size of the buffer that the app needs to allocate
-    /// for the BPF device
-    ///
-    /// The `SIOGIFMTU` cant be called on a BPF descriptor. There is a workaround
-    /// to get the actual interface mtu, but this should work better
-    ///
-    /// To get the interface MTU, you would need to create a raw socket first,
-    /// and then call `SIOGIFMTU` for the same interface your BPF device is "bound" to.
-    /// This MTU that you would get would not include the length of `struct bpf_hdr`
-    /// which gets prepended to every packet by BPF,
-    /// and your packet will be truncated if it has the length of the MTU.
-    ///
-    /// The buffer size for BPF is usually 4096 bytes, MTU is typically 1500 bytes.
-    /// You could do something like `mtu += BPF_HDRLEN`,
-    /// but you must change the buffer size the BPF device expects using `BIOCSBLEN` accordingly,
-    /// and you must set it before setting the interface with the `BIOCSETIF` ioctl.
-    ///
-    /// The reason I said this should work better is because you might see some unexpected behavior,
-    /// truncated/unaligned packets, I/O errors on read()
-    /// if you change the buffer size to the actual MTU of the interface.
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
     pub fn interface_mtu(&mut self) -> io::Result<usize> {
-        let mut bufsize: libc::c_int = 1;
-        try_ioctl!(self.fd, BIOCIMMEDIATE, &mut bufsize as *mut libc::c_int);
-        try_ioctl!(self.fd, BIOCGBLEN, &mut bufsize as *mut libc::c_int);
+        let mut ifreq = unsafe { mem::zeroed::<libc::ifreq>() };
+        ifreq.ifr_name = self.ifreq.ifr_name;
+        let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0) };
+        if fd == -1 {
+            return Err(io::Error::last_os_error());
+        }
+        let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+
+        try_ioctl!(fd.as_raw_fd(), SIOCGIFMTU, &mut ifreq);
+
+        Ok(unsafe { ifreq.ifr_ifru.ifru_mtu } as usize)
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+    pub fn interface_mtu(&mut self) -> io::Result<usize> {
+        self.bpf_buffer_len()
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    pub fn read_buffer_len(&mut self, frame_mtu: usize) -> io::Result<usize> {
+        let needed = frame_mtu
+            .checked_add(mem::size_of::<libc::bpf_hdr>())
+            .and_then(|len| libc::c_uint::try_from(len).ok())
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "interface MTU is too large")
+            })?;
+        let mut bufsize = needed;
+        try_ioctl!(
+            self.as_raw_fd(),
+            BIOCSBLEN,
+            &mut bufsize as *mut libc::c_uint
+        );
+
+        let actual = self.bpf_buffer_len()?;
+        if actual < needed as usize {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "BPF buffer is too small for interface MTU",
+            ));
+        }
+
+        Ok(actual)
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+    pub fn read_buffer_len(&mut self, _frame_mtu: usize) -> io::Result<usize> {
+        self.bpf_buffer_len()
+    }
+
+    fn bpf_buffer_len(&mut self) -> io::Result<usize> {
+        let mut immediate: libc::c_uint = 1;
+        try_ioctl!(
+            self.as_raw_fd(),
+            BIOCIMMEDIATE,
+            &mut immediate as *mut libc::c_uint
+        );
+        let mut bufsize: libc::c_uint = 0;
+        try_ioctl!(
+            self.as_raw_fd(),
+            BIOCGBLEN,
+            &mut bufsize as *mut libc::c_uint
+        );
 
         Ok(bufsize as usize)
     }
@@ -142,17 +274,17 @@ impl BpfDevice {
     pub fn recv(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
         unsafe {
             let len = libc::read(
-                self.fd,
+                self.as_raw_fd(),
                 buffer.as_mut_ptr() as *mut libc::c_void,
                 buffer.len(),
             );
 
-            if len == -1 || len < BPF_HDRLEN as isize {
+            if len == -1 {
                 return Err(io::Error::last_os_error());
             }
 
             let len = len as usize;
-            let payload_len = len - BPF_HDRLEN;
+            let (header_len, payload_len) = bpf_packet_bounds(buffer, len)?;
 
             // BPF prepends a bpf_hdr to each packet; strip it so the caller sees
             // only the link-layer frame. NOTE: BPF may pack multiple packets into
@@ -160,7 +292,7 @@ impl BpfDevice {
             // here. Multi-packet iteration is a larger change tracked separately.
             libc::memmove(
                 buffer.as_mut_ptr() as *mut libc::c_void,
-                &buffer[BPF_HDRLEN] as *const u8 as *const libc::c_void,
+                buffer.as_ptr().add(header_len) as *const libc::c_void,
                 payload_len,
             );
 
@@ -171,7 +303,7 @@ impl BpfDevice {
     pub fn send(&mut self, buffer: &[u8]) -> io::Result<usize> {
         unsafe {
             let len = libc::write(
-                self.fd,
+                self.as_raw_fd(),
                 buffer.as_ptr() as *const libc::c_void,
                 buffer.len(),
             );
@@ -185,20 +317,13 @@ impl BpfDevice {
     }
 }
 
-impl Drop for BpfDevice {
-    fn drop(&mut self) {
-        unsafe {
-            libc::close(self.fd);
-        }
-    }
-}
-
 #[cfg(test)]
+#[cfg(any(target_os = "netbsd", target_os = "openbsd"))]
 mod test {
     use super::*;
 
     #[test]
-    #[cfg(any(target_os = "macos", target_os = "netbsd"))]
+    #[cfg(target_os = "netbsd")]
     fn test_aligned_bpf_hdr_len() {
         assert_eq!(18, BPF_HDRLEN);
     }

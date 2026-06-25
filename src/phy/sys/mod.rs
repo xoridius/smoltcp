@@ -44,7 +44,7 @@ pub use self::tuntap_interface::TunTapInterfaceDesc;
 
 /// Wait until given file descriptor becomes readable, but no longer than given timeout.
 pub fn wait(fd: RawFd, duration: Option<Duration>) -> io::Result<()> {
-    if fd < 0 || fd as usize >= libc::FD_SETSIZE as usize {
+    if fd < 0 || fd as usize >= libc::FD_SETSIZE {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "file descriptor is outside fd_set bounds",
@@ -99,7 +99,8 @@ pub fn wait(fd: RawFd, duration: Option<Duration>) -> io::Result<()> {
 
 #[cfg(all(
     any(feature = "phy-tuntap_interface", feature = "phy-raw_socket"),
-    unix
+    unix,
+    not(any(target_os = "macos", target_os = "ios"))
 ))]
 #[repr(C)]
 #[derive(Debug)]
@@ -110,7 +111,8 @@ struct ifreq {
 
 #[cfg(all(
     any(feature = "phy-tuntap_interface", feature = "phy-raw_socket"),
-    unix
+    unix,
+    not(any(target_os = "macos", target_os = "ios"))
 ))]
 fn ifreq_for(name: &str) -> io::Result<ifreq> {
     if name.len() >= libc::IF_NAMESIZE {
@@ -168,7 +170,8 @@ mod test {
     #[test]
     #[cfg(all(
         unix,
-        any(feature = "phy-tuntap_interface", feature = "phy-raw_socket")
+        any(feature = "phy-tuntap_interface", feature = "phy-raw_socket"),
+        not(any(target_os = "macos", target_os = "ios"))
     ))]
     fn ifreq_for_rejects_names_without_nul_room() {
         let max_valid = "x".repeat(libc::IF_NAMESIZE - 1);

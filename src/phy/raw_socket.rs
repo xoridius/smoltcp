@@ -1,6 +1,6 @@
 use std::cell::RefCell;
 use std::io;
-use std::os::unix::io::{AsRawFd, RawFd};
+use std::os::fd::{AsRawFd, RawFd};
 use std::rc::Rc;
 use std::vec::Vec;
 
@@ -13,6 +13,7 @@ pub struct RawSocket {
     medium: Medium,
     lower: Rc<RefCell<sys::RawSocketDesc>>,
     mtu: usize,
+    rx_buffer_len: usize,
 }
 
 impl AsRawFd for RawSocket {
@@ -28,7 +29,6 @@ impl RawSocket {
     /// set on the executable.
     pub fn new(name: &str, medium: Medium) -> io::Result<RawSocket> {
         let mut lower = sys::RawSocketDesc::new(name, medium)?;
-        lower.bind_interface()?;
 
         let mut mtu = lower.interface_mtu()?;
 
@@ -50,10 +50,14 @@ impl RawSocket {
             mtu += crate::wire::EthernetFrame::<&[u8]>::header_len()
         }
 
+        let rx_buffer_len = lower.read_buffer_len(mtu)?;
+        lower.bind_interface()?;
+
         Ok(RawSocket {
             medium,
             lower: Rc::new(RefCell::new(lower)),
             mtu,
+            rx_buffer_len,
         })
     }
 }
@@ -78,7 +82,7 @@ impl Device for RawSocket {
 
     fn receive(&mut self, _timestamp: Instant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
         let mut lower = self.lower.borrow_mut();
-        let mut buffer = vec![0; self.mtu];
+        let mut buffer = vec![0; self.rx_buffer_len];
         match lower.recv(&mut buffer[..]) {
             Ok(size) => {
                 buffer.resize(size, 0);
