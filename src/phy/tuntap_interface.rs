@@ -1,6 +1,6 @@
 use std::cell::RefCell;
 use std::io;
-use std::os::unix::io::{AsRawFd, RawFd};
+use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::rc::Rc;
 use std::vec::Vec;
 
@@ -37,11 +37,11 @@ impl TunTapInterface {
         })
     }
 
-    /// Attaches to a TUN/TAP interface specified by file descriptor `fd`.
+    /// Attaches to a TUN/TAP interface specified by an owned file descriptor.
     ///
     /// On platforms like Android, a file descriptor to a tun interface is exposed.
     /// On these platforms, a TunTapInterface cannot be instantiated with a name.
-    pub fn from_fd(fd: RawFd, medium: Medium, mtu: usize) -> io::Result<TunTapInterface> {
+    pub fn from_fd(fd: OwnedFd, medium: Medium, mtu: usize) -> io::Result<TunTapInterface> {
         let lower = sys::TunTapInterfaceDesc::from_fd(fd, mtu)?;
         Ok(TunTapInterface {
             lower: Rc::new(RefCell::new(lower)),

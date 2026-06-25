@@ -1,18 +1,24 @@
 use super::*;
 use crate::phy::Medium;
-use std::os::unix::io::{AsRawFd, RawFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 use std::{io, mem};
 
 #[derive(Debug)]
 pub struct RawSocketDesc {
     protocol: libc::c_short,
-    lower: libc::c_int,
+    lower: OwnedFd,
     ifreq: ifreq,
+}
+
+impl AsFd for RawSocketDesc {
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        self.lower.as_fd()
+    }
 }
 
 impl AsRawFd for RawSocketDesc {
     fn as_raw_fd(&self) -> RawFd {
-        self.lower
+        self.lower.as_raw_fd()
     }
 }
 
@@ -27,34 +33,35 @@ impl RawSocketDesc {
             Medium::Ieee802154 => imp::ETH_P_IEEE802154,
         };
 
+        let ifreq = ifreq_for(name)?;
         let lower = unsafe {
-            let lower = libc::socket(
+            let fd = libc::socket(
                 libc::AF_PACKET,
                 libc::SOCK_RAW | libc::SOCK_NONBLOCK,
                 protocol.to_be() as i32,
             );
-            if lower == -1 {
+            if fd == -1 {
                 return Err(io::Error::last_os_error());
             }
-            lower
+            OwnedFd::from_raw_fd(fd)
         };
 
         Ok(RawSocketDesc {
             protocol,
             lower,
-            ifreq: ifreq_for(name)?,
+            ifreq,
         })
     }
 
     pub fn interface_mtu(&mut self) -> io::Result<usize> {
-        ifreq_ioctl(self.lower, &mut self.ifreq, imp::SIOCGIFMTU).map(|mtu| mtu as usize)
+        ifreq_ioctl(self.as_raw_fd(), &mut self.ifreq, imp::SIOCGIFMTU).map(|mtu| mtu as usize)
     }
 
     pub fn bind_interface(&mut self) -> io::Result<()> {
         let sockaddr = libc::sockaddr_ll {
             sll_family: libc::AF_PACKET as u16,
             sll_protocol: self.protocol.to_be() as u16,
-            sll_ifindex: ifreq_ioctl(self.lower, &mut self.ifreq, imp::SIOCGIFINDEX)?,
+            sll_ifindex: ifreq_ioctl(self.as_raw_fd(), &mut self.ifreq, imp::SIOCGIFINDEX)?,
             sll_hatype: 1,
             sll_pkttype: 0,
             sll_halen: 6,
@@ -63,7 +70,7 @@ impl RawSocketDesc {
 
         unsafe {
             let res = libc::bind(
-                self.lower,
+                self.as_raw_fd(),
                 &sockaddr as *const libc::sockaddr_ll as *const libc::sockaddr,
                 mem::size_of::<libc::sockaddr_ll>() as libc::socklen_t,
             );
@@ -78,7 +85,7 @@ impl RawSocketDesc {
     pub fn recv(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
         unsafe {
             let len = libc::recv(
-                self.lower,
+                self.as_raw_fd(),
                 buffer.as_mut_ptr() as *mut libc::c_void,
                 buffer.len(),
                 0,
@@ -93,7 +100,7 @@ impl RawSocketDesc {
     pub fn send(&mut self, buffer: &[u8]) -> io::Result<usize> {
         unsafe {
             let len = libc::send(
-                self.lower,
+                self.as_raw_fd(),
                 buffer.as_ptr() as *const libc::c_void,
                 buffer.len(),
                 0,
@@ -102,14 +109,6 @@ impl RawSocketDesc {
                 return Err(io::Error::last_os_error());
             }
             Ok(len as usize)
-        }
-    }
-}
-
-impl Drop for RawSocketDesc {
-    fn drop(&mut self) {
-        unsafe {
-            libc::close(self.lower);
         }
     }
 }

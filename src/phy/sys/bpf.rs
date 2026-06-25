@@ -1,6 +1,6 @@
 use std::io;
 use std::mem;
-use std::os::unix::io::{AsRawFd, RawFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 
 use libc;
 
@@ -69,17 +69,23 @@ macro_rules! try_ioctl {
 
 #[derive(Debug)]
 pub struct BpfDevice {
-    fd: libc::c_int,
+    fd: OwnedFd,
     ifreq: ifreq,
+}
+
+impl AsFd for BpfDevice {
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        self.fd.as_fd()
+    }
 }
 
 impl AsRawFd for BpfDevice {
     fn as_raw_fd(&self) -> RawFd {
-        self.fd
+        self.fd.as_raw_fd()
     }
 }
 
-fn open_device() -> io::Result<libc::c_int> {
+fn open_device() -> io::Result<OwnedFd> {
     unsafe {
         for i in 0..256 {
             let dev = format!("/dev/bpf{}\0", i);
@@ -88,7 +94,7 @@ fn open_device() -> io::Result<libc::c_int> {
                 libc::O_RDWR | libc::O_NONBLOCK,
             ) {
                 -1 => continue,
-                fd => return Ok(fd),
+                fd => return Ok(OwnedFd::from_raw_fd(fd)),
             };
         }
     }
@@ -98,14 +104,15 @@ fn open_device() -> io::Result<libc::c_int> {
 
 impl BpfDevice {
     pub fn new(name: &str, _medium: Medium) -> io::Result<BpfDevice> {
+        let ifreq = ifreq_for(name)?;
         Ok(BpfDevice {
             fd: open_device()?,
-            ifreq: ifreq_for(name)?,
+            ifreq,
         })
     }
 
     pub fn bind_interface(&mut self) -> io::Result<()> {
-        try_ioctl!(self.fd, BIOCSETIF, &mut self.ifreq);
+        try_ioctl!(self.as_raw_fd(), BIOCSETIF, &mut self.ifreq);
 
         Ok(())
     }
@@ -133,8 +140,16 @@ impl BpfDevice {
     /// if you change the buffer size to the actual MTU of the interface.
     pub fn interface_mtu(&mut self) -> io::Result<usize> {
         let mut bufsize: libc::c_int = 1;
-        try_ioctl!(self.fd, BIOCIMMEDIATE, &mut bufsize as *mut libc::c_int);
-        try_ioctl!(self.fd, BIOCGBLEN, &mut bufsize as *mut libc::c_int);
+        try_ioctl!(
+            self.as_raw_fd(),
+            BIOCIMMEDIATE,
+            &mut bufsize as *mut libc::c_int
+        );
+        try_ioctl!(
+            self.as_raw_fd(),
+            BIOCGBLEN,
+            &mut bufsize as *mut libc::c_int
+        );
 
         Ok(bufsize as usize)
     }
@@ -142,7 +157,7 @@ impl BpfDevice {
     pub fn recv(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
         unsafe {
             let len = libc::read(
-                self.fd,
+                self.as_raw_fd(),
                 buffer.as_mut_ptr() as *mut libc::c_void,
                 buffer.len(),
             );
@@ -171,7 +186,7 @@ impl BpfDevice {
     pub fn send(&mut self, buffer: &[u8]) -> io::Result<usize> {
         unsafe {
             let len = libc::write(
-                self.fd,
+                self.as_raw_fd(),
                 buffer.as_ptr() as *const libc::c_void,
                 buffer.len(),
             );
@@ -181,14 +196,6 @@ impl BpfDevice {
             }
 
             Ok(len as usize)
-        }
-    }
-}
-
-impl Drop for BpfDevice {
-    fn drop(&mut self) {
-        unsafe {
-            libc::close(self.fd);
         }
     }
 }

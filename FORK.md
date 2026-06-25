@@ -124,13 +124,14 @@ notes, not as standing values in this file.
 | Question | First evidence to collect |
 |---|---|
 | Did the ordinary library matrix regress? | §3 test matrix. |
-| Did loss recovery or congestion control regress? | `./ci.sh netsim` (§15) plus targeted TCP tests. |
-| What is tunnel-like throughput? | `profile_loopback --mode bench udp <seconds>` and the same run with `offload` (§4.2, §4.3). |
-| Are many flows fair and bounded? | `many_tcp_fair`, `many_tcp`, and `many_udp` (§4.2). |
-| Are dynamic TCP buffers safe for packet-tunnel memory budgets? | `dynbuf_memcompare` plus `idle_hot` and `churn` (§4.2.1, §14.6). Subtract lane `reserved total`; it is harness memory. |
+| Did loss recovery or congestion control regress? | `./ci.sh netsim` for the stable NoControl sweep (§15), plus targeted TCP tests. Run `netsim_cubic`/`netsim_reno` manually when touching congestion controllers. |
+| What is tunnel-like throughput? | `./ci.sh profile-smoke` first, then `profile_loopback --mode bench udp <seconds>` and the same run with `offload` (§4.2, §4.3). |
+| Are many flows fair and bounded? | `./ci.sh profile-smoke` first, then `many_tcp_fair`, `many_tcp`, and `many_udp` (§4.2). |
+| Are dynamic TCP buffers safe for packet-tunnel memory budgets? | `./ci.sh ios-gate`, then `dynbuf_memcompare` plus `idle_hot` and `churn` (§4.2.1, §14.6). Subtract lane `reserved total`; it is harness memory. |
 | Where is CPU time going? | `perf record` / `perf report`, `cargo flamegraph`, or `samply` (§5). |
 | Where is heap growth coming from? | Built-in RSS/allocator fields first, then `heaptrack`, Massif, or `dhat-heap` (§6). |
-| Is parser hardening still covered? | `cargo fuzz build`, ASan-backed short `cargo fuzz run <target>` smoke runs, and Miri proof lanes (§7). |
+| Is parser hardening still covered? | `./ci.sh fuzz-build`, `./ci.sh fuzz-smoke`, and Miri proof lanes (§7). `fuzz-smoke` defaults to the broad `wire_parsers` target. |
+| Did socket footprints change? | `./ci.sh sizecheck` (§4.4). |
 | Did codegen for checksum paths change? | Cross-target assembly checks (§5.3). |
 
 ## 4. Load-test workflows
@@ -779,23 +780,14 @@ git bisect start HEAD v0.13.1
 git bisect run bash -lc 'MIRIFLAGS="-Zmiri-tree-borrows" cargo +nightly miri test --lib <proof_test>'
 ```
 
-### 10.1 Known upstream latent bug: window-update SWS deadlock
+### 10.1 Receive-window update policy
 
-`Socket::window_to_update` (identical to upstream) only advertises a reopened
-receive window when it has *doubled* (`new_win / 2 >= last_win`). Once the last
-advertised window exceeds half the receive buffer this can never fire, so a
-**unidirectional bulk receiver with delayed ACK disabled** (`ack_delay = None`)
-can deadlock: the sender blocks on a stale window and no return data carries the
-update, until a zero-window probe inches it forward. The `firehose` harness
-shape hits this (it sets `ack_delay = None`); a fixed-time-step poll loop is
-also a factor — a one-line `window_to_update` SWS relaxation alone did not clear
-it.
-
-Not a real-consumer hazard: with the default 10 ms delayed ACK the periodic ACKs
-carry the reopened window, so `tests/netsim.rs` (same unidirectional bulk shape,
-default config) transfers at full throughput at 0 loss. Route per the table
-above — file upstream; the proper fix is RFC 1122 §4.2.3.3 receiver-side SWS
-avoidance (advertise once the window opens by ≥ min(MSS, buffer/2)).
+`Socket::window_to_update` is still the upstream Linux-style "significant
+update" heuristic, not full RFC 1122 receiver-side SWS avoidance. Fixed-time-step
+unidirectional harness shapes such as `firehose` can expose receive-window
+reopen stalls when delayed ACKs are disabled. Route changes through the evidence
+map above: prove the predicate with focused TCP tests, then run `./ci.sh netsim`
+and the §4.2 throughput/fairness harnesses before changing snapshots or docs.
 
 ## 11. Out of scope
 
@@ -811,16 +803,16 @@ re-litigating scope:
   is the consumer's responsibility.
 - **RFC 6528 ISN generation.** Security hardening, not behavioural
   correctness. Consumers can plug in a stronger `rand` source via
-  `Config::random_seed`. Rejecting a zero seed at `Interface::new` (proposed
-  on a `codex/*` branch) would panic for every consumer using the
-  `Config::new()` default; instead `Interface::new` logs a debug warning
-  when the seed is zero. Production deployments must set per-boot entropy.
+  `Config::random_seed`. Rejecting a zero seed at `Interface::new` would panic
+  for every consumer using the `Config::new()` default; instead
+  `Interface::new` logs a debug warning when the seed is zero. Production
+  deployments must set per-boot entropy.
 - **Bounding `poll()` ingress work.** `poll()` intentionally drains the
   device queue and documents the DoS trade-off; consumers that need bounded
   per-call latency use the upstream `poll_ingress_single()` /
   `poll_egress()` / `poll_maintenance()` primitives. Changing `poll()` to
-  one-packet-per-call (proposed on a `codex/*` branch) silently breaks the
-  semantics every existing consumer was written against; rejected.
+  one-packet-per-call silently breaks the semantics every existing consumer
+  was written against; rejected.
 - **Async `Device` trait.** The sync trait composes cleanly with
   consumer-side async drivers; an async trait would fragment the ecosystem.
 - **Asymmetric `ChecksumCapabilities` (TX-only / RX-only).** Useful for
@@ -1147,12 +1139,12 @@ controller keeps loss recovery (§15) strictly selective — the cwnd budget
 goes to reassembly holes — where `NoControl` deliberately falls back to a
 redundant in-order pass after the holes.
 
-Validate a configuration change with `pool_capacity_floor_*`-style tests,
-`dynbuf_memcompare`, and the `churn`/`idle_hot` shapes (§4.2.1). When using
-`profile_loopback` on macOS, keep the printed lane `reserved total` out of the
-iOS memory budget: it is the harness's preallocated paired-link packet pool,
-not memory that dynamic TCP sockets or `NEPacketTunnelFlow` consume in a packet
-tunnel extension.
+Validate a configuration change with `./ci.sh ios-gate`, then run longer
+`dynbuf_memcompare`, `churn`, and `idle_hot` shapes (§4.2.1) when changing pool
+or buffer sizing. When using `profile_loopback` on macOS, keep the printed lane
+`reserved total` out of the iOS memory budget: it is the harness's preallocated
+paired-link packet pool, not memory that dynamic TCP sockets or
+`NEPacketTunnelFlow` consume in a packet tunnel extension.
 
 ## 15. SACK-based selective retransmission
 
@@ -1200,13 +1192,20 @@ with the RTO tail eliminated, byte-exact. Clean-path throughput
 unchanged. RACK-TLP and pacing remain out of scope (§11) until profile
 evidence demands them.
 
-In-tree regression coverage: `tests/netsim.rs` runs the buffer×loss sweep
-under each controller — `netsim` (NoControl), `netsim_cubic`, `netsim_reno`
-(the last two gated on their features) — each pinned to its own snapshot. The
-snapshots confirm SACK + the RFC-compliant controllers degrade monotonically
-and deterministically with loss; NoControl blasts-and-SACK-repairs (highest raw
-throughput, no back-off) while Cubic/Reno throttle on loss as a real controller
-must. Run via `./ci.sh netsim`.
+In-tree regression coverage: `tests/netsim.rs` runs the buffer×loss sweep.
+`./ci.sh netsim` runs the stable NoControl snapshot, which exercises the SACK
+repair path without controller back-off. When changing congestion controllers,
+also run the feature-gated controller snapshots directly:
+
+```
+cargo test --release --features "_netsim socket-tcp-cubic socket-tcp-reno" \
+    --test netsim netsim_cubic -- --test-threads=1
+cargo test --release --features "_netsim socket-tcp-cubic socket-tcp-reno" \
+    --test netsim netsim_reno -- --test-threads=1
+```
+
+The controller snapshots should show Cubic/Reno throttling on loss as real
+controllers must; refresh them only after reviewing the throughput table.
 
 ## 16. Backported post-0.13.1 upstream changes
 

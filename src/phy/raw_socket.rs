@@ -1,6 +1,6 @@
 use std::cell::RefCell;
 use std::io;
-use std::os::unix::io::{AsRawFd, RawFd};
+use std::os::fd::{AsRawFd, RawFd};
 use std::rc::Rc;
 use std::vec::Vec;
 
