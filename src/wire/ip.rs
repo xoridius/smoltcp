@@ -780,12 +780,17 @@ pub mod checksum {
     /// (native byte order).
     #[inline(always)]
     fn fold_u64(mut accum: u64) -> u16 {
-        // Two 32-bit halves -> at most 33 bits.
+        // Collapse the two 32-bit halves; the result is at most 33 bits.
         accum = (accum >> 32) + (accum & 0xffff_ffff);
-        // Two 16-bit halves -> at most 17 bits.
-        accum = (accum >> 16) + (accum & 0xffff);
-        // One more fold to absorb the final carry.
-        accum = (accum >> 16) + (accum & 0xffff);
+        // Each 16-bit fold can itself produce a carry (e.g. an accumulator of
+        // 0xFFFF_FFFF_FFFF_0001 folds through 0x1_0000, whose end-around carry
+        // a truncating `as u16` would silently drop). A fixed number of folds
+        // is therefore not enough in general; keep folding until the high half
+        // is empty, exactly as RFC 1071 requires. This runs at most a couple of
+        // iterations and only once per checksum, not in the per-byte loop.
+        while accum >> 16 != 0 {
+            accum = (accum >> 16) + (accum & 0xffff);
+        }
         accum as u16
     }
 
@@ -1019,6 +1024,53 @@ pub mod checksum {
             assert_eq!(data(&[0xff, 0xff, 0xff, 0xff]), 0xffff);
             // 0xff00 + 0x0100 = 0x1_0000; fold gives 0x0001.
             assert_eq!(data(&[0xff, 0x00, 0x01, 0x00]), 0x0001);
+        }
+
+        /// Regression pins for the end-around-carry corner in `fold_u64`: the
+        /// 64-bit accumulator folds through 0x1_0000, whose carry an
+        /// insufficient fold would truncate to 0x0000 instead of 0x0001.
+        /// Cross-checked against the reference; both must agree and must be the
+        /// nonzero value.
+        #[test]
+        fn checksum_end_around_carry_is_not_dropped() {
+            let cases: &[&[u8]] = &[
+                &[0x01, 0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff],
+                &[0xff, 0xff, 0x01, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff],
+            ];
+            for case in cases {
+                assert_eq!(data(case), data_reference(case), "case={case:?}");
+                assert_eq!(data(case), 0x0100, "case={case:?}");
+            }
+        }
+
+        /// Differential fuzz biased toward long 0xff runs — the content that
+        /// drives the accumulator into the fold's carry corner. A deterministic
+        /// xorshift PRNG keeps it reproducible without an external dependency.
+        /// This would have caught the truncated-carry `fold_u64` regression;
+        /// the fixed four-pattern `checksum_matches_reference` sweep did not.
+        #[test]
+        fn checksum_matches_reference_carry_stress() {
+            let mut state: u64 = 0x9e37_79b9_7f4a_7c15;
+            let mut next = || {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                state
+            };
+            for _ in 0..50_000 {
+                let len = (next() % 80) as usize;
+                let buf: alloc::vec::Vec<u8> = (0..len)
+                    .map(|_| {
+                        // ~2/3 of bytes are 0xff to maximize carry propagation.
+                        if next() % 3 == 0 {
+                            (next() & 0xff) as u8
+                        } else {
+                            0xff
+                        }
+                    })
+                    .collect();
+                assert_eq!(data(&buf), data_reference(&buf), "buf={buf:?}");
+            }
         }
     }
 }

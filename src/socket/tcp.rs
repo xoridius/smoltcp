@@ -2418,6 +2418,12 @@ impl<'a> Socket<'a> {
             (State::SynReceived, TcpControl::Rst) if self.listen_endpoint.port != 0 => {
                 tcp_trace!("received RST");
                 self.tuple = None;
+                // Clear TS.Recent inherited from the aborted handshake. If it
+                // survived, the PAWS check (RFC 7323 §5.3) would reject a fresh
+                // SYN from a different client whose randomized initial TSval
+                // happens to be "older" under wrapping arithmetic, wedging the
+                // recycled listening socket until that client's clock caught up.
+                self.last_remote_tsval = 0;
                 self.set_state(State::Listen);
                 return None;
             }
@@ -11253,6 +11259,59 @@ mod test {
             },
         );
         assert_eq!(s.recv_queue(), 4);
+    }
+
+    #[test]
+    fn test_paws_listen_not_poisoned_after_handshake_rst() {
+        // A listening socket that half-opens for one client and then gets a RST
+        // must not carry that client's TS.Recent into the next handshake: the
+        // PAWS check would otherwise reject a different client whose randomized
+        // initial TSval is "older" under wrapping arithmetic, wedging the
+        // listener until that client's clock caught up.
+        let mut s = socket_listen();
+
+        // Client A: SYN with a large tsval, then RST the half-open connection.
+        send!(
+            s,
+            TcpRepr {
+                control: TcpControl::Syn,
+                seq_number: REMOTE_SEQ,
+                ack_number: None,
+                timestamp: Some(TcpTimestampRepr::new(5000, 0)),
+                ..SEND_TEMPL
+            }
+        );
+        assert_eq!(s.state, State::SynReceived);
+        send!(
+            s,
+            time 100,
+            TcpRepr {
+                control: TcpControl::Rst,
+                seq_number: REMOTE_SEQ + 1,
+                ack_number: None,
+                ..SEND_TEMPL
+            }
+        );
+        assert_eq!(s.state, State::Listen);
+
+        // Client B: a fresh SYN whose tsval is smaller than A's must still be
+        // accepted, not PAWS-rejected.
+        send!(
+            s,
+            time 200,
+            TcpRepr {
+                control: TcpControl::Syn,
+                seq_number: REMOTE_SEQ + 12345,
+                ack_number: None,
+                timestamp: Some(TcpTimestampRepr::new(100, 0)),
+                ..SEND_TEMPL
+            }
+        );
+        assert_eq!(
+            s.state,
+            State::SynReceived,
+            "fresh SYN with a smaller tsval must not be PAWS-rejected after a handshake RST"
+        );
     }
 
     // =========================================================================================//
