@@ -69,9 +69,13 @@ Core commands:
 
 Local fork evidence:
   quick                         Fast local smoke: fmt, iOS check, host phy check, iOS sizecheck.
-  sizecheck                     Print default and iOS-shaped footprint numbers.
-  ios-gate                      iOS Network Extension memory-shape proofs.
-  profile-smoke [seconds]       Short throughput/fairness/RSS harness smoke.
+  sizecheck                     Print default and iOS-shaped footprint numbers (diagnostic, never fails).
+  ios-gate                      iOS Network Extension memory-shape proofs. Asserts: idle
+                                dynamic sockets charge 0 pool bytes (create + Drop), churn
+                                refunds every pool byte after teardown, RSS bounded.
+  profile-smoke [seconds]       Short throughput/fairness/RSS harness smoke. Asserts:
+                                many_tcp_fair is FAIR with no starved flows, idle_hot
+                                charges 0 pool bytes for idle sockets, RSS bounded.
   fuzz-build                    Build all fuzz targets on nightly.
   fuzz-smoke [seconds] [target] Short ASan fuzz smoke, default wire_parsers.
 
@@ -174,17 +178,89 @@ quick() {
     cargo test --release --test sizecheck --no-default-features --features "$IOS_FEATURES" -- --nocapture
 }
 
+# --- Gate plumbing -----------------------------------------------------------
+#
+# The harness shapes are measurement tools and never assert; the gates live
+# here. `run_gated` captures a command's output, `require` then fails the run
+# unless the given pattern is present. A missing line is a failure too, so a
+# harness output-format change breaks the gate loudly instead of letting it
+# pass vacuously. The gated values are the durable invariants from FORK.md
+# §13.4 (pool refunds, lazy-alloc, fairness, RSS boundedness) — not
+# host-dependent throughput numbers, which per §13 policy are never pinned.
+
+GATE_LOG="$(mktemp)"
+trap 'rm -f "$GATE_LOG"' EXIT
+
+run_gated() {
+    : >"$GATE_LOG"
+    "$@" 2>&1 | tee "$GATE_LOG"
+}
+
+require() {
+    local desc="$1" pattern="$2"
+    if ! grep -Eq "$pattern" "$GATE_LOG"; then
+        echo "GATE FAIL: ${desc} — pattern not found in output: ${pattern}" >&2
+        exit 1
+    fi
+    echo "GATE OK:   ${desc}"
+}
+
 ios_gate() {
     cargo test --release --lib --no-default-features --features "std,$IOS_FEATURES" dyn_buf -- --test-threads=1
     cargo test --release --test sizecheck --no-default-features --features "$IOS_FEATURES" -- --nocapture
-    cargo run --release --example dynbuf_memcompare --features socket-tcp-dynamic-buffer -- dynamic 300
+
+    # Idle-footprint invariant (FORK.md §14.6): dynamic sockets with zero
+    # initial buffers must charge nothing to the pool, at creation and
+    # after Drop.
+    run_gated cargo run --release --example dynbuf_memcompare \
+        --features socket-tcp-dynamic-buffer -- dynamic 300
+    require "idle dynamic sockets charge 0 pool bytes" \
+        'pool charged after N idle sockets: +0 KiB'
+    require "dropped dynamic sockets refund the pool to 0" \
+        'pool charged after Drop: +0 KiB'
+
+    # Lifecycle-refund invariant (FORK.md §13.4): after connection churn and
+    # teardown, every pool byte must be refunded. The at-deadline reading is
+    # a bounded diagnostic and is deliberately not gated.
+    run_gated cargo run --release --example profile_loopback \
+        --features socket-tcp-dynamic-buffer -- --mode bench churn 5 200
+    require "churn refunds every pool byte after teardown" \
+        'pool used \(end\): +0 KiB'
+    require "churn RSS bounded" 'RSS verdict: bounded'
 }
 
 profile_smoke() {
-    local seconds="${1:-1}"
+    local seconds="${1:-2}"
     cargo run --release --example profile_loopback -- --mode bench udp "$seconds"
-    cargo run --release --example profile_loopback -- --mode bench many_tcp_fair "$seconds" 8
-    cargo run --release --example profile_loopback --features socket-tcp-dynamic-buffer -- --mode bench idle_hot "$seconds" 50 2
+
+    # Deterministic TCP fairness signal (FORK.md §13.3): Jain >= 0.95 and no
+    # zero-byte flows is printed as "FAIR (no starvation)".
+    run_gated cargo run --release --example profile_loopback -- \
+        --mode bench many_tcp_fair "$seconds" 8
+    require "many_tcp_fair verdict is FAIR with no starvation" \
+        'verdict: FAIR \(no starvation\)'
+    require "many_tcp_fair RSS bounded" 'RSS verdict: bounded'
+
+    # Lazy-alloc invariant (FORK.md §13.4): idle dynamic sockets charge
+    # nothing at creation; steady-state charge must not exceed the printed
+    # active-socket upper bound.
+    run_gated cargo run --release --example profile_loopback \
+        --features socket-tcp-dynamic-buffer -- --mode bench idle_hot "$seconds" 50 2
+    require "idle sockets are charge-free at creation" \
+        'pool used post-create: +0 KiB'
+    require "idle_hot RSS bounded" 'RSS verdict: bounded'
+    local steady bound
+    steady="$(grep -Eo 'pool used steady: +[0-9]+' "$GATE_LOG" | grep -Eo '[0-9]+$' || true)"
+    bound="$(grep -Eo 'steady upper bound is [0-9]+' "$GATE_LOG" | grep -Eo '[0-9]+$' || true)"
+    if [[ -z "$steady" || -z "$bound" ]]; then
+        echo "GATE FAIL: idle_hot steady-pool lines missing from output" >&2
+        exit 1
+    fi
+    if (( steady > bound )); then
+        echo "GATE FAIL: idle_hot steady pool ${steady} KiB exceeds active-socket bound ${bound} KiB" >&2
+        exit 1
+    fi
+    echo "GATE OK:   idle_hot steady pool ${steady} KiB within bound ${bound} KiB"
 }
 
 fuzz_build() {

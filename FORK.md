@@ -941,6 +941,12 @@ CPU-bound. Jain below the gate across threads suggests `MemoryPool` contention
 or host scheduling noise; confirm with System Trace before changing pool
 internals.
 
+The pool-refund, lazy-alloc, fairness, and RSS-boundedness rows above are
+machine-enforced: `./ci.sh ios-gate` and `./ci.sh profile-smoke` grep the
+harness output for the passing form and exit non-zero when an invariant — or
+the output line carrying it — is missing. Host-dependent throughput values
+stay ungated per the §13 policy.
+
 ### 13.5 Context switches and pool contention
 
 On Linux, every shape prints `voluntary` / `nonvoluntary` context-switch counts
@@ -1275,3 +1281,52 @@ Deliberately **not** taken:
 
 Still ahead of upstream (candidate to upstream per §12): RFC 6928 IW10 in
 `set_mss` (upstream's redesigned Reno/CUBIC open at 2*MSS).
+
+## 17. Candidate future work
+
+Ideas that passed review triage but are not yet scoped. Each would be a
+deliberate exception to §1's "no architectural divergence" policy, so it
+needs an explicit scope decision (and an upstream-discussion attempt per
+§12) before any code lands.
+
+### 17.1 O(1) ingress demux + egress dirty-list
+
+The one remaining ≥2x-class CPU lever at realistic tunnel flow counts.
+Three inherited-from-upstream O(n_sockets) walks dominate once an
+`Interface` carries hundreds of (mostly idle) flows — the browser-driven
+packet-tunnel shape:
+
+- **Ingress demux**: every inbound TCP segment walks all sockets calling
+  `accepts()` until one matches (`src/iface/interface/tcp.rs`, the
+  `for tcp_socket in sockets.items_mut()` loop). Per-packet cost grows
+  linearly with flow count.
+- **Egress scan**: every `poll()` visits every socket — including idle
+  ones — in `socket_egress` (`src/iface/interface/mod.rs`, the
+  `for item in sockets.items_mut()` loop).
+- **`poll_at` scan**: computing the next wake time iterates all sockets
+  again (`src/iface/interface/mod.rs`, `Interface::poll_at`).
+
+The `idle_hot` shape measures exactly this: with 1000 idle + 4 active
+sockets, every poll still pays a 1004-socket walk twice.
+
+Design sketch:
+
+- A 4-tuple → `SocketHandle` hash index maintained at the points where a
+  socket's `tuple` is set or cleared (connect, passive-open promotion,
+  reset, abort, close, `SocketSet::remove`). Established-connection
+  lookups become O(1); SYNs to listeners fall back to a (short) scan of
+  listen sockets only.
+- An egress-interest dirty list: sockets enroll when a state change makes
+  egress work possible (the conditions `egress_interest` / `poll_at`
+  already express) and drop out when drained; `poll()` visits only
+  enrolled sockets plus timer-due ones. A timer min-heap (or wheel) over
+  per-socket `poll_at` values replaces the full scan.
+- Keep it additive and feature-gated; the index lives beside `SocketSet`
+  without changing socket or interface public API.
+
+Evidence plan before/after: the `many_tcp` N-sweep (50→2000, §4.2) and
+`idle_hot 1000 4` (§4.2.1). Acceptance: per-packet cost flat (not linear)
+in N at high flow counts, no regression at N ≤ 8, `poll_at` cost
+proportional to active flows only. Risks to watch: index/tuple desync on
+abort/reuse paths (needs a churn-shape invariant check), and hash-flood
+resistance of the tuple hash (seed it from `Config::random_seed`).
