@@ -1209,12 +1209,26 @@ Design, in `src/socket/tcp.rs`:
   The pure observers (`seq_to_transmit`, `poll_at`, `egress_interest`)
   therefore needed no changes. The segment selector clamps a hole
   retransmission at the next SACKed block.
-- **Recovery point** (RFC 6582 §3): armed at dupack #3 and on RTO.
-  Partial ACKs below it rewind-and-walk the next hole immediately;
-  reaching it ends recovery. During SACK-based recovery, partial ACKs do
-  not notify Reno/Cubic as ordinary new-data ACKs, so the controller stays
-  in fast recovery until the recovery point is cumulatively ACKed. RTO
-  discards the scoreboard and resends conservatively (RFC 2018 §8).
+- **Recovery point** (RFC 6582 §3): armed at dupack #3 and on RTO. For
+  managed controllers both sites arm at HighData — the highest sequence
+  transmitted (`rtte.max_seq_sent`; RFC 6582 "recover", Linux
+  `high_seq = snd_nxt`) — never at the send cursor, which legally rewinds
+  during recovery and would understate the point (early exit with holes
+  outstanding, then a double window cut from the next dupack burst).
+  Each episode records how it started: partial ACKs below the point are
+  withheld from the controller's ordinary new-data `on_ack` only during
+  FAST recovery (RFC 6582 §3.2 — Reno/Cubic would otherwise exit and
+  deflate to ssthresh mid-episode), while an RTO-armed episode keeps
+  delivering them so the post-RTO drain grows in slow start on every ACK
+  (RFC 5681 §3.1). Under a managed controller a new episode — and its
+  `on_loss` window cut — is armed only once the previous recovery point
+  is cumulatively ACKed (RFC 6582 §3.2 heuristic). Partial ACKs below
+  the point rewind-and-walk the next hole immediately; reaching it ends
+  recovery. RTO discards the scoreboard and resends conservatively
+  (RFC 2018 §8). `NoControl` deliberately keeps the legacy behavior —
+  cursor-armed points, re-armed at every trigger — because it has no
+  window to protect and the redundant-pass machinery below keys off the
+  latest trigger.
 - **Redundant pass, `NoControl` only**: when the selective walk exhausts
   while recovery is open, one bounded in-order resend of the window —
   holes always first, then redundancy fills the unmanaged pipe and

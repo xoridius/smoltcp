@@ -587,14 +587,14 @@ const DEFAULT_MSS: usize = 536;
 const MIN_REMOTE_MSS: usize = 48;
 
 bitflags::bitflags! {
-    /// Packed bool fields on `Socket`. Packing them into one byte saves
+    /// Packed bool fields on `Socket`. Packing them into one word saves
     /// ~8 bytes of inter-field padding the compiler would otherwise emit
     /// between scattered `bool` fields (`rx_fin_received`,
     /// `remote_last_win_unscaled`, `remote_has_sack`, `nagle`,
     /// `synack_paused`, `rx_window_update_dirty`). This matches the same
     /// `bitflags!`-based packing style used by `wire::dns::Flags`,
     /// `wire::dhcpv4::Flags`, etc.
-    struct Flags: u8 {
+    struct Flags: u16 {
         const RX_FIN_RECEIVED        = 1 << 0;
         const REMOTE_LAST_WIN_UNSCALED = 1 << 1;
         const REMOTE_HAS_SACK        = 1 << 2;
@@ -613,6 +613,15 @@ bitflags::bitflags! {
         /// separate from `REMOTE_HAS_SACK`, which controls whether we may
         /// send SACK blocks to the peer.
         const LOCAL_HAS_SACK         = 1 << 7;
+        /// The current loss-recovery episode (`recovery_point` armed) was
+        /// started — or taken over — by a retransmission timeout, not by
+        /// fast retransmit. The distinction matters for partial ACKs
+        /// below the recovery point: during *fast* recovery they must not
+        /// be reported to the controller as new-data ACKs (RFC 6582 §3.2,
+        /// or Reno/Cubic would exit recovery and deflate to ssthresh with
+        /// holes outstanding), while the post-RTO drain is slow start and
+        /// RFC 5681 §3.1 mandates window growth on every ACK.
+        const RECOVERY_FROM_RTO      = 1 << 8;
     }
 }
 
@@ -1358,7 +1367,14 @@ impl<'a> Socket<'a> {
         self.recovery_point = None;
         self.flags.remove(Flags::REMOTE_HAS_SACK);
         self.flags.remove(Flags::SACK_REDUNDANT_PASS);
+        self.flags.remove(Flags::RECOVERY_FROM_RTO);
         self.flags.remove(Flags::LOCAL_HAS_SACK);
+        // Duplicate-ACK tracking is connection-scoped: a stale
+        // `local_rx_last_ack` colliding with the next connection's ACKs
+        // would corrupt loss detection.
+        self.local_rx_last_ack = None;
+        self.local_rx_last_seq = None;
+        self.local_rx_dup_acks = 0;
         self.tx_buffer.clear();
         self.rx_buffer.clear();
         self.flags.set(Flags::RX_FIN_RECEIVED, false);
@@ -2417,13 +2433,33 @@ impl<'a> Socket<'a> {
             // reason is TCP simultaneous open).
             (State::SynReceived, TcpControl::Rst) if self.listen_endpoint.port != 0 => {
                 tcp_trace!("received RST");
-                self.tuple = None;
-                // Clear TS.Recent inherited from the aborted handshake. If it
-                // survived, the PAWS check (RFC 7323 §5.3) would reject a fresh
-                // SYN from a different client whose randomized initial TSval
-                // happens to be "older" under wrapping arithmetic, wedging the
-                // recycled listening socket until that client's clock caught up.
-                self.last_remote_tsval = 0;
+                // Recycle the socket exactly as `listen()` re-arms one (it
+                // cannot be called here: it rejects open sockets). A plain
+                // "tuple = None, state = Listen" would leak the aborted
+                // handshake's per-connection transport state into the next
+                // connection: the RTT estimator (whose `max_seq_sent`
+                // high-water mark now bounds SACK ingest and whose monotone
+                // `on_send` guard would suppress all RTT sampling behind a
+                // stale-high mark), a recovery point armed by an RTO that
+                // fired in SYN-RECEIVED (the next connection would then run
+                // entirely "inside recovery": `on_ack` suppressed, dup #3
+                // refusing to arm), the SACK scoreboard, duplicate-ACK
+                // tracking, and TS.Recent (PAWS, RFC 7323 §5.3 — a stale
+                // value would reject a fresh SYN whose randomized initial
+                // TSval is "older" under wrapping arithmetic). `reset()`
+                // clears all of these; configuration (keep-alive, timeout,
+                // Nagle, hop limit, ack delay, SYN|ACK pausing, the timestamp
+                // generator) survives, matching `listen()`.
+                let listen_endpoint = self.listen_endpoint;
+                self.reset();
+                // `reset()` released any dynamic-buffer backing (and its pool
+                // charge); re-arm the configured idle footprint like
+                // `listen()` does. The state setter's SynReceived -> Listen
+                // hook does not fire here because `reset()` already moved the
+                // state to Closed.
+                #[cfg(feature = "socket-tcp-dynamic-buffer")]
+                self.restore_dyn_initial_buffers();
+                self.listen_endpoint = listen_endpoint;
                 self.set_state(State::Listen);
                 return None;
             }
@@ -2676,8 +2712,14 @@ impl<'a> Socket<'a> {
                         // timer above), but do not cut the window again.
                         if self.recovery_point.is_none() {
                             // RFC 6582/6675: remember how far we had sent when
-                            // recovery began; ACKs below this are partial ACKs.
-                            self.recovery_point = Some(self.remote_last_seq);
+                            // recovery began (HighData for managed
+                            // controllers, see `new_recovery_point`); ACKs
+                            // below this are partial ACKs.
+                            self.recovery_point = Some(self.new_recovery_point());
+                            // This episode is fast recovery, not an RTO
+                            // drain: partial ACKs below the recovery point
+                            // must not be reported as new-data ACKs.
+                            self.flags.remove(Flags::RECOVERY_FROM_RTO);
                             // Deliver the congestion response (below, once
                             // this ACK's SACK blocks are on the scoreboard).
                             entered_loss_recovery = true;
@@ -2773,15 +2815,22 @@ impl<'a> Socket<'a> {
             }
 
             // RFC 6582 §3.2: an ACK that advances SND.UNA without reaching
-            // the recovery point is a partial ACK; it must not be reported
-            // to the congestion controller as an ordinary new-data ACK, or
-            // Reno/Cubic would exit fast recovery and deflate cwnd to
-            // ssthresh with holes still outstanding. This holds regardless
-            // of the SACK scoreboard: a SACKless peer (or a scoreboard
-            // emptied by assembler overflow) sends partial ACKs too.
+            // the recovery point is a partial ACK; during *fast* recovery
+            // it must not be reported to the congestion controller as an
+            // ordinary new-data ACK, or Reno/Cubic would exit fast recovery
+            // and deflate cwnd to ssthresh with holes still outstanding.
+            // This holds regardless of the SACK scoreboard: a SACKless peer
+            // (or a scoreboard emptied by assembler overflow) sends partial
+            // ACKs too. It must NOT hold for an episode armed by an RTO:
+            // the post-RTO drain runs in slow start and RFC 5681 §3.1
+            // mandates window growth on every ACK — suppressing them would
+            // pin the whole drain at the loss window (N round trips instead
+            // of log2 N).
             let partial_recovery_ack = matches!(
                 self.recovery_point,
-                Some(recovery_point) if ack_len > 0 && ack_number < recovery_point
+                Some(recovery_point) if ack_len > 0
+                    && ack_number < recovery_point
+                    && !self.flags.contains(Flags::RECOVERY_FROM_RTO)
             );
 
             match self.recovery_point {
@@ -2790,6 +2839,7 @@ impl<'a> Socket<'a> {
                 Some(recovery_point) if ack_number >= recovery_point => {
                     self.recovery_point = None;
                     self.flags.remove(Flags::SACK_REDUNDANT_PASS);
+                    self.flags.remove(Flags::RECOVERY_FROM_RTO);
                 }
                 // Partial ACK during SACK-based recovery: SND.UNA advanced
                 // but not past the recovery point, which means the segment
@@ -3044,6 +3094,30 @@ impl<'a> Socket<'a> {
         }
     }
 
+    /// Where a new loss-recovery episode should be armed (RFC 6582
+    /// "recover"). For managed controllers this is HighData — the highest
+    /// sequence number transmitted, per RFC 6582 §3 and Linux's
+    /// `tp->high_seq = tp->snd_nxt` — taken from the RTT estimator's
+    /// monotone high-water mark (the same source `ingest_sack_ranges`
+    /// validates against). The send cursor cannot serve: it legally
+    /// rewinds during recovery, and an RTO firing after a partial-ACK
+    /// rewind would arm an understated point, exit the episode on the
+    /// next advancing ACK with holes still outstanding, and let a
+    /// following dup #3 cut the window a second time for the same loss
+    /// window. `None` only before the first sequence-occupying segment is
+    /// sent, when the cursor is trivially correct.
+    ///
+    /// `NoControl` deliberately keeps the legacy cursor arm: it has no
+    /// window to protect, and its §15 redundant-pass machinery keys off
+    /// the latest trigger.
+    fn new_recovery_point(&self) -> TcpSeqNumber {
+        if self.congestion_controller.manages_window() {
+            self.rtte.max_seq_sent.unwrap_or(self.remote_last_seq)
+        } else {
+            self.remote_last_seq
+        }
+    }
+
     /// Begin the one-shot redundant pass of loss recovery: rewind the
     /// cursor to SND.UNA and resend the window in order, ignoring the
     /// scoreboard. Entered only when the selective hole-walk has nothing
@@ -3063,6 +3137,10 @@ impl<'a> Socket<'a> {
         }
         self.flags.insert(Flags::SACK_REDUNDANT_PASS);
         self.remote_last_seq = self.local_seq_no;
+        // Karn's algorithm (RFC 6298 §3): the rewind resends the window, so
+        // an RTT sample in progress could complete against an ACK elicited
+        // by the second copy. Abort it, as every other rewind site does.
+        self.rtte.on_retransmit();
     }
 
     /// Number of octets transmitted but not yet cumulatively ACKed.
@@ -3408,11 +3486,17 @@ impl<'a> Socket<'a> {
 
                 self.sack_scoreboard.clear();
                 // RFC 6582 §3: (re)arm the recovery point on timeout as
-                // well. SACK blocks arriving during the go-back-N walk
-                // repopulate the scoreboard, and partial ACKs below this
-                // point then repair re-lost holes immediately instead of
-                // waiting out further exponentially backed-off RTOs.
-                self.recovery_point = Some(self.remote_last_seq);
+                // well, at HighData for managed controllers (the cursor may
+                // rest below it after a partial-ACK rewind — see
+                // `new_recovery_point`). SACK blocks arriving during the
+                // go-back-N walk repopulate the scoreboard, and partial
+                // ACKs below this point then repair re-lost holes
+                // immediately instead of waiting out further exponentially
+                // backed-off RTOs. Mark the episode as RTO recovery: the
+                // drain runs in slow start, so partial ACKs must keep
+                // feeding the controller (RFC 5681 §3.1).
+                self.recovery_point = Some(self.new_recovery_point());
+                self.flags.insert(Flags::RECOVERY_FROM_RTO);
                 self.flags.remove(Flags::SACK_REDUNDANT_PASS);
             } else {
                 net_debug!("retransmitting for fast-retransmit");
@@ -4826,6 +4910,101 @@ mod test {
         assert_eq!(s.state, State::Listen);
         assert_eq!(s.listen_endpoint, LISTEN_END);
         assert_eq!(s.tuple, None);
+    }
+
+    #[test]
+    fn test_syn_received_rst_recycle_clears_transport_state() {
+        // The SYN-RECEIVED -> LISTEN recycle must be equivalent to
+        // `listen()`'s re-arm. Leaking the aborted handshake's transport
+        // state poisons the next connection: a stale `rtte.max_seq_sent`
+        // is stale-HIGH about half the time under wrapping order (the next
+        // ISN is random), silently degrading the RFC 6675 SACK-ingest
+        // bound and suppressing all RTT sampling behind `on_send`'s
+        // monotone guard; a recovery point armed by an RTO that fired in
+        // SYN-RECEIVED makes the next connection run entirely "inside
+        // recovery" (`on_ack` suppressed so cwnd freezes, dup #3 refusing
+        // to arm a fresh episode so `on_loss` is never delivered).
+        let mut s = socket_listen();
+        send!(
+            s,
+            TcpRepr {
+                control: TcpControl::Syn,
+                seq_number: REMOTE_SEQ,
+                ack_number: None,
+                ..SEND_TEMPL
+            }
+        );
+        recv!(
+            s,
+            [TcpRepr {
+                control: TcpControl::Syn,
+                seq_number: LOCAL_SEQ,
+                ack_number: Some(REMOTE_SEQ + 1),
+                max_seg_size: Some(BASE_MSS),
+                ..RECV_TEMPL
+            }]
+        );
+
+        // The SYN|ACK retransmission timeout fires: the dispatch RTO
+        // branch runs in SYN-RECEIVED too, arming the recovery point and
+        // marking the episode as RTO recovery.
+        recv!(s, time 1500, Ok(TcpRepr {
+            control: TcpControl::Syn,
+            seq_number: LOCAL_SEQ,
+            ack_number: Some(REMOTE_SEQ + 1),
+            max_seg_size: Some(BASE_MSS),
+            ..RECV_TEMPL
+        }));
+        assert_eq!(s.rtte.max_seq_sent, Some(LOCAL_SEQ + 1));
+        assert!(s.recovery_point.is_some());
+        assert!(s.flags.contains(Flags::RECOVERY_FROM_RTO));
+        // Stale per-connection state that a previous connection on this
+        // socket could equally have left behind.
+        s.local_rx_dup_acks = 2;
+        s.local_rx_last_ack = Some(LOCAL_SEQ);
+        s.sack_scoreboard.add(6, 6).unwrap();
+        s.flags.insert(Flags::SACK_REDUNDANT_PASS);
+
+        send!(s, time 1600, TcpRepr {
+            control: TcpControl::Rst,
+            seq_number: REMOTE_SEQ + 1,
+            ack_number: Some(LOCAL_SEQ),
+            ..SEND_TEMPL
+        });
+        assert_eq!(s.state, State::Listen);
+        assert_eq!(s.listen_endpoint, LISTEN_END);
+        assert_eq!(s.tuple, None);
+
+        // Everything per-connection is gone.
+        assert_eq!(s.rtte.max_seq_sent, None);
+        assert!(s.recovery_point.is_none());
+        assert!(s.sack_scoreboard.is_empty());
+        assert_eq!(s.local_rx_dup_acks, 0);
+        assert_eq!(s.local_rx_last_ack, None);
+        assert!(!s.flags.contains(Flags::SACK_REDUNDANT_PASS));
+        assert!(!s.flags.contains(Flags::RECOVERY_FROM_RTO));
+
+        // A fresh handshake completes normally.
+        send!(s, time 2000, TcpRepr {
+            control: TcpControl::Syn,
+            seq_number: REMOTE_SEQ + 12345,
+            ack_number: None,
+            ..SEND_TEMPL
+        });
+        assert_eq!(s.state, State::SynReceived);
+        recv!(s, time 2010, Ok(TcpRepr {
+            control: TcpControl::Syn,
+            seq_number: LOCAL_SEQ,
+            ack_number: Some(REMOTE_SEQ + 12345 + 1),
+            max_seg_size: Some(BASE_MSS),
+            ..RECV_TEMPL
+        }));
+        send!(s, time 2020, TcpRepr {
+            seq_number: REMOTE_SEQ + 12345 + 1,
+            ack_number: Some(LOCAL_SEQ + 1),
+            ..SEND_TEMPL
+        });
+        assert_eq!(s.state, State::Established);
     }
 
     #[test]
@@ -8712,6 +8891,275 @@ mod test {
             ..RECV_TEMPL
         }));
         assert_eq!(s.congestion_controller.window(), post_rto_cwnd);
+    }
+
+    #[cfg(feature = "socket-tcp-reno")]
+    #[test]
+    fn test_rto_recovery_drain_grows_in_slow_start() {
+        // RFC 5681 §3.1: after an RTO collapses cwnd to the loss window,
+        // the drain of the outstanding data runs in slow start and every
+        // ACK of new data must grow the window. The RFC 6582 §3.2
+        // partial-ACK suppression applies to FAST recovery only — carrying
+        // it into an RTO episode pins the whole SACKless drain at 1 MSS
+        // (N round trips for N outstanding segments instead of log2 N).
+        let mut s = socket_established();
+        s.set_congestion_control(CongestionControl::Reno);
+        s.congestion_controller.set_mss(6);
+        s.remote_mss = 6;
+        send!(s, time 0, TcpRepr {
+            seq_number: REMOTE_SEQ + 1,
+            ack_number: Some(LOCAL_SEQ + 1),
+            ..SEND_TEMPL
+        });
+
+        // Six 6-byte segments in flight.
+        s.send_slice(b"aaaaaabbbbbbccccccddddddeeeeeeffffff")
+            .unwrap();
+        for (i, payload) in [
+            &b"aaaaaa"[..],
+            b"bbbbbb",
+            b"cccccc",
+            b"dddddd",
+            b"eeeeee",
+            b"ffffff",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            recv!(s, time 1000 + i as i64 * 5, Ok(TcpRepr {
+                seq_number: LOCAL_SEQ + 1 + 6 * i,
+                ack_number: Some(REMOTE_SEQ + 1),
+                payload,
+                ..RECV_TEMPL
+            }));
+        }
+
+        // Nothing is ACKed: the RTO collapses cwnd to one segment
+        // (ssthresh = half the 36-byte flight = 18) and resends segment 1.
+        recv!(s, time 2000, Ok(TcpRepr {
+            seq_number: LOCAL_SEQ + 1,
+            ack_number: Some(REMOTE_SEQ + 1),
+            payload:    &b"aaaaaa"[..],
+            ..RECV_TEMPL
+        }));
+        assert!(s.recovery_point.is_some());
+        assert_eq!(s.congestion_controller.window(), 6);
+
+        // Successive advancing partial ACKs below the recovery point: the
+        // window must grow by 1 MSS each (slow start), not stay pinned at
+        // the loss window.
+        send!(s, time 2050, TcpRepr {
+            seq_number: REMOTE_SEQ + 1,
+            ack_number: Some(LOCAL_SEQ + 1 + 6),
+            ..SEND_TEMPL
+        });
+        assert_eq!(s.congestion_controller.window(), 12);
+
+        // The grown window admits two segments per round trip now.
+        recv!(s, time 2060, Ok(TcpRepr {
+            seq_number: LOCAL_SEQ + 1 + 6,
+            ack_number: Some(REMOTE_SEQ + 1),
+            payload:    &b"bbbbbb"[..],
+            ..RECV_TEMPL
+        }));
+        recv!(s, time 2065, Ok(TcpRepr {
+            seq_number: LOCAL_SEQ + 1 + 12,
+            ack_number: Some(REMOTE_SEQ + 1),
+            payload:    &b"cccccc"[..],
+            ..RECV_TEMPL
+        }));
+        recv_nothing!(s, time 2070);
+
+        send!(s, time 2100, TcpRepr {
+            seq_number: REMOTE_SEQ + 1,
+            ack_number: Some(LOCAL_SEQ + 1 + 18),
+            ..SEND_TEMPL
+        });
+        assert_eq!(s.congestion_controller.window(), 18);
+
+        // Three more under the again-grown window.
+        recv!(s, time 2110, Ok(TcpRepr {
+            seq_number: LOCAL_SEQ + 1 + 18,
+            ack_number: Some(REMOTE_SEQ + 1),
+            payload:    &b"dddddd"[..],
+            ..RECV_TEMPL
+        }));
+        recv!(s, time 2115, Ok(TcpRepr {
+            seq_number: LOCAL_SEQ + 1 + 24,
+            ack_number: Some(REMOTE_SEQ + 1),
+            payload:    &b"eeeeee"[..],
+            ..RECV_TEMPL
+        }));
+        recv!(s, time 2120, Ok(TcpRepr {
+            seq_number: LOCAL_SEQ + 1 + 30,
+            ack_number: Some(REMOTE_SEQ + 1),
+            payload:    &b"ffffff"[..],
+            ..RECV_TEMPL
+        }));
+        recv_nothing!(s, time 2125);
+
+        // At ssthresh, growth continues in congestion avoidance.
+        send!(s, time 2150, TcpRepr {
+            seq_number: REMOTE_SEQ + 1,
+            ack_number: Some(LOCAL_SEQ + 1 + 30),
+            ..SEND_TEMPL
+        });
+        assert!(s.congestion_controller.window() > 18);
+
+        // The cumulative ACK reaching the recovery point exits cleanly.
+        send!(s, time 2200, TcpRepr {
+            seq_number: REMOTE_SEQ + 1,
+            ack_number: Some(LOCAL_SEQ + 1 + 36),
+            ..SEND_TEMPL
+        });
+        assert!(s.recovery_point.is_none());
+        assert!(!s.flags.contains(Flags::RECOVERY_FROM_RTO));
+        assert_eq!(s.tx_buffer.len(), 0);
+        recv_nothing!(s, time 2250);
+    }
+
+    #[cfg(feature = "socket-tcp-reno")]
+    #[test]
+    fn test_rto_mid_recovery_arms_recovery_point_at_high_data() {
+        // RFC 6582 §3: "recover" is HighData, the highest sequence number
+        // transmitted — Linux arms high_seq = snd_nxt at every episode
+        // start. The send cursor cannot serve: it legally rewinds during
+        // recovery, so an RTO firing after a partial-ACK rewind would arm
+        // an understated point, exit the episode on the next advancing ACK
+        // with holes still outstanding, and let a following dup #3 deliver
+        // a second on_loss for the same loss window (double cut).
+        let mut s = socket_established();
+        s.set_congestion_control(CongestionControl::Reno);
+        s.congestion_controller.set_mss(6);
+        s.flags.insert(Flags::LOCAL_HAS_SACK);
+        s.remote_mss = 6;
+        send!(s, time 0, TcpRepr {
+            seq_number: REMOTE_SEQ + 1,
+            ack_number: Some(LOCAL_SEQ + 1),
+            ..SEND_TEMPL
+        });
+
+        // Eight 6-byte segments in flight; HighData = SND.UNA + 48.
+        s.send_slice(b"aaaaaabbbbbbccccccddddddeeeeeeffffffgggggghhhhhh")
+            .unwrap();
+        for (i, payload) in [
+            &b"aaaaaa"[..],
+            b"bbbbbb",
+            b"cccccc",
+            b"dddddd",
+            b"eeeeee",
+            b"ffffff",
+            b"gggggg",
+            b"hhhhhh",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            recv!(s, time 1000 + i as i64 * 5, Ok(TcpRepr {
+                seq_number: LOCAL_SEQ + 1 + 6 * i,
+                ack_number: Some(REMOTE_SEQ + 1),
+                payload,
+                ..RECV_TEMPL
+            }));
+        }
+
+        // Three duplicate ACKs SACKing the last segment: fast recovery,
+        // window cut once (ssthresh = 42/2 = 21, cwnd = 21 + 3 MSS = 39).
+        for t in [1050, 1055, 1060] {
+            send!(s, time t, TcpRepr {
+                seq_number: REMOTE_SEQ + 1,
+                ack_number: Some(LOCAL_SEQ + 1),
+                sack_ranges: [
+                    sack_block(LOCAL_SEQ + 1 + 42, LOCAL_SEQ + 1 + 48),
+                    None,
+                    None,
+                ],
+                ..SEND_TEMPL
+            });
+        }
+        assert_eq!(s.recovery_point, Some(LOCAL_SEQ + 1 + 48));
+
+        // The recovery walk rewinds and resends; the 39-byte window
+        // admits six of the seven un-SACKed segments, then stalls with
+        // the cursor at SND.UNA + 36 — below HighData.
+        for (i, payload) in [
+            &b"aaaaaa"[..],
+            b"bbbbbb",
+            b"cccccc",
+            b"dddddd",
+            b"eeeeee",
+            b"ffffff",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            recv!(s, time 1100 + i as i64 * 5, Ok(TcpRepr {
+                seq_number: LOCAL_SEQ + 1 + 6 * i,
+                ack_number: Some(REMOTE_SEQ + 1),
+                payload,
+                ..RECV_TEMPL
+            }));
+        }
+        recv_nothing!(s, time 1130);
+        assert_eq!(s.remote_last_seq, LOCAL_SEQ + 1 + 36);
+
+        // The RTO expires mid-recovery, with the cursor still rewound.
+        // The re-armed recovery point must be HighData, not the cursor.
+        recv!(s, time 2150, Ok(TcpRepr {
+            seq_number: LOCAL_SEQ + 1,
+            ack_number: Some(REMOTE_SEQ + 1),
+            payload:    &b"aaaaaa"[..],
+            ..RECV_TEMPL
+        }));
+        assert_eq!(s.recovery_point, Some(LOCAL_SEQ + 1 + 48));
+        assert!(s.flags.contains(Flags::RECOVERY_FROM_RTO));
+
+        // An advancing ACK below HighData is a partial ACK: it must NOT
+        // exit the episode (with a cursor-armed point of +36 it would).
+        send!(s, time 2200, TcpRepr {
+            seq_number: REMOTE_SEQ + 1,
+            ack_number: Some(LOCAL_SEQ + 1 + 42),
+            ..SEND_TEMPL
+        });
+        assert!(s.recovery_point.is_some());
+
+        // The post-RTO drain continues: the last segment goes out under
+        // the slow-start-grown window.
+        recv!(s, time 2210, Ok(TcpRepr {
+            seq_number: LOCAL_SEQ + 1 + 42,
+            ack_number: Some(REMOTE_SEQ + 1),
+            payload:    &b"hhhhhh"[..],
+            ..RECV_TEMPL
+        }));
+
+        // Three fresh duplicate ACKs still below HighData belong to the
+        // SAME loss window: retransmit, but no second window reduction.
+        let cwnd_before_dupacks = s.congestion_controller.window();
+        for t in [2250, 2255, 2260] {
+            send!(s, time t, TcpRepr {
+                seq_number: REMOTE_SEQ + 1,
+                ack_number: Some(LOCAL_SEQ + 1 + 42),
+                ..SEND_TEMPL
+            });
+        }
+        assert_eq!(s.congestion_controller.window(), cwnd_before_dupacks);
+        assert!(s.recovery_point.is_some());
+        recv!(s, time 2300, Ok(TcpRepr {
+            seq_number: LOCAL_SEQ + 1 + 42,
+            ack_number: Some(REMOTE_SEQ + 1),
+            payload:    &b"hhhhhh"[..],
+            ..RECV_TEMPL
+        }));
+
+        // The cumulative ACK of HighData ends the episode.
+        send!(s, time 2400, TcpRepr {
+            seq_number: REMOTE_SEQ + 1,
+            ack_number: Some(LOCAL_SEQ + 1 + 48),
+            ..SEND_TEMPL
+        });
+        assert!(s.recovery_point.is_none());
+        assert_eq!(s.tx_buffer.len(), 0);
+        recv_nothing!(s, time 2450);
     }
 
     #[test]
