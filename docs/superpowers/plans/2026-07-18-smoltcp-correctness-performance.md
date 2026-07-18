@@ -28,7 +28,8 @@
 
 **Files:**
 - Create: `docs/perf/2026-07-18-before.md`
-- Read: `ci.sh`, `examples/profile_loopback.rs`, `examples/dynbuf_memcompare.rs`
+- Modify: `examples/profile_loopback.rs` only if an existing shape cannot emit a required baseline metric
+- Read: `ci.sh`, `examples/dynbuf_memcompare.rs`
 - Read: `/root/tunnel-lib-rust/crates/netstack/tests/rss_budget_*.rs`
 
 **Interfaces:**
@@ -58,18 +59,18 @@ Expected: ordinary suites and NoControl pass; record the known pre-change Reno/C
 
 - [ ] **Step 3: Capture five matched performance samples**
 
-For each software-checksum and `offload` variant, run five release samples of `udp`, `firehose`, `pingpong`, `small`, `many_tcp 3 8`, `many_tcp_fair 3 8`, `many_udp 3 8`, `many_tcp 3 100`, `many_tcp_fair 3 100`, and `many_udp 3 100`. Run dynamic-buffer shapes `multi_tcp 3 2 50`, `multi_tcp_sink 3 2 50`, `churn 3 500`, `idle_hot 3 1000 0`, and `idle_hot 3 1000 10` five times. Save every raw output under `/tmp/smoltcp-perf-before/<shape>-<sample>.log` and record medians for throughput, RSS, heap delta, allocations, fairness, pool charge, and fallback allocations.
+For each software-checksum and `offload` variant, run one unrecorded warm-up followed by five release samples of `udp`, `firehose`, `pingpong`, `small`, `many_tcp 3 8`, `many_tcp_fair 3 8`, `many_udp 3 8`, `many_tcp 3 50`, `many_tcp_fair 3 50`, `many_udp 3 50`, `many_tcp 3 100`, `many_tcp_fair 3 100`, and `many_udp 3 100`. Run dynamic-buffer shapes `multi_tcp 3 2 50`, `multi_tcp_sink 3 2 50`, `churn 3 500`, `idle_hot 3 1000 0`, and `idle_hot 3 1000 10` in both software-checksum and `offload` variants with the same warm-up plus five-sample protocol. Save every raw output under `/tmp/smoltcp-perf-before/<shape>-<sample>.log` and record medians for throughput, raw RSS start/end, heap delta, allocations, fairness, active pool charge, pool charge after teardown, and fallback allocations. If a current shape omits a required metric, first add reporting-only instrumentation with a failing pure unit test and synchronization outside its timed steady-state loop; do not change its traffic or library behavior.
 
 - [ ] **Step 4: Capture idle socket and downstream constrained-memory baselines**
 
-Run separate-process `dynbuf_memcompare` legacy/dynamic samples for 300 and 1,000 flows. In `/root/tunnel-lib-rust`, run the focused release RSS suites registered as `rss_budget_tcp`, `rss_budget_combined`, `rss_budget_tcp_slow`, `rss_budget_tcp_rst`, `rss_budget_tcp_pressure`, `rss_budget_udp_pressure`, and `rss_budget_tcp_pool` using the repository's documented feature set. Record passes and raw RSS/footprint values.
+Run one warm-up plus five separate-process `dynbuf_memcompare` legacy/dynamic samples for 300 and 1,000 flows, recording raw RSS start/end as well as deltas. In `/root/tunnel-lib-rust`, run the focused release RSS suites registered as `rss_budget_tcp`, `rss_budget_combined`, `rss_budget_tcp_slow`, `rss_budget_tcp_rst`, `rss_budget_tcp_pressure`, `rss_budget_udp_pressure`, and `rss_budget_tcp_pool` using the repository's documented feature set. For each of the three absolute-RSS bodies, run one unrecorded warm-up followed by five fresh test-process samples and record the exact command plus raw before/after/delta medians; label Linux results supplemental rather than Apple jetsam truth. Record all platform-neutral passes and diagnostics.
 
 - [ ] **Step 5: Verify and commit the baseline document**
 
 Run `git diff --check`, verify the document names every command and sample count, then commit:
 
 ```bash
-git add docs/perf/2026-07-18-before.md
+git add examples/profile_loopback.rs docs/perf/2026-07-18-before.md
 git commit -m "docs: capture pre-fix smoltcp performance baseline"
 ```
 
