@@ -742,6 +742,42 @@ mod tests {
         assert_eq!(stats.fallback_allocs, 0);
         assert_eq!(stats.pool_misses, 0);
     }
+
+    #[cfg(feature = "socket-tcp-dynamic-buffer")]
+    #[test]
+    fn multi_tcp_memory_report_keeps_active_and_teardown_boundaries() {
+        let before = AllocSnap {
+            alloc_bytes: 1_000,
+            alloc_count: 10,
+            free_bytes: 400,
+            rss: 8_192,
+            ctxsw_voluntary: 0,
+            ctxsw_nonvoluntary: 0,
+            cpu_ns: 0,
+            tsc: 0,
+        };
+        let after = AllocSnap {
+            alloc_bytes: 1_600,
+            alloc_count: 14,
+            free_bytes: 850,
+            rss: 12_288,
+            ctxsw_voluntary: 0,
+            ctxsw_nonvoluntary: 0,
+            cpu_ns: 0,
+            tsc: 0,
+        };
+
+        let report = MultiTcpMemoryReport::from_snapshots(before, after, 65_536, 0);
+
+        assert_eq!(report.rss_start, 8_192);
+        assert_eq!(report.rss_end, 12_288);
+        assert_eq!(report.bytes_allocated, 600);
+        assert_eq!(report.bytes_freed, 450);
+        assert_eq!(report.net_heap_delta, 150);
+        assert_eq!(report.allocation_count, 4);
+        assert_eq!(report.pool_active, 65_536);
+        assert_eq!(report.pool_after_teardown, 0);
+    }
 }
 
 /// A `Device` that sends to one queue and receives from another. Two of these
@@ -1011,6 +1047,81 @@ impl AllocSnap {
             cpu_ns: thread_cpu_ns(),
             tsc: read_tsc(),
         }
+    }
+}
+
+#[cfg(feature = "socket-tcp-dynamic-buffer")]
+fn alloc_counters_with_rss(rss: u64) -> AllocSnap {
+    AllocSnap {
+        alloc_bytes: ALLOC_BYTES.load(Ordering::Relaxed),
+        alloc_count: ALLOC_COUNT.load(Ordering::Relaxed),
+        free_bytes: FREE_BYTES.load(Ordering::Relaxed),
+        rss,
+        ctxsw_voluntary: 0,
+        ctxsw_nonvoluntary: 0,
+        cpu_ns: 0,
+        tsc: 0,
+    }
+}
+
+#[cfg(feature = "socket-tcp-dynamic-buffer")]
+struct MultiTcpMemoryReport {
+    rss_start: u64,
+    rss_end: u64,
+    bytes_allocated: u64,
+    bytes_freed: u64,
+    net_heap_delta: i128,
+    allocation_count: u64,
+    pool_active: usize,
+    pool_after_teardown: usize,
+}
+
+#[cfg(feature = "socket-tcp-dynamic-buffer")]
+impl MultiTcpMemoryReport {
+    fn from_snapshots(
+        before: AllocSnap,
+        after: AllocSnap,
+        pool_active: usize,
+        pool_after_teardown: usize,
+    ) -> Self {
+        let bytes_allocated = after.alloc_bytes.saturating_sub(before.alloc_bytes);
+        let bytes_freed = after.free_bytes.saturating_sub(before.free_bytes);
+        Self {
+            rss_start: before.rss,
+            rss_end: after.rss,
+            bytes_allocated,
+            bytes_freed,
+            net_heap_delta: bytes_allocated as i128 - bytes_freed as i128,
+            allocation_count: after.alloc_count.saturating_sub(before.alloc_count),
+            pool_active,
+            pool_after_teardown,
+        }
+    }
+
+    fn print(&self) {
+        println!("  pool used active end:   {} KiB", self.pool_active / 1024);
+        println!(
+            "  pool used after teardown: {} KiB",
+            self.pool_after_teardown / 1024
+        );
+        println!();
+        println!("  steady-state allocations:");
+        println!("    bytes allocated:       {}", self.bytes_allocated);
+        println!("    bytes freed:           {}", self.bytes_freed);
+        println!("    net heap delta:        {}", self.net_heap_delta);
+        println!("    allocation count:      {}", self.allocation_count);
+        println!();
+        println!("  process memory:");
+        println!(
+            "    rss start:              {}  ({:.1} MiB)",
+            self.rss_start,
+            self.rss_start as f64 / (1024.0 * 1024.0)
+        );
+        println!(
+            "    rss end:                {}  ({:.1} MiB)",
+            self.rss_end,
+            self.rss_end as f64 / (1024.0 * 1024.0)
+        );
     }
 }
 
@@ -2449,13 +2560,19 @@ fn shape_multi_tcp_impl(
     let pool_bytes: usize = total_flows * 2 * MAX_BUF as usize;
     let pool = tcp::MemoryPool::new(pool_bytes);
 
-    let barrier = Arc::new(Barrier::new(n_threads));
+    let setup_ready = Arc::new(Barrier::new(n_threads + 1));
+    let steady_start_release = Arc::new(Barrier::new(n_threads + 1));
+    let steady_finished = Arc::new(Barrier::new(n_threads + 1));
+    let teardown_release = Arc::new(Barrier::new(n_threads + 1));
     let (vol_before, nvol_before) = ctxsw_counts();
     let mut handles: Vec<thread::JoinHandle<(u64, u64, u64, LaneStats)>> =
         Vec::with_capacity(n_threads);
     for tid in 0..n_threads {
         let pool = pool.clone();
-        let barrier = barrier.clone();
+        let setup_ready = setup_ready.clone();
+        let steady_start_release = steady_start_release.clone();
+        let steady_finished = steady_finished.clone();
+        let teardown_release = teardown_release.clone();
         handles.push(thread::spawn(move || {
             let qd = (flows_per_thread * 16).clamp(1024, 16384);
             // Distinct base address per thread so server/client tuples don't
@@ -2519,8 +2636,9 @@ fn shape_multi_tcp_impl(
                 }
             }
 
-            // Synchronize the steady-state start across threads.
-            barrier.wait();
+            // Setup and start coordination stays outside the timed traffic loop.
+            setup_ready.wait();
+            steady_start_release.wait();
             let steady_start = StdInstant::now();
 
             let mut sent: u64 = 0;
@@ -2622,11 +2740,33 @@ fn shape_multi_tcp_impl(
             }
             let elapsed_us = steady_start.elapsed().as_micros() as u64;
             let lane_stats = collect_lane_stats(&[&lane_a, &lane_b]);
+            // Keep every worker's sockets alive until the main thread samples
+            // the active-end memory and pool boundaries.
+            steady_finished.wait();
+            teardown_release.wait();
             (sent, recvd, elapsed_us, lane_stats)
         }));
     }
 
+    // Wait until every worker has connected its sockets, then bracket only the
+    // steady phase. Workers remain blocked before start and after finish.
+    setup_ready.wait();
+    let rss_start = rss_bytes();
+    let alloc_before = alloc_counters_with_rss(rss_start);
+    steady_start_release.wait();
+    steady_finished.wait();
+    let mut alloc_after = alloc_counters_with_rss(0);
+    let pool_active = pool.used();
+    alloc_after.rss = rss_bytes();
+    teardown_release.wait();
     let results: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+    let pool_after_teardown = pool.used();
+    let memory_report = MultiTcpMemoryReport::from_snapshots(
+        alloc_before,
+        alloc_after,
+        pool_active,
+        pool_after_teardown,
+    );
     let total_elapsed_us = results
         .iter()
         .map(|(_, _, elapsed_us, _)| *elapsed_us)
@@ -2681,11 +2821,8 @@ fn shape_multi_tcp_impl(
     println!(
         "  threads:                {n_threads}   flows/thread: {flows_per_thread}   total flows: {total_flows}"
     );
-    println!(
-        "  pool budget:            {} KiB    pool used (end): {} KiB",
-        pool_bytes / 1024,
-        pool.used() / 1024,
-    );
+    println!("  pool budget:            {} KiB", pool_bytes / 1024);
+    memory_report.print();
     println!("  elapsed:                {:.3}s", total_secs);
     println!(
         "  aggregate app sent:     {:.3} GB    ({:.3} Gbps)",
@@ -2886,6 +3023,8 @@ fn shape_churn(seconds: u64, target_conn_per_sec: usize, offload: bool, mode: Ru
         pool_after_teardown / 1024
     );
     println!("  pool budget:            {} KiB", pool_bytes / 1024);
+    println!("  RSS start:              {} KiB", alloc_before.rss / 1024);
+    println!("  RSS end:                {} KiB", alloc_after.rss / 1024);
     println!("  bytes allocated:        {alloc_bytes}");
     println!("  bytes freed:            {free_bytes}");
     println!(
@@ -3062,10 +3201,20 @@ fn shape_idle_hot(seconds: u64, n_idle: usize, n_active: usize, offload: bool, m
         }
     }
     let elapsed = steady_start.elapsed().as_secs_f64();
-    let alloc_after = AllocSnap::now();
+    let mut alloc_after = AllocSnap::now();
     let pool_steady = pool.used();
     let rss_end = rss_bytes();
+    alloc_after.rss = rss_end;
     let lane_stats = collect_lane_stats(&[&lane_a, &lane_b]);
+    drop(server);
+    drop(client);
+    let pool_after_teardown = pool.used();
+    let memory_report = MultiTcpMemoryReport::from_snapshots(
+        alloc_before,
+        alloc_after,
+        pool_steady,
+        pool_after_teardown,
+    );
     let harness_reserved = lane_stats.reserved_total_bytes() as u64;
     let rss_after_create_less_harness = rss_after_create.saturating_sub(harness_reserved);
     let rss_end_less_harness = rss_end.saturating_sub(harness_reserved);
@@ -3092,21 +3241,11 @@ fn shape_idle_hot(seconds: u64, n_idle: usize, n_active: usize, offload: bool, m
     println!("  elapsed:                {elapsed:.3}s");
     println!("  app sent / recvd:       {} / {}", sent, recvd);
     println!("  active throughput:      {gbps:.3} Gbps");
-    println!("  pool used steady:       {} KiB", pool_steady / 1024);
-    println!("  RSS end:                {} KiB", rss_end / 1024);
+    memory_report.print();
     println!(
         "  RSS end less harness:   {} KiB  (excludes harness packet pool)",
         rss_end_less_harness / 1024
     );
-    let alloc_bytes = alloc_after.alloc_bytes - alloc_before.alloc_bytes;
-    let free_bytes = alloc_after.free_bytes - alloc_before.free_bytes;
-    let alloc_count = alloc_after.alloc_count - alloc_before.alloc_count;
-    println!("  bytes allocated:        {alloc_bytes}");
-    println!(
-        "  net heap delta:         {}",
-        alloc_bytes as i64 - free_bytes as i64
-    );
-    println!("  allocation count:       {alloc_count}");
     println!(
         "  expected: idle pool charge ~= 0 KiB; steady upper bound is {} KiB (active client/server sockets x rx/tx max)",
         expected_steady_bytes / 1024
