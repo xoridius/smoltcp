@@ -778,6 +778,66 @@ mod tests {
         assert_eq!(report.pool_active, 65_536);
         assert_eq!(report.pool_after_teardown, 0);
     }
+
+    #[cfg(feature = "socket-tcp-dynamic-buffer")]
+    fn assert_multi_tcp_worker_panic_propagates(fail_before_ready: bool) {
+        use std::panic::{AssertUnwindSafe, catch_unwind};
+        use std::sync::mpsc;
+        use std::thread;
+        use std::time::Duration;
+
+        let (completed_tx, completed_rx) = mpsc::channel();
+        let supervisor = thread::spawn(move || {
+            let outcome = catch_unwind(AssertUnwindSafe(|| {
+                let mut workers = MultiTcpWorkers::<()>::spawn(2, move |worker_id, mut phases| {
+                    if worker_id == 0 && fail_before_ready {
+                        panic!("injected multi_tcp setup failure");
+                    }
+                    if !phases.ready() {
+                        return;
+                    }
+                    if worker_id == 0 && !fail_before_ready {
+                        panic!("injected multi_tcp work failure");
+                    }
+                    if worker_id != 0 && !fail_before_ready {
+                        thread::sleep(Duration::from_millis(50));
+                    }
+                    let _ = phases.finished(());
+                });
+                workers.wait_ready();
+                workers.start();
+                let _ = workers.wait_finished();
+                workers.release_and_join();
+            }));
+            let _ = completed_tx.send(outcome);
+        });
+
+        let outcome = completed_rx
+            .recv_timeout(Duration::from_millis(500))
+            .expect("multi_tcp coordinator did not propagate worker failure");
+        supervisor.join().unwrap();
+        let panic = outcome.expect_err("injected worker panic was not resumed");
+        let message = panic
+            .downcast_ref::<&str>()
+            .copied()
+            .or_else(|| panic.downcast_ref::<String>().map(String::as_str));
+        assert!(
+            message.is_some_and(|message| message.starts_with("injected multi_tcp")),
+            "unexpected panic payload: {message:?}"
+        );
+    }
+
+    #[cfg(feature = "socket-tcp-dynamic-buffer")]
+    #[test]
+    fn multi_tcp_coordinator_propagates_setup_panic_without_deadlock() {
+        assert_multi_tcp_worker_panic_propagates(true);
+    }
+
+    #[cfg(feature = "socket-tcp-dynamic-buffer")]
+    #[test]
+    fn multi_tcp_coordinator_propagates_work_panic_without_deadlock() {
+        assert_multi_tcp_worker_panic_propagates(false);
+    }
 }
 
 /// A `Device` that sends to one queue and receives from another. Two of these
@@ -2476,6 +2536,268 @@ fn shape_many_udp(seconds: u64, n: usize, offload: bool, mode: RunMode) {
     );
 }
 
+#[cfg(feature = "socket-tcp-dynamic-buffer")]
+type MultiTcpPanic = Box<dyn std::any::Any + Send + 'static>;
+
+#[cfg(feature = "socket-tcp-dynamic-buffer")]
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum MultiTcpWorkerState {
+    Setup,
+    Running,
+    Released,
+    Cancelled,
+}
+
+#[cfg(feature = "socket-tcp-dynamic-buffer")]
+type MultiTcpWorkerGate =
+    std::sync::Arc<(std::sync::Mutex<MultiTcpWorkerState>, std::sync::Condvar)>;
+
+#[cfg(feature = "socket-tcp-dynamic-buffer")]
+fn set_multi_tcp_worker_state(gate: &MultiTcpWorkerGate, state: MultiTcpWorkerState) {
+    let (current, changed) = &**gate;
+    *current.lock().unwrap_or_else(|error| error.into_inner()) = state;
+    changed.notify_all();
+}
+
+#[cfg(feature = "socket-tcp-dynamic-buffer")]
+enum MultiTcpWorkerEvent<R> {
+    Ready(usize),
+    Finished(usize, R),
+    Failed(usize, MultiTcpPanic),
+}
+
+#[cfg(feature = "socket-tcp-dynamic-buffer")]
+struct MultiTcpWorkerPhases<R> {
+    worker_id: usize,
+    gate: MultiTcpWorkerGate,
+    events: std::sync::mpsc::Sender<MultiTcpWorkerEvent<R>>,
+}
+
+#[cfg(feature = "socket-tcp-dynamic-buffer")]
+impl<R> MultiTcpWorkerPhases<R> {
+    fn ready(&mut self) -> bool {
+        if self
+            .events
+            .send(MultiTcpWorkerEvent::Ready(self.worker_id))
+            .is_err()
+        {
+            return false;
+        }
+        self.wait_while(MultiTcpWorkerState::Setup, MultiTcpWorkerState::Running)
+    }
+
+    fn finished(&mut self, result: R) -> bool {
+        if self
+            .events
+            .send(MultiTcpWorkerEvent::Finished(self.worker_id, result))
+            .is_err()
+        {
+            return false;
+        }
+        self.wait_while(MultiTcpWorkerState::Running, MultiTcpWorkerState::Released)
+    }
+
+    fn wait_while(&self, waiting: MultiTcpWorkerState, proceed: MultiTcpWorkerState) -> bool {
+        let (state, changed) = &*self.gate;
+        let mut state = state.lock().unwrap_or_else(|error| error.into_inner());
+        while *state == waiting {
+            state = changed
+                .wait(state)
+                .unwrap_or_else(|error| error.into_inner());
+        }
+        *state == proceed
+    }
+}
+
+#[cfg(feature = "socket-tcp-dynamic-buffer")]
+struct MultiTcpWorkers<R> {
+    worker_count: usize,
+    gate: MultiTcpWorkerGate,
+    events: std::sync::mpsc::Receiver<MultiTcpWorkerEvent<R>>,
+    handles: Vec<std::thread::JoinHandle<()>>,
+}
+
+#[cfg(feature = "socket-tcp-dynamic-buffer")]
+impl<R> MultiTcpWorkers<R> {
+    fn spawn<F>(worker_count: usize, worker: F) -> Self
+    where
+        R: Send + 'static,
+        F: Fn(usize, MultiTcpWorkerPhases<R>) + Send + Sync + 'static,
+    {
+        let gate = std::sync::Arc::new((
+            std::sync::Mutex::new(MultiTcpWorkerState::Setup),
+            std::sync::Condvar::new(),
+        ));
+        let (event_tx, events) = std::sync::mpsc::channel();
+        let worker = std::sync::Arc::new(worker);
+        let mut handles = Vec::with_capacity(worker_count);
+
+        for worker_id in 0..worker_count {
+            let worker_gate = gate.clone();
+            let events = event_tx.clone();
+            let worker = worker.clone();
+            let spawn = std::thread::Builder::new()
+                .name(format!("multi-tcp-{worker_id}"))
+                .spawn(move || {
+                    let phases = MultiTcpWorkerPhases {
+                        worker_id,
+                        gate: worker_gate,
+                        events: events.clone(),
+                    };
+                    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        worker(worker_id, phases);
+                    }));
+                    if let Err(panic) = outcome {
+                        let _ = events.send(MultiTcpWorkerEvent::Failed(worker_id, panic));
+                    }
+                });
+
+            match spawn {
+                Ok(handle) => handles.push(handle),
+                Err(error) => {
+                    set_multi_tcp_worker_state(&gate, MultiTcpWorkerState::Cancelled);
+                    for handle in handles {
+                        let _ = handle.join();
+                    }
+                    panic!("failed to spawn multi_tcp worker {worker_id}: {error}");
+                }
+            }
+        }
+        drop(event_tx);
+
+        Self {
+            worker_count,
+            gate,
+            events,
+            handles,
+        }
+    }
+
+    fn wait_ready(&mut self) {
+        let mut ready = vec![false; self.worker_count];
+        let mut ready_count = 0;
+        while ready_count < self.worker_count {
+            let event = match self.events.recv() {
+                Ok(event) => event,
+                Err(_) => self.abort_with_message("worker event channel closed before ready"),
+            };
+            match event {
+                MultiTcpWorkerEvent::Ready(worker_id)
+                    if worker_id < self.worker_count && !ready[worker_id] =>
+                {
+                    ready[worker_id] = true;
+                    ready_count += 1;
+                }
+                MultiTcpWorkerEvent::Ready(worker_id) => self.abort_with_message(&format!(
+                    "invalid or duplicate ready event from worker {worker_id}"
+                )),
+                MultiTcpWorkerEvent::Finished(worker_id, _) => self.abort_with_message(&format!(
+                    "worker {worker_id} finished before the steady phase"
+                )),
+                MultiTcpWorkerEvent::Failed(worker_id, panic) => {
+                    self.abort_worker_panic(worker_id, panic)
+                }
+            }
+        }
+    }
+
+    fn start(&self) {
+        set_multi_tcp_worker_state(&self.gate, MultiTcpWorkerState::Running);
+    }
+
+    fn wait_finished(&mut self) -> Vec<R> {
+        let mut results: Vec<Option<R>> = std::iter::repeat_with(|| None)
+            .take(self.worker_count)
+            .collect();
+        let mut finished_count = 0;
+        while finished_count < self.worker_count {
+            let event = match self.events.recv() {
+                Ok(event) => event,
+                Err(_) => self.abort_with_message("worker event channel closed before finish"),
+            };
+            match event {
+                MultiTcpWorkerEvent::Finished(worker_id, result)
+                    if worker_id < self.worker_count && results[worker_id].is_none() =>
+                {
+                    results[worker_id] = Some(result);
+                    finished_count += 1;
+                }
+                MultiTcpWorkerEvent::Finished(worker_id, _) => self.abort_with_message(&format!(
+                    "invalid or duplicate finish event from worker {worker_id}"
+                )),
+                MultiTcpWorkerEvent::Ready(worker_id) => self
+                    .abort_with_message(&format!("duplicate ready event from worker {worker_id}")),
+                MultiTcpWorkerEvent::Failed(worker_id, panic) => {
+                    self.abort_worker_panic(worker_id, panic)
+                }
+            }
+        }
+        results.into_iter().map(Option::unwrap).collect()
+    }
+
+    fn release_and_join(mut self) {
+        set_multi_tcp_worker_state(&self.gate, MultiTcpWorkerState::Released);
+        let join_panic = self.join_all();
+        if let Some((_, panic)) = self.take_worker_panic() {
+            std::panic::resume_unwind(panic);
+        }
+        if let Some(panic) = join_panic {
+            std::panic::resume_unwind(panic);
+        }
+    }
+
+    fn abort_worker_panic(&mut self, _worker_id: usize, panic: MultiTcpPanic) -> ! {
+        self.cancel();
+        let _ = self.join_all();
+        std::panic::resume_unwind(panic);
+    }
+
+    fn abort_with_message(&mut self, message: &str) -> ! {
+        self.cancel();
+        let join_panic = self.join_all();
+        if let Some((_, panic)) = self.take_worker_panic() {
+            std::panic::resume_unwind(panic);
+        }
+        if let Some(panic) = join_panic {
+            std::panic::resume_unwind(panic);
+        }
+        panic!("{message}");
+    }
+
+    fn cancel(&self) {
+        set_multi_tcp_worker_state(&self.gate, MultiTcpWorkerState::Cancelled);
+    }
+
+    fn join_all(&mut self) -> Option<MultiTcpPanic> {
+        let mut first_panic = None;
+        for handle in self.handles.drain(..) {
+            if let Err(panic) = handle.join()
+                && first_panic.is_none()
+            {
+                first_panic = Some(panic);
+            }
+        }
+        first_panic
+    }
+
+    fn take_worker_panic(&self) -> Option<(usize, MultiTcpPanic)> {
+        self.events.try_iter().find_map(|event| match event {
+            MultiTcpWorkerEvent::Failed(worker_id, panic) => Some((worker_id, panic)),
+            _ => None,
+        })
+    }
+}
+
+#[cfg(feature = "socket-tcp-dynamic-buffer")]
+impl<R> Drop for MultiTcpWorkers<R> {
+    fn drop(&mut self) {
+        if !self.handles.is_empty() {
+            self.cancel();
+            let _ = self.join_all();
+        }
+    }
+}
+
 /// Multi-Interface pool-contention shape. Spawns `n_threads` threads, each
 /// owning its own server/client `Interface` pair and `flows_per_thread`
 /// TCP echo flows, all sharing a single [`tcp::MemoryPool`]. Measures the
@@ -2484,7 +2806,7 @@ fn shape_many_udp(seconds: u64, n: usize, offload: bool, mode: RunMode) {
 ///
 /// Each thread runs the same workload as `many_tcp` but with sockets
 /// created via `new_dynamic` so the pool is exercised. Threads start
-/// in lockstep via a barrier so the contention window aligns.
+/// together only after every worker reports setup complete.
 #[cfg(feature = "socket-tcp-dynamic-buffer")]
 #[derive(Clone, Copy)]
 enum MultiTcpWorkload {
@@ -2547,8 +2869,6 @@ fn shape_multi_tcp_impl(
     mode: RunMode,
     workload: MultiTcpWorkload,
 ) {
-    use std::sync::{Arc, Barrier};
-    use std::thread;
     use std::time::Instant as StdInstant;
 
     const MAX_BUF: u32 = 32 * 1024;
@@ -2560,20 +2880,11 @@ fn shape_multi_tcp_impl(
     let pool_bytes: usize = total_flows * 2 * MAX_BUF as usize;
     let pool = tcp::MemoryPool::new(pool_bytes);
 
-    let setup_ready = Arc::new(Barrier::new(n_threads + 1));
-    let steady_start_release = Arc::new(Barrier::new(n_threads + 1));
-    let steady_finished = Arc::new(Barrier::new(n_threads + 1));
-    let teardown_release = Arc::new(Barrier::new(n_threads + 1));
     let (vol_before, nvol_before) = ctxsw_counts();
-    let mut handles: Vec<thread::JoinHandle<(u64, u64, u64, LaneStats)>> =
-        Vec::with_capacity(n_threads);
-    for tid in 0..n_threads {
-        let pool = pool.clone();
-        let setup_ready = setup_ready.clone();
-        let steady_start_release = steady_start_release.clone();
-        let steady_finished = steady_finished.clone();
-        let teardown_release = teardown_release.clone();
-        handles.push(thread::spawn(move || {
+    let worker_pool = pool.clone();
+    let mut workers = MultiTcpWorkers::spawn(n_threads, move |tid, mut phases| {
+        let pool = worker_pool.clone();
+        {
             let qd = (flows_per_thread * 16).clamp(1024, 16384);
             // Distinct base address per thread so server/client tuples don't
             // clash if anything inspects them (they won't — lanes are isolated).
@@ -2637,8 +2948,9 @@ fn shape_multi_tcp_impl(
             }
 
             // Setup and start coordination stays outside the timed traffic loop.
-            setup_ready.wait();
-            steady_start_release.wait();
+            if !phases.ready() {
+                return;
+            }
             let steady_start = StdInstant::now();
 
             let mut sent: u64 = 0;
@@ -2742,24 +3054,21 @@ fn shape_multi_tcp_impl(
             let lane_stats = collect_lane_stats(&[&lane_a, &lane_b]);
             // Keep every worker's sockets alive until the main thread samples
             // the active-end memory and pool boundaries.
-            steady_finished.wait();
-            teardown_release.wait();
-            (sent, recvd, elapsed_us, lane_stats)
-        }));
-    }
+            let _ = phases.finished((sent, recvd, elapsed_us, lane_stats));
+        }
+    });
 
     // Wait until every worker has connected its sockets, then bracket only the
     // steady phase. Workers remain blocked before start and after finish.
-    setup_ready.wait();
+    workers.wait_ready();
     let rss_start = rss_bytes();
     let alloc_before = alloc_counters_with_rss(rss_start);
-    steady_start_release.wait();
-    steady_finished.wait();
+    workers.start();
+    let results = workers.wait_finished();
     let mut alloc_after = alloc_counters_with_rss(0);
     let pool_active = pool.used();
     alloc_after.rss = rss_bytes();
-    teardown_release.wait();
-    let results: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+    workers.release_and_join();
     let pool_after_teardown = pool.used();
     let memory_report = MultiTcpMemoryReport::from_snapshots(
         alloc_before,
