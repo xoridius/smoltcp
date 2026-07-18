@@ -25,6 +25,7 @@ fn dyn_socket_established(cfg: DynamicBufferConfig, pool: Option<MemoryPool>) ->
     s.state = State::Established;
     s.tuple = Some(TUPLE);
     s.local_seq_no = LOCAL_SEQ + 1;
+    s.local_seq_next = LOCAL_SEQ + 1;
     s.remote_seq_no = REMOTE_SEQ + 1;
     s.remote_last_seq = LOCAL_SEQ + 1;
     s.remote_last_ack = Some(REMOTE_SEQ + 1);
@@ -76,6 +77,7 @@ fn dyn_socket_established_fixed_capacity(tx_len: usize, rx_len: usize) -> TestSo
     s.state = State::Established;
     s.tuple = Some(TUPLE);
     s.local_seq_no = LOCAL_SEQ + 1;
+    s.local_seq_next = LOCAL_SEQ + 1;
     s.remote_seq_no = REMOTE_SEQ + 1;
     s.remote_last_seq = LOCAL_SEQ + 1;
     s.remote_last_ack = Some(REMOTE_SEQ + 1);
@@ -618,6 +620,7 @@ fn last_ack_data_fin_ack_dequeues_before_release() {
     s.remote_last_ack = Some(REMOTE_SEQ + 1 + 1);
     assert_eq!(s.tx_buffer.enqueue_slice(b"x"), 1);
     s.remote_last_seq = LOCAL_SEQ + 1 + 1 + 1;
+    s.local_seq_next = LOCAL_SEQ + 1 + 1 + 1;
 
     send!(
         s,
