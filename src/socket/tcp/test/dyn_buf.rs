@@ -887,6 +887,115 @@ fn closed_by_rst_keeps_unread_rx_readable_until_drained() {
     assert_eq!(pool.used(), 0);
 }
 
+fn dyn_socket_closed_by_rst_with_unread_rx(payload: &[u8]) -> (TestSocket, MemoryPool) {
+    let pool = MemoryPool::new(64 * 1024);
+    let cfg = DynamicBufferConfig::symmetric(4 * 1024, 32 * 1024, 4 * 1024);
+    let mut s = dyn_socket_established(cfg, Some(pool.clone()));
+
+    let _ = process_snapshot(
+        &mut s,
+        Instant::from_millis(100),
+        &TcpRepr {
+            seq_number: REMOTE_SEQ + 1,
+            ack_number: Some(LOCAL_SEQ + 1),
+            payload,
+            ..SEND_TEMPL
+        },
+    );
+    let _ = process_snapshot(
+        &mut s,
+        Instant::from_millis(101),
+        &TcpRepr {
+            control: TcpControl::Rst,
+            seq_number: REMOTE_SEQ + 1 + payload.len(),
+            ack_number: Some(LOCAL_SEQ + 1),
+            ..SEND_TEMPL
+        },
+    );
+
+    assert_eq!(s.state, State::Closed);
+    assert_eq!(s.tuple, None);
+    assert_eq!(s.recv_queue(), payload.len());
+    assert_eq!(s.send_capacity(), 0);
+    assert_eq!(pool.used(), s.recv_capacity());
+    (s, pool)
+}
+
+#[test]
+fn recv_with_full_terminal_drain_refunds_pool() {
+    let payload = [b'r'; 1000];
+    let (mut s, pool) = dyn_socket_closed_by_rst_with_unread_rx(&payload);
+
+    let received = s
+        .recv_with(|buffer| (buffer.len(), buffer.to_vec()))
+        .unwrap();
+
+    assert_eq!(received, payload);
+    assert_eq!(s.recv_capacity(), 0);
+    assert_eq!(pool.used(), 0);
+}
+
+#[test]
+fn recv_with_partial_terminal_drain_refunds_only_when_empty() {
+    let payload = [b'p'; 1000];
+    let (mut s, pool) = dyn_socket_closed_by_rst_with_unread_rx(&payload);
+    let charged = pool.used();
+
+    let first = s.recv_with(|buffer| (300, buffer[..300].to_vec())).unwrap();
+    assert_eq!(first, &payload[..300]);
+    assert_eq!(s.recv_queue(), 700);
+    assert_eq!(s.recv_capacity(), charged);
+    assert_eq!(pool.used(), charged);
+
+    let second = s
+        .recv_with(|buffer| (buffer.len(), buffer.to_vec()))
+        .unwrap();
+    assert_eq!(second, &payload[300..]);
+    assert_eq!(s.recv_queue(), 0);
+    assert_eq!(s.recv_capacity(), 0);
+    assert_eq!(pool.used(), 0);
+}
+
+#[test]
+fn recv_with_error_refunds_terminal_empty_pool() {
+    let pool = MemoryPool::new(64 * 1024);
+    let cfg = DynamicBufferConfig::symmetric(4 * 1024, 32 * 1024, 4 * 1024);
+    let mut s = dyn_socket_established(cfg, Some(pool.clone()));
+    s.state = State::TimeWait;
+    s.flags.insert(Flags::RX_FIN_RECEIVED);
+    assert_eq!(pool.used(), 8 * 1024);
+
+    let result = s.recv_with(|_| -> (usize, ()) { panic!("closure must not run") });
+
+    assert_eq!(result, Err(RecvError::Finished));
+    assert_eq!(s.recv_capacity(), 0);
+    assert_eq!(s.send_capacity(), 0);
+    assert_eq!(pool.used(), 0);
+}
+
+#[test]
+fn recv_remains_borrowing() {
+    let cfg = DynamicBufferConfig::symmetric(4 * 1024, 32 * 1024, 4 * 1024);
+    let mut s = dyn_socket_established(cfg, None);
+    let payload = b"borrowed";
+    let _ = process_snapshot(
+        &mut s,
+        Instant::from_millis(100),
+        &TcpRepr {
+            seq_number: REMOTE_SEQ + 1,
+            ack_number: Some(LOCAL_SEQ + 1),
+            payload,
+            ..SEND_TEMPL
+        },
+    );
+
+    {
+        let borrowed = s.recv(|buffer| (0, &buffer[..payload.len()])).unwrap();
+        assert_eq!(borrowed, payload);
+    }
+    assert_eq!(s.recv_queue(), payload.len());
+}
+
 #[test]
 fn send_data_survives_until_ack_with_dynamic_tx() {
     // Standard correctness: pre-ACK tx data is not freed by growth.

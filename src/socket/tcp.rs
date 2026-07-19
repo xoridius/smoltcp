@@ -1033,7 +1033,7 @@ impl<'a> Socket<'a> {
     /// that was received and ACKed but not yet read; `may_recv` promises
     /// it stays readable in `Closed` (Linux likewise delivers pre-RST
     /// queued data before surfacing ECONNRESET). Releasing rx is deferred
-    /// to `recv_slice` once the application drains it; `reset`/`Drop`
+    /// to `recv_slice` or `recv_with` once the application drains it; `reset`/`Drop`
     /// remain the backstop if it never does.
     #[cfg(feature = "socket-tcp-dynamic-buffer")]
     #[cold]
@@ -2008,6 +2008,32 @@ impl<'a> Socket<'a> {
         F: FnOnce(&'b mut [u8]) -> (usize, R),
     {
         self.recv_impl(|rx_buffer| rx_buffer.dequeue_many_with(f))
+    }
+
+    /// Call `f` with the largest contiguous slice of octets in the receive buffer,
+    /// and dequeue the amount of elements returned by `f`.
+    ///
+    /// Unlike [`recv`](Self::recv), the return value cannot borrow from the supplied
+    /// receive slice. This allows terminal dynamic receive storage to be reclaimed
+    /// before this method returns.
+    ///
+    /// ```compile_fail
+    /// # use smoltcp::socket::tcp::Socket;
+    /// fn borrow_rx<'a>(socket: &'a mut Socket<'static>) -> &'a [u8] {
+    ///     socket.recv_with(|buffer| (0, buffer)).unwrap()
+    /// }
+    /// ```
+    pub fn recv_with<F, R>(&mut self, f: F) -> Result<R, RecvError>
+    where
+        F: for<'b> FnOnce(&'b mut [u8]) -> (usize, R),
+    {
+        let result = self.recv_impl(|rx_buffer| rx_buffer.dequeue_many_with(f));
+        #[cfg(feature = "socket-tcp-dynamic-buffer")]
+        {
+            self.release_dyn_buffers_if_terminal_empty();
+            self.release_dyn_buffers_if_closed_and_detached();
+        }
+        result
     }
 
     /// Dequeue a sequence of received octets, and fill a slice from it.
