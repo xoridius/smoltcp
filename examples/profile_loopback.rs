@@ -42,7 +42,7 @@
 //!     target/release/examples/profile_loopback udp 2
 
 use std::alloc::{GlobalAlloc, Layout, System};
-use std::cell::RefCell;
+use std::cell::{RefCell, RefMut};
 use std::collections::VecDeque;
 use std::env;
 use std::num::{NonZeroU64, NonZeroUsize};
@@ -1572,15 +1572,18 @@ mod tests {
     }
 
     #[test]
-    fn transmit_reserves_packet_before_returning_token() {
+    fn transmit_token_construction_preserves_lane() {
         let tx = lane(64, 2);
         let rx = lane(64, 2);
         let mut device = device(&tx, &rx, 64);
 
         let token = device.transmit(Instant::from_millis(0)).unwrap();
 
-        assert_eq!(tx.borrow().pool.len(), 1);
+        assert_eq!(tx.borrow().pool.len(), 2);
+        assert!(tx.borrow().queue.is_empty());
         drop(token);
+        assert_eq!(tx.borrow().pool.len(), 2);
+        assert!(tx.borrow().queue.is_empty());
     }
 
     #[test]
@@ -1597,32 +1600,21 @@ mod tests {
     }
 
     #[test]
-    fn unused_transmit_token_refunds_reservation() {
+    fn transmit_consume_reuses_preallocated_packet_and_queue_storage() {
         let tx = lane(64, 2);
         let rx = lane(64, 2);
         let mut device = device(&tx, &rx, 64);
-
-        let token = device.transmit(Instant::from_millis(0)).unwrap();
-        assert_eq!(tx.borrow().pool.len(), 1);
-
-        drop(token);
-        assert_eq!(tx.borrow().pool.len(), 2);
-        assert!(tx.borrow().queue.is_empty());
-    }
-
-    #[test]
-    fn transmit_consume_reuses_reserved_packet_and_queue_storage() {
-        let tx = lane(64, 2);
-        let rx = lane(64, 2);
-        let mut device = device(&tx, &rx, 64);
-        let token = device.transmit(Instant::from_millis(0)).unwrap();
-        let packet_buffer = token.packet.as_ref().unwrap().buf.as_ptr();
-        let packet_capacity = token.packet.as_ref().unwrap().buf.capacity();
+        let packet_buffer = tx.borrow().pool.last().unwrap().buf.as_ptr();
+        let packet_capacity = tx.borrow().pool.last().unwrap().buf.capacity();
         let queue_capacity = tx.borrow().queue.capacity();
+        let token = device.transmit(Instant::from_millis(0)).unwrap();
+
+        assert_eq!(tx.borrow().pool.len(), 2);
 
         phy::TxToken::consume(token, 4, |buffer| buffer.copy_from_slice(&[1, 2, 3, 4]));
 
         let tx = tx.borrow();
+        assert_eq!(tx.pool.len(), 1);
         assert_eq!(tx.queue.capacity(), queue_capacity);
         assert_eq!(tx.queue[0].buf.as_ptr(), packet_buffer);
         assert_eq!(tx.queue[0].buf.capacity(), packet_capacity);
@@ -1632,27 +1624,34 @@ mod tests {
     #[test]
     fn paired_receive_backpressure_leaves_rx_queued() {
         let tx = lane(64, 1);
-        let rx = lane(64, 1);
-        queue_packet(&rx, &[1, 2, 3]);
+        let rx = lane(64, 2);
+        queue_packet(&rx, &[1]);
+        queue_packet(&rx, &[2]);
         let reserved = tx.borrow_mut().try_take_packet().unwrap();
         let mut device = device(&tx, &rx, 64);
 
         assert!(device.receive(Instant::from_millis(0)).is_none());
-        assert_eq!(rx.borrow().queue.len(), 1);
+        assert_eq!(rx.borrow().queue.len(), 2);
         assert_eq!(tx.borrow().stats.rx_backpressure, 1);
 
         tx.borrow_mut().return_pkt(reserved);
+        let (rx_token, tx_token) = device.receive(Instant::from_millis(0)).unwrap();
+        assert_eq!(phy::RxToken::consume(rx_token, |bytes| bytes[0]), 1);
+        drop(tx_token);
+        let (rx_token, tx_token) = device.receive(Instant::from_millis(0)).unwrap();
+        assert_eq!(phy::RxToken::consume(rx_token, |bytes| bytes[0]), 2);
+        drop(tx_token);
     }
 
     #[test]
-    fn paired_receive_and_unused_tx_refund_both_packets() {
+    fn paired_receive_tx_token_construction_preserves_tx_pool() {
         let tx = lane(64, 1);
         let rx = lane(64, 1);
         queue_packet(&rx, &[1, 2, 3]);
         let mut device = device(&tx, &rx, 64);
 
         let (rx_token, tx_token) = device.receive(Instant::from_millis(0)).unwrap();
-        assert!(tx.borrow().pool.is_empty());
+        assert_eq!(tx.borrow().pool.len(), 1);
         assert!(rx.borrow().queue.is_empty());
 
         phy::RxToken::consume(rx_token, |bytes| assert_eq!(bytes, [1, 2, 3]));
@@ -1663,7 +1662,23 @@ mod tests {
     }
 
     #[test]
-    fn oversized_transmit_panics_and_refunds_reservation() {
+    fn paired_response_consumes_final_credit() {
+        let tx = lane(64, 1);
+        let rx = lane(64, 1);
+        queue_packet(&rx, &[1]);
+        let mut device = device(&tx, &rx, 64);
+
+        let (rx_token, tx_token) = device.receive(Instant::from_millis(0)).unwrap();
+        assert_eq!(tx.borrow().pool.len(), 1);
+        phy::RxToken::consume(rx_token, |_| ());
+        phy::TxToken::consume(tx_token, 1, |buffer| buffer[0] = 2);
+
+        assert!(tx.borrow().pool.is_empty());
+        assert_eq!(&tx.borrow().queue[0].buf[..1], &[2]);
+    }
+
+    #[test]
+    fn oversized_transmit_panics_and_preserves_credit() {
         use std::panic::{AssertUnwindSafe, catch_unwind};
 
         let tx = lane(64, 2);
@@ -1681,13 +1696,34 @@ mod tests {
     }
 
     #[test]
-    fn packet_ownership_is_conserved_across_live_token_and_queue() {
+    fn transmit_callback_panic_returns_checked_out_packet() {
+        use std::panic::{AssertUnwindSafe, catch_unwind};
+
+        let tx = lane(64, 2);
+        let rx = lane(64, 2);
+        let mut device = device(&tx, &rx, 64);
+        let token = device.transmit(Instant::from_millis(0)).unwrap();
+
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            phy::TxToken::consume(token, 1, |buffer| {
+                buffer[0] = 1;
+                panic!("callback panic");
+            });
+        }));
+
+        assert!(result.is_err());
+        assert_eq!(tx.borrow().pool.len(), 2);
+        assert!(tx.borrow().queue.is_empty());
+    }
+
+    #[test]
+    fn packet_ownership_is_conserved_across_token_and_queue() {
         let tx = lane(64, 2);
         let rx = lane(64, 2);
         let mut device = device(&tx, &rx, 64);
 
         let token = device.transmit(Instant::from_millis(0)).unwrap();
-        assert_eq!(tx.borrow().pool.len() + tx.borrow().queue.len() + 1, 2);
+        assert_eq!(tx.borrow().pool.len() + tx.borrow().queue.len(), 2);
 
         phy::TxToken::consume(token, 1, |buffer| buffer[0] = 1);
         assert_eq!(tx.borrow().pool.len() + tx.borrow().queue.len(), 2);
@@ -1979,26 +2015,22 @@ impl Device for PairedDevice {
     }
 
     fn receive(&mut self, _ts: Instant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
-        if self.rx.borrow().queue.is_empty() {
+        let mut rx = self.rx.borrow_mut();
+        if rx.queue.is_empty() {
             return None;
         }
 
-        let tx_packet = {
+        {
             let mut tx = self.tx.borrow_mut();
-            match tx.try_take_packet() {
-                Some(packet) => packet,
-                None => {
-                    tx.stats.rx_backpressure += 1;
-                    return None;
-                }
+            if tx.pool.is_empty() {
+                tx.stats.rx_backpressure += 1;
+                return None;
             }
-        };
-        let rx_packet = self
-            .rx
-            .borrow_mut()
+        }
+        let rx_packet = rx
             .queue
             .pop_front()
-            .expect("RX queue changed while reserving paired TX packet");
+            .expect("RX queue changed after paired TX availability check");
         Some((
             PairedRx {
                 pkt: Some(rx_packet),
@@ -2006,7 +2038,6 @@ impl Device for PairedDevice {
             },
             PairedTx {
                 tx: &self.tx,
-                packet: Some(tx_packet),
                 mtu: self.mtu,
                 tx_bytes: &mut self.tx_bytes,
                 tx_packets: &mut self.tx_packets,
@@ -2015,18 +2046,15 @@ impl Device for PairedDevice {
     }
 
     fn transmit(&mut self, _ts: Instant) -> Option<Self::TxToken<'_>> {
-        let packet = {
+        {
             let mut tx = self.tx.borrow_mut();
             if tx.pool.len() <= 1 {
                 tx.stats.tx_backpressure += 1;
                 return None;
             }
-            tx.try_take_packet()
-                .expect("standalone TX credit disappeared after availability check")
-        };
+        }
         Some(PairedTx {
             tx: &self.tx,
-            packet: Some(packet),
             mtu: self.mtu,
             tx_bytes: &mut self.tx_bytes,
             tx_packets: &mut self.tx_packets,
@@ -2063,41 +2091,49 @@ impl Drop for PairedRx<'_> {
 
 struct PairedTx<'a> {
     tx: &'a LaneRc,
-    packet: Option<Packet>,
     mtu: usize,
     tx_bytes: &'a mut u64,
     tx_packets: &'a mut u64,
 }
 
 impl<'a> phy::TxToken for PairedTx<'a> {
-    fn consume<R, F>(mut self, len: usize, f: F) -> R
+    fn consume<R, F>(self, len: usize, f: F) -> R
     where
         F: FnOnce(&mut [u8]) -> R,
     {
+        struct CheckedOutPacket<'a> {
+            tx: RefMut<'a, Lane>,
+            packet: Option<Packet>,
+        }
+
+        impl Drop for CheckedOutPacket<'_> {
+            fn drop(&mut self) {
+                if let Some(packet) = self.packet.take() {
+                    self.tx.return_pkt(packet);
+                }
+            }
+        }
+
         assert!(
             len <= self.mtu,
             "transmit length {len} exceeds MTU {}",
             self.mtu
         );
-        let result = {
-            let packet = self.packet.as_mut().unwrap();
-            f(&mut packet.buf[..len])
-        };
         let mut tx = self.tx.borrow_mut();
-        let mut packet = self.packet.take().unwrap();
-        packet.len = len;
+        let packet = tx
+            .try_take_packet()
+            .expect("TX credit disappeared after token construction");
+        let mut packet = CheckedOutPacket {
+            tx,
+            packet: Some(packet),
+        };
+        let result = f(&mut packet.packet.as_mut().unwrap().buf[..len]);
+        let mut queued = packet.packet.take().unwrap();
+        queued.len = len;
         *self.tx_bytes += len as u64;
         *self.tx_packets += 1;
-        tx.queue_pkt(packet);
+        packet.tx.queue_pkt(queued);
         result
-    }
-}
-
-impl Drop for PairedTx<'_> {
-    fn drop(&mut self) {
-        if let Some(packet) = self.packet.take() {
-            self.tx.borrow_mut().return_pkt(packet);
-        }
     }
 }
 
