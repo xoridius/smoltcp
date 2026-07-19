@@ -15,10 +15,10 @@
 //! `heaptrack` with no external setup.
 //!
 //! Usage:
-//!   cargo run --release --example profile_loopback -- [--mode bench|trace] [shape] [seconds] [opts...]
+//!   cargo run --release --example profile_loopback -- [--mode bench|trace] <shape> <seconds> [opts...]
 //!
 //! Shapes:
-//!   udp           - 1400B UDP packet forwarding (default; tunnel analogue)
+//!   udp           - 1400B UDP packet forwarding (tunnel analogue)
 //!   small         - many small TCP segments, measures per-packet overhead
 //!   pingpong      - 128B request/response, latency-bound
 //!   firehose      - one-way TCP bulk transfer (cwnd-limited)
@@ -45,7 +45,10 @@ use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::env;
+use std::num::{NonZeroU64, NonZeroUsize};
+use std::process::ExitCode;
 use std::rc::Rc;
+use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant as StdInstant;
 
@@ -55,18 +58,20 @@ enum RunMode {
     Trace,
 }
 
-impl RunMode {
-    fn parse(value: &str) -> Self {
+impl FromStr for RunMode {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
         match value {
-            "bench" => Self::Bench,
-            "trace" => Self::Trace,
-            other => {
-                eprintln!("unknown --mode '{other}', expected bench|trace");
-                std::process::exit(2);
-            }
+            "bench" => Ok(Self::Bench),
+            "trace" => Ok(Self::Trace),
+            "" => Err("mode cannot be empty; expected bench|trace".to_owned()),
+            other => Err(format!("invalid mode '{other}', expected bench|trace")),
         }
     }
+}
 
+impl RunMode {
     fn label(self) -> &'static str {
         match self {
             Self::Bench => "bench",
@@ -76,6 +81,243 @@ impl RunMode {
 
     fn sample_memory(self) -> bool {
         matches!(self, Self::Bench)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct Config {
+    mode: RunMode,
+    seconds: NonZeroU64,
+    shape: TrafficShape,
+    offload_checksums: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TrafficShape {
+    Udp,
+    Firehose,
+    PingPong,
+    Small,
+    All,
+    ManyTcp {
+        flows: NonZeroUsize,
+    },
+    ManyTcpFair {
+        flows: NonZeroUsize,
+    },
+    ManyUdp {
+        flows: NonZeroUsize,
+    },
+    #[cfg(feature = "socket-tcp-dynamic-buffer")]
+    MultiTcp {
+        threads: NonZeroUsize,
+        flows_per_thread: NonZeroUsize,
+    },
+    #[cfg(feature = "socket-tcp-dynamic-buffer")]
+    MultiTcpSink {
+        threads: NonZeroUsize,
+        flows_per_thread: NonZeroUsize,
+    },
+    #[cfg(feature = "socket-tcp-dynamic-buffer")]
+    Churn {
+        rate: NonZeroUsize,
+    },
+    #[cfg(feature = "socket-tcp-dynamic-buffer")]
+    IdleHot {
+        idle: usize,
+        active: usize,
+    },
+}
+
+impl TrafficShape {
+    fn flow_count(self) -> Option<usize> {
+        match self {
+            Self::ManyTcp { flows } | Self::ManyTcpFair { flows } | Self::ManyUdp { flows } => {
+                Some(flows.get())
+            }
+            _ => None,
+        }
+    }
+}
+
+fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Config, String> {
+    let mut args = args.into_iter().peekable();
+    let mut explicit_mode = false;
+    let mode = match args.peek().map(String::as_str) {
+        Some("--mode") => {
+            explicit_mode = true;
+            args.next();
+            args.next()
+                .ok_or_else(|| "missing value for --mode, expected bench|trace".to_owned())?
+                .parse()?
+        }
+        Some(arg) if arg.starts_with("--mode=") => {
+            explicit_mode = true;
+            let value = arg["--mode=".len()..].to_owned();
+            args.next();
+            value.parse()?
+        }
+        _ => RunMode::Bench,
+    };
+
+    let shape_name = args
+        .next()
+        .ok_or_else(|| "missing traffic shape".to_owned())?;
+    if is_mode_option(&shape_name) {
+        return Err(mode_position_error(explicit_mode));
+    }
+    if shape_name.starts_with('-') {
+        return Err(format!("unknown option '{shape_name}'"));
+    }
+
+    let seconds = next_nonzero_u64(&mut args, "seconds", explicit_mode)?;
+
+    let shape = match shape_name.as_str() {
+        "udp" => TrafficShape::Udp,
+        "firehose" => TrafficShape::Firehose,
+        "pingpong" => TrafficShape::PingPong,
+        "small" => TrafficShape::Small,
+        "all" => TrafficShape::All,
+        "many_tcp" => TrafficShape::ManyTcp {
+            flows: next_nonzero_usize(&mut args, "flows", explicit_mode)?,
+        },
+        "many_tcp_fair" => TrafficShape::ManyTcpFair {
+            flows: next_nonzero_usize(&mut args, "flows", explicit_mode)?,
+        },
+        "many_udp" => TrafficShape::ManyUdp {
+            flows: next_nonzero_usize(&mut args, "flows", explicit_mode)?,
+        },
+        #[cfg(feature = "socket-tcp-dynamic-buffer")]
+        "multi_tcp" => TrafficShape::MultiTcp {
+            threads: next_nonzero_usize(&mut args, "threads", explicit_mode)?,
+            flows_per_thread: next_nonzero_usize(&mut args, "flows per thread", explicit_mode)?,
+        },
+        #[cfg(feature = "socket-tcp-dynamic-buffer")]
+        "multi_tcp_sink" => TrafficShape::MultiTcpSink {
+            threads: next_nonzero_usize(&mut args, "threads", explicit_mode)?,
+            flows_per_thread: next_nonzero_usize(&mut args, "flows per thread", explicit_mode)?,
+        },
+        #[cfg(feature = "socket-tcp-dynamic-buffer")]
+        "churn" => TrafficShape::Churn {
+            rate: next_nonzero_usize(&mut args, "rate", explicit_mode)?,
+        },
+        #[cfg(feature = "socket-tcp-dynamic-buffer")]
+        "idle_hot" => {
+            let idle = next_usize(&mut args, "idle flows", explicit_mode)?;
+            let active = next_usize(&mut args, "active flows", explicit_mode)?;
+            if idle == 0 && active == 0 {
+                return Err("idle_hot requires at least one idle or active flow".to_owned());
+            }
+            TrafficShape::IdleHot { idle, active }
+        }
+        #[cfg(not(feature = "socket-tcp-dynamic-buffer"))]
+        "multi_tcp" | "multi_tcp_sink" | "churn" | "idle_hot" => {
+            return Err(format!(
+                "traffic shape '{shape_name}' requires feature 'socket-tcp-dynamic-buffer'"
+            ));
+        }
+        other => return Err(format!("unknown traffic shape '{other}'")),
+    };
+
+    let offload_checksums = parse_offload(&mut args, explicit_mode)?;
+    Ok(Config {
+        mode,
+        seconds,
+        shape,
+        offload_checksums,
+    })
+}
+
+fn next_value(
+    args: &mut impl Iterator<Item = String>,
+    name: &str,
+    explicit_mode: bool,
+) -> Result<String, String> {
+    let value = args.next().ok_or_else(|| format!("missing {name}"))?;
+    if is_mode_option(&value) {
+        return Err(mode_position_error(explicit_mode));
+    }
+    if value.starts_with('-') {
+        return Err(format!("unknown option '{value}'"));
+    }
+    Ok(value)
+}
+
+fn next_nonzero_u64(
+    args: &mut impl Iterator<Item = String>,
+    name: &str,
+    explicit_mode: bool,
+) -> Result<NonZeroU64, String> {
+    let value = next_value(args, name, explicit_mode)?;
+    let parsed = value
+        .parse::<u64>()
+        .map_err(|_| format!("invalid {name} '{value}': expected a non-zero integer"))?;
+    NonZeroU64::new(parsed).ok_or_else(|| format!("{name} must be non-zero"))
+}
+
+fn next_nonzero_usize(
+    args: &mut impl Iterator<Item = String>,
+    name: &str,
+    explicit_mode: bool,
+) -> Result<NonZeroUsize, String> {
+    let value = next_value(args, name, explicit_mode)?;
+    let parsed = value
+        .parse::<usize>()
+        .map_err(|_| format!("invalid {name} '{value}': expected a non-zero integer"))?;
+    NonZeroUsize::new(parsed).ok_or_else(|| format!("{name} must be non-zero"))
+}
+
+#[cfg(feature = "socket-tcp-dynamic-buffer")]
+fn next_usize(
+    args: &mut impl Iterator<Item = String>,
+    name: &str,
+    explicit_mode: bool,
+) -> Result<usize, String> {
+    let value = next_value(args, name, explicit_mode)?;
+    value
+        .parse()
+        .map_err(|_| format!("invalid {name} '{value}': expected a non-negative integer"))
+}
+
+fn parse_offload(
+    args: &mut impl Iterator<Item = String>,
+    explicit_mode: bool,
+) -> Result<bool, String> {
+    let Some(value) = args.next() else {
+        return Ok(false);
+    };
+    if is_mode_option(&value) {
+        return Err(mode_position_error(explicit_mode));
+    }
+    if value.starts_with('-') {
+        return Err(format!("unknown option '{value}'"));
+    }
+    if !matches!(value.as_str(), "offload" | "1" | "true") {
+        return Err(format!(
+            "invalid offload value '{value}': expected offload|1|true"
+        ));
+    }
+    if let Some(trailing) = args.next() {
+        if is_mode_option(&trailing) {
+            return Err(mode_position_error(explicit_mode));
+        }
+        if trailing.starts_with('-') {
+            return Err(format!("unknown option '{trailing}'"));
+        }
+        return Err(format!("unexpected trailing argument '{trailing}'"));
+    }
+    Ok(true)
+}
+
+fn is_mode_option(value: &str) -> bool {
+    value == "--mode" || value.starts_with("--mode=")
+}
+
+fn mode_position_error(explicit_mode: bool) -> String {
+    if explicit_mode {
+        "--mode may be specified only once and must appear before the traffic shape".to_owned()
+    } else {
+        "--mode must appear before the traffic shape".to_owned()
     }
 }
 
@@ -563,7 +805,7 @@ impl SampledTimer {
     }
 }
 
-use smoltcp::iface::{Config, Interface, SocketSet};
+use smoltcp::iface::{Config as InterfaceConfig, Interface, SocketSet};
 use smoltcp::phy::{self, ChecksumCapabilities, Device, DeviceCapabilities, Medium};
 use smoltcp::socket::{tcp, udp};
 use smoltcp::time::Instant;
@@ -692,6 +934,375 @@ fn print_lane_stats(label: &str, stats: LaneStats) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn args(values: &[&str]) -> Result<Config, String> {
+        parse_args(values.iter().map(|value| (*value).to_owned()))
+    }
+
+    fn nz64(value: u64) -> NonZeroU64 {
+        std::num::NonZeroU64::new(value).unwrap()
+    }
+
+    fn nz(value: usize) -> NonZeroUsize {
+        std::num::NonZeroUsize::new(value).unwrap()
+    }
+
+    fn config(mode: RunMode, seconds: u64, shape: TrafficShape, offload: bool) -> Config {
+        Config {
+            mode,
+            seconds: nz64(seconds),
+            shape,
+            offload_checksums: offload,
+        }
+    }
+
+    fn assert_commands_parse(commands: &[&str], expected_count: usize) {
+        assert_eq!(commands.len(), expected_count);
+        for command in commands {
+            let result = parse_args(command.split_ascii_whitespace().map(str::to_owned));
+            assert!(result.is_ok(), "command {command:?}: {result:?}");
+        }
+    }
+
+    fn assert_errors(cases: Vec<(Vec<&str>, &str)>) {
+        for (input, expected) in cases {
+            let error = args(&input).unwrap_err();
+            assert!(
+                error.contains(expected),
+                "input {input:?}: expected {expected:?}, got {error:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_args_returns_complete_config_for_every_static_shape() {
+        let cases: &[(&[&str], Config)] = &[
+            (
+                &["udp", "1"],
+                config(RunMode::Bench, 1, TrafficShape::Udp, false),
+            ),
+            (
+                &["--mode", "trace", "firehose", "2", "offload"],
+                config(RunMode::Trace, 2, TrafficShape::Firehose, true),
+            ),
+            (
+                &["--mode=bench", "pingpong", "3", "1"],
+                config(RunMode::Bench, 3, TrafficShape::PingPong, true),
+            ),
+            (
+                &["small", "4", "true"],
+                config(RunMode::Bench, 4, TrafficShape::Small, true),
+            ),
+            (
+                &["all", "5"],
+                config(RunMode::Bench, 5, TrafficShape::All, false),
+            ),
+            (
+                &["many_tcp", "6", "7"],
+                config(
+                    RunMode::Bench,
+                    6,
+                    TrafficShape::ManyTcp { flows: nz(7) },
+                    false,
+                ),
+            ),
+            (
+                &["many_tcp_fair", "8", "9", "offload"],
+                config(
+                    RunMode::Bench,
+                    8,
+                    TrafficShape::ManyTcpFair { flows: nz(9) },
+                    true,
+                ),
+            ),
+            (
+                &["many_udp", "10", "11", "1"],
+                config(
+                    RunMode::Bench,
+                    10,
+                    TrafficShape::ManyUdp { flows: nz(11) },
+                    true,
+                ),
+            ),
+        ];
+
+        for (input, expected) in cases {
+            assert_eq!(args(input), Ok(*expected), "input: {input:?}");
+        }
+    }
+
+    #[cfg(feature = "socket-tcp-dynamic-buffer")]
+    #[test]
+    fn parse_args_returns_complete_config_for_every_dynamic_shape() {
+        let cases: &[(&[&str], Config)] = &[
+            (
+                &["multi_tcp", "1", "2", "3"],
+                config(
+                    RunMode::Bench,
+                    1,
+                    TrafficShape::MultiTcp {
+                        threads: nz(2),
+                        flows_per_thread: nz(3),
+                    },
+                    false,
+                ),
+            ),
+            (
+                &["multi_tcp_sink", "4", "5", "6", "offload"],
+                config(
+                    RunMode::Bench,
+                    4,
+                    TrafficShape::MultiTcpSink {
+                        threads: nz(5),
+                        flows_per_thread: nz(6),
+                    },
+                    true,
+                ),
+            ),
+            (
+                &["churn", "7", "8", "1"],
+                config(RunMode::Bench, 7, TrafficShape::Churn { rate: nz(8) }, true),
+            ),
+            (
+                &["idle_hot", "9", "10", "0", "true"],
+                config(
+                    RunMode::Bench,
+                    9,
+                    TrafficShape::IdleHot {
+                        idle: 10,
+                        active: 0,
+                    },
+                    true,
+                ),
+            ),
+            (
+                &["idle_hot", "9", "0", "10"],
+                config(
+                    RunMode::Bench,
+                    9,
+                    TrafficShape::IdleHot {
+                        idle: 0,
+                        active: 10,
+                    },
+                    false,
+                ),
+            ),
+        ];
+
+        for (input, expected) in cases {
+            assert_eq!(args(input), Ok(*expected), "input: {input:?}");
+        }
+    }
+
+    #[test]
+    fn parse_args_accepts_each_mode_and_offload_spelling() {
+        let cases: &[(&[&str], RunMode, bool)] = &[
+            (&["udp", "1"], RunMode::Bench, false),
+            (&["--mode", "bench", "udp", "1"], RunMode::Bench, false),
+            (&["--mode=bench", "udp", "1"], RunMode::Bench, false),
+            (&["--mode", "trace", "udp", "1"], RunMode::Trace, false),
+            (&["--mode=trace", "udp", "1"], RunMode::Trace, false),
+            (&["udp", "1", "offload"], RunMode::Bench, true),
+            (&["udp", "1", "1"], RunMode::Bench, true),
+            (&["udp", "1", "true"], RunMode::Bench, true),
+        ];
+
+        for (input, expected_mode, expected_offload) in cases {
+            let config = args(input).unwrap();
+            assert_eq!(config.mode, *expected_mode, "input: {input:?}");
+            assert_eq!(
+                config.offload_checksums, *expected_offload,
+                "input: {input:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_args_accepts_maximum_representable_numbers() {
+        assert_eq!(
+            parse_args(vec![
+                "many_tcp".to_owned(),
+                u64::MAX.to_string(),
+                usize::MAX.to_string(),
+            ]),
+            Ok(config(
+                RunMode::Bench,
+                u64::MAX,
+                TrafficShape::ManyTcp {
+                    flows: nz(usize::MAX),
+                },
+                false,
+            ))
+        );
+    }
+
+    #[test]
+    fn full_gate_static_command_list_has_26_parseable_commands() {
+        assert_commands_parse(
+            &[
+                "--mode bench udp 3",
+                "--mode bench udp 3 offload",
+                "--mode bench firehose 3",
+                "--mode bench firehose 3 offload",
+                "--mode bench pingpong 3",
+                "--mode bench pingpong 3 offload",
+                "--mode bench small 3",
+                "--mode bench small 3 offload",
+                "--mode bench many_tcp 3 8",
+                "--mode bench many_tcp 3 8 offload",
+                "--mode bench many_tcp_fair 3 8",
+                "--mode bench many_tcp_fair 3 8 offload",
+                "--mode bench many_udp 3 8",
+                "--mode bench many_udp 3 8 offload",
+                "--mode bench many_tcp 3 50",
+                "--mode bench many_tcp 3 50 offload",
+                "--mode bench many_tcp_fair 3 50",
+                "--mode bench many_tcp_fair 3 50 offload",
+                "--mode bench many_udp 3 50",
+                "--mode bench many_udp 3 50 offload",
+                "--mode bench many_tcp 3 100",
+                "--mode bench many_tcp 3 100 offload",
+                "--mode bench many_tcp_fair 3 100",
+                "--mode bench many_tcp_fair 3 100 offload",
+                "--mode bench many_udp 3 100",
+                "--mode bench many_udp 3 100 offload",
+            ],
+            26,
+        );
+    }
+
+    #[cfg(feature = "socket-tcp-dynamic-buffer")]
+    #[test]
+    fn full_gate_dynamic_command_list_has_10_parseable_commands() {
+        assert_commands_parse(
+            &[
+                "--mode bench multi_tcp 3 2 50",
+                "--mode bench multi_tcp 3 2 50 offload",
+                "--mode bench multi_tcp_sink 3 2 50",
+                "--mode bench multi_tcp_sink 3 2 50 offload",
+                "--mode bench churn 3 500",
+                "--mode bench churn 3 500 offload",
+                "--mode bench idle_hot 3 1000 0",
+                "--mode bench idle_hot 3 1000 0 offload",
+                "--mode bench idle_hot 3 1000 10",
+                "--mode bench idle_hot 3 1000 10 offload",
+            ],
+            10,
+        );
+    }
+
+    #[test]
+    fn parse_args_rejects_invalid_static_commands() {
+        let usize_overflow = (usize::MAX as u128 + 1).to_string();
+        assert_errors(vec![
+            (vec![], "missing traffic shape"),
+            (vec!["udp"], "missing seconds"),
+            (vec!["udp", "0"], "seconds must be non-zero"),
+            (vec!["udp", ""], "invalid seconds ''"),
+            (vec!["udp", "nope"], "invalid seconds 'nope'"),
+            (
+                vec!["udp", "18446744073709551616"],
+                "invalid seconds '18446744073709551616'",
+            ),
+            (vec!["unknown", "1"], "unknown traffic shape 'unknown'"),
+            (vec!["", "1"], "unknown traffic shape ''"),
+            (vec!["--wat", "udp", "1"], "unknown option '--wat'"),
+            (vec!["--mode"], "missing value for --mode"),
+            (vec!["--mode=", "udp", "1"], "mode cannot be empty"),
+            (vec!["--mode", "fast", "udp", "1"], "invalid mode 'fast'"),
+            (
+                vec!["--mode", "bench", "--mode", "trace", "udp", "1"],
+                "--mode may be specified only once",
+            ),
+            (
+                vec!["udp", "1", "--mode", "trace"],
+                "--mode must appear before the traffic shape",
+            ),
+            (vec!["udp", "1", "false"], "invalid offload value 'false'"),
+            (
+                vec!["udp", "1", "offload", "extra"],
+                "unexpected trailing argument 'extra'",
+            ),
+            (
+                vec!["udp", "1", "offload", "--wat"],
+                "unknown option '--wat'",
+            ),
+            (vec!["udp", "offload", "1"], "invalid seconds 'offload'"),
+            (vec!["many_tcp", "1"], "missing flows"),
+            (vec!["many_tcp", "1", "0"], "flows must be non-zero"),
+            (vec!["many_tcp", "1", "nope"], "invalid flows 'nope'"),
+            (
+                vec!["many_tcp", "1", usize_overflow.as_str()],
+                "invalid flows",
+            ),
+            (
+                vec!["many_udp", "1", "2", "TRUE"],
+                "invalid offload value 'TRUE'",
+            ),
+        ]);
+    }
+
+    #[cfg(feature = "socket-tcp-dynamic-buffer")]
+    #[test]
+    fn parse_args_rejects_invalid_dynamic_commands() {
+        let usize_overflow = (usize::MAX as u128 + 1).to_string();
+        assert_errors(vec![
+            (vec!["multi_tcp", "1"], "missing threads"),
+            (vec!["multi_tcp", "1", "0", "2"], "threads must be non-zero"),
+            (
+                vec!["multi_tcp", "1", "nope", "2"],
+                "invalid threads 'nope'",
+            ),
+            (
+                vec!["multi_tcp", "1", usize_overflow.as_str(), "2"],
+                "invalid threads",
+            ),
+            (vec!["multi_tcp_sink", "1", "2"], "missing flows per thread"),
+            (
+                vec!["multi_tcp_sink", "1", "2", "0"],
+                "flows per thread must be non-zero",
+            ),
+            (
+                vec!["multi_tcp_sink", "1", "2", "nope"],
+                "invalid flows per thread 'nope'",
+            ),
+            (vec!["churn", "1"], "missing rate"),
+            (vec!["churn", "1", "0"], "rate must be non-zero"),
+            (vec!["churn", "1", "nope"], "invalid rate 'nope'"),
+            (vec!["idle_hot", "1"], "missing idle flows"),
+            (vec!["idle_hot", "1", "2"], "missing active flows"),
+            (
+                vec!["idle_hot", "1", "nope", "2"],
+                "invalid idle flows 'nope'",
+            ),
+            (
+                vec!["idle_hot", "1", "2", "nope"],
+                "invalid active flows 'nope'",
+            ),
+            (
+                vec!["idle_hot", "1", "0", "0"],
+                "idle_hot requires at least one idle or active flow",
+            ),
+            (
+                vec!["idle_hot", "1", "2", "3", "offload", "extra"],
+                "unexpected trailing argument 'extra'",
+            ),
+        ]);
+    }
+
+    #[cfg(not(feature = "socket-tcp-dynamic-buffer"))]
+    #[test]
+    fn parse_args_reports_the_required_feature_for_dynamic_shapes() {
+        for shape in ["multi_tcp", "multi_tcp_sink", "churn", "idle_hot"] {
+            let input = [shape, "1", "1", "1"];
+            assert_eq!(
+                args(&input),
+                Err(format!(
+                    "traffic shape '{shape}' requires feature 'socket-tcp-dynamic-buffer'"
+                ))
+            );
+        }
+    }
 
     fn lane(mtu: usize, depth: usize) -> LaneRc {
         Rc::new(RefCell::new(Lane::new(mtu, depth)))
@@ -1152,7 +1763,7 @@ fn make_endpoint(
     offload_checksums: bool,
 ) -> Endpoint<'static> {
     let mut device = PairedDevice::new(tx, rx, mtu, offload_checksums);
-    let mut config = Config::new(HardwareAddress::Ip);
+    let mut config = InterfaceConfig::new(HardwareAddress::Ip);
     config.random_seed = 0xdead_beef;
     let mut iface = Interface::new(config, &mut device, Instant::from_millis(0));
     iface.update_ip_addrs(|ips| {
@@ -3783,136 +4394,104 @@ fn print_socket_sizes() {
     );
 }
 
-fn main() {
-    // Args:
-    //   [--mode bench|trace]
-    //   <shape> [seconds] [offload]                     for single-flow shapes
-    //   many_tcp|many_udp [seconds] [n_flows] [offload] for many-flow shapes
-    //
-    //   offload: "offload" | "1" | "true" -> Device advertises checksum
-    //            offload (mimics a hardware NIC or iOS NEPacketTunnelFlow).
+const USAGE: &str = "\
+Usage:
+  profile_loopback [--mode bench|trace] <shape> <seconds> [offload]
+  profile_loopback [--mode bench|trace] many_tcp|many_tcp_fair|many_udp <seconds> <flows> [offload]
+  profile_loopback [--mode bench|trace] multi_tcp|multi_tcp_sink <seconds> <threads> <flows-per-thread> [offload]
+  profile_loopback [--mode bench|trace] churn <seconds> <rate> [offload]
+  profile_loopback [--mode bench|trace] idle_hot <seconds> <idle> <active> [offload]
+
+Shapes without extra parameters: udp, firehose, pingpong, small, all
+Dynamic shapes require --features socket-tcp-dynamic-buffer.
+The optional final offload value is exactly one of: offload, 1, true.";
+
+fn main() -> ExitCode {
     #[cfg(feature = "dhat-heap")]
     let _profiler = dhat::Profiler::builder()
         .file_name("dhat-heap.json")
         .build();
-    let raw_args: Vec<String> = env::args().skip(1).collect();
-    let mut mode = RunMode::Bench;
-    let mut args: Vec<String> = Vec::with_capacity(raw_args.len());
-    let mut i = 0usize;
-    while i < raw_args.len() {
-        let arg = raw_args[i].as_str();
-        if let Some(value) = arg.strip_prefix("--mode=") {
-            mode = RunMode::parse(value);
-        } else if arg == "--mode" {
-            i += 1;
-            let value = raw_args.get(i).map(String::as_str).unwrap_or_else(|| {
-                eprintln!("missing value for --mode, expected bench|trace");
-                std::process::exit(2);
-            });
-            mode = RunMode::parse(value);
-        } else {
-            args.push(raw_args[i].clone());
+    let config = match parse_args(env::args().skip(1)) {
+        Ok(config) => config,
+        Err(error) => {
+            eprintln!("error: {error}\n\n{USAGE}");
+            return ExitCode::from(2);
         }
-        i += 1;
-    }
-
-    let shape = args.first().map(String::as_str).unwrap_or("all");
-    let seconds: u64 = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(3);
-
-    let is_offload = |s: Option<&str>| matches!(s, Some("offload") | Some("1") | Some("true"));
-
-    // Many-flow shapes interpret args[2] as the flow count and args[3] as the
-    // offload flag; single-flow shapes interpret args[2] directly as offload.
-    // Pool-aware shapes reserve positional knobs before the offload flag.
-    let (n_flows, offload) = if shape.starts_with("many_") {
-        let n: usize = args
-            .get(2)
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(100)
-            .max(1);
-        (Some(n), is_offload(args.get(3).map(String::as_str)))
-    } else if shape == "churn" {
-        (None, is_offload(args.get(3).map(String::as_str)))
-    } else if matches!(shape, "multi_tcp" | "multi_tcp_sink" | "idle_hot") {
-        (None, is_offload(args.get(4).map(String::as_str)))
-    } else {
-        (None, is_offload(args.get(2).map(String::as_str)))
     };
 
     println!(
         "config: mode={} | {} checksums ({}{})",
-        mode.label(),
-        if offload {
+        config.mode.label(),
+        if config.offload_checksums {
             "device-offloaded"
         } else {
             "full software"
         },
-        if offload {
+        if config.offload_checksums {
             "mimics a NIC or iOS NEPacketTunnelFlow"
         } else {
             "worst case"
         },
-        match n_flows {
+        match config.shape.flow_count() {
             Some(n) => format!(", {n} flows"),
             None => String::new(),
         }
     );
     print_socket_sizes();
 
-    match shape {
-        "firehose" => shape_firehose(seconds, offload, mode),
-        "pingpong" => shape_pingpong(seconds, offload, mode),
-        "small" => shape_small(seconds, offload, mode),
-        "udp" => shape_udp_firehose(seconds, offload, mode),
-        "all" => {
+    let seconds = config.seconds.get();
+    let offload = config.offload_checksums;
+    let mode = config.mode;
+    match config.shape {
+        TrafficShape::Firehose => shape_firehose(seconds, offload, mode),
+        TrafficShape::PingPong => shape_pingpong(seconds, offload, mode),
+        TrafficShape::Small => shape_small(seconds, offload, mode),
+        TrafficShape::Udp => shape_udp_firehose(seconds, offload, mode),
+        TrafficShape::All => {
             shape_udp_firehose(seconds, offload, mode);
             shape_small(seconds, offload, mode);
             shape_pingpong(seconds, offload, mode);
         }
-        "many_tcp" => shape_many_tcp(seconds, n_flows.unwrap(), offload, mode),
-        "many_tcp_fair" => shape_many_tcp_fair(seconds, n_flows.unwrap(), offload, mode),
-        "many_udp" => shape_many_udp(seconds, n_flows.unwrap(), offload, mode),
-        #[cfg(feature = "socket-tcp-dynamic-buffer")]
-        "multi_tcp" => {
-            let n_threads: usize = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(2).max(1);
-            let flows: usize = args
-                .get(3)
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(50)
-                .max(1);
-            shape_multi_tcp(seconds, n_threads, flows, offload, mode);
+        TrafficShape::ManyTcp { flows } => shape_many_tcp(seconds, flows.get(), offload, mode),
+        TrafficShape::ManyTcpFair { flows } => {
+            shape_many_tcp_fair(seconds, flows.get(), offload, mode)
         }
+        TrafficShape::ManyUdp { flows } => shape_many_udp(seconds, flows.get(), offload, mode),
         #[cfg(feature = "socket-tcp-dynamic-buffer")]
-        "multi_tcp_sink" => {
-            let n_threads: usize = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(2).max(1);
-            let flows: usize = args
-                .get(3)
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(50)
-                .max(1);
-            shape_multi_tcp_sink(seconds, n_threads, flows, offload, mode);
-        }
-        #[cfg(feature = "socket-tcp-dynamic-buffer")]
-        "churn" => {
-            let rate: usize = args
-                .get(2)
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(500)
-                .max(1);
-            shape_churn(seconds, rate, offload, mode);
-        }
-        #[cfg(feature = "socket-tcp-dynamic-buffer")]
-        "idle_hot" => {
-            let n_idle: usize = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(500);
-            let n_active: usize = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(10);
-            shape_idle_hot(seconds, n_idle, n_active, offload, mode);
-        }
-        _ => {
-            eprintln!(
-                "unknown shape '{shape}'. expected udp|small|pingpong|firehose|all|many_tcp|many_tcp_fair|many_udp\
-                 |multi_tcp|multi_tcp_sink|churn|idle_hot (dynamic-buffer shapes need --features socket-tcp-dynamic-buffer)"
+        TrafficShape::MultiTcp {
+            threads,
+            flows_per_thread,
+        } => {
+            shape_multi_tcp(
+                seconds,
+                threads.get(),
+                flows_per_thread.get(),
+                offload,
+                mode,
             );
-            std::process::exit(2);
+        }
+        #[cfg(feature = "socket-tcp-dynamic-buffer")]
+        TrafficShape::MultiTcpSink {
+            threads,
+            flows_per_thread,
+        } => {
+            shape_multi_tcp_sink(
+                seconds,
+                threads.get(),
+                flows_per_thread.get(),
+                offload,
+                mode,
+            );
+        }
+        #[cfg(feature = "socket-tcp-dynamic-buffer")]
+        TrafficShape::Churn { rate } => {
+            shape_churn(seconds, rate.get(), offload, mode);
+        }
+        #[cfg(feature = "socket-tcp-dynamic-buffer")]
+        TrafficShape::IdleHot { idle, active } => {
+            shape_idle_hot(seconds, idle, active, offload, mode);
         }
     }
+
+    ExitCode::SUCCESS
 }
