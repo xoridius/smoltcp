@@ -7,8 +7,19 @@
 use byteorder::{ByteOrder, NetworkEndian};
 
 use super::{Error, Result};
+use crate::time::Duration;
 use crate::wire::Ipv6Address;
 use crate::wire::icmpv6::{Message, Packet, field};
+
+pub(crate) const fn max_resp_delay(code: u16) -> Duration {
+    if code < 0x8000 {
+        Duration::from_millis(code as u64)
+    } else {
+        let exp = ((code & 0x7000) >> 12) as u32;
+        let mant = (code & 0x0fff) as u32;
+        Duration::from_millis(((mant | 0x1000) << (exp + 3)) as u64)
+    }
+}
 
 enum_with_unknown! {
     /// MLDv2 Multicast Listener Report Record Type. See [RFC 3810 § 5.2.12] for
@@ -634,5 +645,18 @@ mod test {
             &ChecksumCapabilities::default(),
         );
         assert_eq!(&*packet.into_inner(), &REPORT_PACKET_BYTES[..]);
+    }
+
+    #[test]
+    fn test_max_resp_delay() {
+        for (code, millis) in [
+            (0, 0),
+            (1, 1),
+            (0x7fff, 32_767),
+            (0x8000, 32_768),
+            (0xffff, 8_387_584),
+        ] {
+            assert_eq!(max_resp_delay(code).total_millis(), millis);
+        }
     }
 }

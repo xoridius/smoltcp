@@ -86,6 +86,59 @@ impl State {
             Some(GroupState::Leaving) => false,
         }
     }
+
+    #[cfg(feature = "proto-ipv6")]
+    fn schedule_mld_report(&mut self, group: Option<Ipv6Address>, timeout: crate::time::Instant) {
+        let (group, timeout) = match self.mld_report_state {
+            MldReportState::Inactive => (group, timeout),
+            MldReportState::ToGeneralQuery {
+                timeout: pending_timeout,
+            } => (None, timeout.min(pending_timeout)),
+            MldReportState::ToSpecificQuery {
+                group: pending_group,
+                timeout: pending_timeout,
+            } => (
+                (group == Some(pending_group)).then_some(pending_group),
+                timeout.min(pending_timeout),
+            ),
+        };
+
+        self.mld_report_state = match group {
+            Some(group) => MldReportState::ToSpecificQuery { group, timeout },
+            None => MldReportState::ToGeneralQuery { timeout },
+        };
+    }
+
+    pub(super) fn poll_at(&self) -> Option<crate::time::Instant> {
+        if self
+            .groups
+            .values()
+            .any(|state| *state != GroupState::Joined)
+        {
+            return Some(crate::time::Instant::ZERO);
+        }
+
+        let mut result = None;
+        #[cfg(feature = "proto-ipv4")]
+        {
+            let timeout = match self.igmp_report_state {
+                IgmpReportState::Inactive => None,
+                IgmpReportState::ToGeneralQuery { timeout, .. }
+                | IgmpReportState::ToSpecificQuery { timeout, .. } => Some(timeout),
+            };
+            result = result.into_iter().chain(timeout).min();
+        }
+        #[cfg(feature = "proto-ipv6")]
+        {
+            let timeout = match self.mld_report_state {
+                MldReportState::Inactive => None,
+                MldReportState::ToGeneralQuery { timeout }
+                | MldReportState::ToSpecificQuery { timeout, .. } => Some(timeout),
+            };
+            result = result.into_iter().chain(timeout).min();
+        }
+        result
+    }
 }
 
 impl core::fmt::Display for MulticastError {
@@ -212,19 +265,18 @@ impl Interface {
                 }
                 #[cfg(feature = "proto-ipv6")]
                 IpAddress::Ipv6(addr) => {
-                    if let Some(pkt) = self.inner.mldv2_report_packet(&[MldAddressRecordRepr::new(
-                        MldRecordType::ChangeToInclude,
-                        addr,
-                    )]) {
-                        let Some(tx_token) = device.transmit(self.inner.now) else {
-                            break;
-                        };
+                    let record = MldAddressRecordRepr::new(MldRecordType::ChangeToInclude, addr);
+                    let pkt = self
+                        .inner
+                        .mldv2_report_packet(core::slice::from_ref(&record));
+                    let Some(tx_token) = device.transmit(self.inner.now) else {
+                        break;
+                    };
 
-                        // NOTE(unwrap): packet destination is multicast, which is always routable and doesn't require neighbor discovery.
-                        self.inner
-                            .dispatch_ip(tx_token, PacketMeta::default(), pkt, &mut self.fragmenter)
-                            .unwrap();
-                    }
+                    // NOTE(unwrap): packet destination is multicast, which is always routable and doesn't require neighbor discovery.
+                    self.inner
+                        .dispatch_ip(tx_token, PacketMeta::default(), pkt, &mut self.fragmenter)
+                        .unwrap();
                 }
             }
 
@@ -260,19 +312,18 @@ impl Interface {
                 }
                 #[cfg(feature = "proto-ipv6")]
                 IpAddress::Ipv6(addr) => {
-                    if let Some(pkt) = self.inner.mldv2_report_packet(&[MldAddressRecordRepr::new(
-                        MldRecordType::ChangeToExclude,
-                        addr,
-                    )]) {
-                        let Some(tx_token) = device.transmit(self.inner.now) else {
-                            break;
-                        };
+                    let record = MldAddressRecordRepr::new(MldRecordType::ChangeToExclude, addr);
+                    let pkt = self
+                        .inner
+                        .mldv2_report_packet(core::slice::from_ref(&record));
+                    let Some(tx_token) = device.transmit(self.inner.now) else {
+                        break;
+                    };
 
-                        // NOTE(unwrap): packet destination is multicast, which is always routable and doesn't require neighbor discovery.
-                        self.inner
-                            .dispatch_ip(tx_token, PacketMeta::default(), pkt, &mut self.fragmenter)
-                            .unwrap();
-                    }
+                    // NOTE(unwrap): packet destination is multicast, which is always routable and doesn't require neighbor discovery.
+                    self.inner
+                        .dispatch_ip(tx_token, PacketMeta::default(), pkt, &mut self.fragmenter)
+                        .unwrap();
                 }
             }
 
@@ -356,35 +407,38 @@ impl Interface {
                     .multicast
                     .groups
                     .iter()
-                    .filter_map(|(addr, _)| match addr {
-                        IpAddress::Ipv6(addr) => Some(MldAddressRecordRepr::new(
-                            MldRecordType::ModeIsExclude,
-                            *addr,
-                        )),
+                    .filter_map(|(addr, state)| match (addr, *state) {
+                        (IpAddress::Ipv6(addr), GroupState::Joining | GroupState::Joined) => Some(
+                            MldAddressRecordRepr::new(MldRecordType::ModeIsExclude, *addr),
+                        ),
                         #[allow(unreachable_patterns)]
                         _ => None,
                     })
                     .collect::<heapless::Vec<_, IFACE_MAX_MULTICAST_GROUP_COUNT>>();
-                if let Some(pkt) = self.inner.mldv2_report_packet(&records)
-                    && let Some(tx_token) = device.transmit(self.inner.now)
-                {
+                if records.is_empty() {
+                    self.inner.multicast.mld_report_state = MldReportState::Inactive;
+                } else if let Some(tx_token) = device.transmit(self.inner.now) {
+                    let pkt = self.inner.mldv2_report_packet(&records);
                     self.inner
                         .dispatch_ip(tx_token, PacketMeta::default(), pkt, &mut self.fragmenter)
                         .unwrap();
-                };
-                self.inner.multicast.mld_report_state = MldReportState::Inactive;
+                    self.inner.multicast.mld_report_state = MldReportState::Inactive;
+                }
             }
             MldReportState::ToSpecificQuery { group, timeout } if self.inner.now >= timeout => {
-                let record = MldAddressRecordRepr::new(MldRecordType::ModeIsExclude, group);
-                if let Some(pkt) = self.inner.mldv2_report_packet(&[record])
-                    && let Some(tx_token) = device.transmit(self.inner.now)
-                {
+                if !self.inner.multicast.has_multicast_group(group) {
+                    self.inner.multicast.mld_report_state = MldReportState::Inactive;
+                } else if let Some(tx_token) = device.transmit(self.inner.now) {
+                    let record = MldAddressRecordRepr::new(MldRecordType::ModeIsExclude, group);
+                    let pkt = self
+                        .inner
+                        .mldv2_report_packet(core::slice::from_ref(&record));
                     // NOTE(unwrap): packet destination is multicast, which is always routable and doesn't require neighbor discovery.
                     self.inner
                         .dispatch_ip(tx_token, PacketMeta::default(), pkt, &mut self.fragmenter)
                         .unwrap();
+                    self.inner.multicast.mld_report_state = MldReportState::Inactive;
                 }
-                self.inner.multicast.mld_report_state = MldReportState::Inactive;
             }
             _ => {}
         }
@@ -525,13 +579,14 @@ impl InterfaceInner {
                 max_resp_code,
                 ..
             } => {
-                // Do not respond immediately to the query, but wait a random time
-                let delay = if max_resp_code > 0 {
-                    (self.rand.rand_u16() % max_resp_code).into()
+                let max_delay = mldv2_max_resp_delay(max_resp_code).total_millis();
+                let delay = if max_delay == 0 {
+                    crate::time::Duration::ZERO
                 } else {
-                    0
+                    crate::time::Duration::from_millis(
+                        1 + u64::from(self.rand.rand_u32()) % max_delay,
+                    )
                 };
-                let delay = crate::time::Duration::from_millis(delay);
                 // General query
                 if mcast_addr.is_unspecified()
                     && (ip_repr.dst_addr == IPV6_LINK_LOCAL_ALL_NODES
@@ -544,21 +599,236 @@ impl InterfaceInner {
                         .filter(|a| matches!(a, IpAddress::Ipv6(_)))
                         .count();
                     if ipv6_multicast_group_count != 0 {
-                        self.multicast.mld_report_state = MldReportState::ToGeneralQuery {
-                            timeout: self.now + delay,
-                        };
+                        self.multicast.schedule_mld_report(None, self.now + delay);
                     }
                 }
                 if self.has_multicast_group(mcast_addr) && ip_repr.dst_addr == mcast_addr {
-                    self.multicast.mld_report_state = MldReportState::ToSpecificQuery {
-                        group: mcast_addr,
-                        timeout: self.now + delay,
-                    };
+                    self.multicast
+                        .schedule_mld_report(Some(mcast_addr), self.now + delay);
                 }
                 None
             }
             MldRepr::Report { .. } => None,
             MldRepr::ReportRecordReprs { .. } => None,
         }
+    }
+}
+
+#[cfg(all(test, feature = "proto-ipv6", feature = "medium-ethernet"))]
+mod tests {
+    use super::*;
+    use crate::phy::{DeviceCapabilities, Medium};
+    use crate::rand::Rand;
+    use crate::tests::setup;
+
+    const GROUP_A: Ipv6Address = Ipv6Address::new(0xff02, 0, 0, 0, 0, 0, 0, 0x1234);
+    const GROUP_B: Ipv6Address = Ipv6Address::new(0xff02, 0, 0, 0, 0, 0, 0, 0x5678);
+
+    struct TxUnavailable {
+        caps: DeviceCapabilities,
+        transmit_calls: usize,
+    }
+
+    impl Device for TxUnavailable {
+        type RxToken<'a> = crate::tests::RxToken;
+        type TxToken<'a> = crate::tests::TxToken<'a>;
+
+        fn capabilities(&self) -> DeviceCapabilities {
+            self.caps.clone()
+        }
+
+        fn receive(
+            &mut self,
+            _timestamp: crate::time::Instant,
+        ) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
+            None
+        }
+
+        fn transmit(&mut self, _timestamp: crate::time::Instant) -> Option<Self::TxToken<'_>> {
+            self.transmit_calls += 1;
+            None
+        }
+    }
+
+    fn assert_general(state: &State, timeout: crate::time::Instant) {
+        assert!(matches!(
+            state.mld_report_state,
+            MldReportState::ToGeneralQuery { timeout: actual } if actual == timeout
+        ));
+    }
+
+    fn assert_specific(state: &State, group: Ipv6Address, timeout: crate::time::Instant) {
+        assert!(matches!(
+            state.mld_report_state,
+            MldReportState::ToSpecificQuery {
+                group: actual_group,
+                timeout: actual_timeout,
+            } if actual_group == group && actual_timeout == timeout
+        ));
+    }
+
+    fn scheduled_delay(max_resp_code: u16) -> u64 {
+        let (mut iface, _, _) = setup(Medium::Ethernet);
+        let now = crate::time::Instant::from_millis(10);
+        iface.inner.now = now;
+
+        let repr = MldRepr::Query {
+            max_resp_code,
+            mcast_addr: Ipv6Address::UNSPECIFIED,
+            s_flag: false,
+            qrv: 0,
+            qqic: 0,
+            num_srcs: 0,
+            data: &[],
+        };
+        iface.inner.rand = Rand::new(1);
+        iface.inner.process_mldv2(
+            Ipv6Repr {
+                src_addr: Ipv6Address::new(0xfe80, 0, 0, 0, 0, 0, 0, 2),
+                dst_addr: IPV6_LINK_LOCAL_ALL_NODES,
+                next_header: IpProtocol::Icmpv6,
+                payload_len: repr.buffer_len(),
+                hop_limit: 1,
+            },
+            repr,
+        );
+
+        match iface.inner.multicast.mld_report_state {
+            MldReportState::ToGeneralQuery { timeout } => (timeout - now).total_millis(),
+            _ => panic!("MLD report was not scheduled"),
+        }
+    }
+
+    #[test]
+    fn mld_query_delay_uses_decoded_range() {
+        assert_eq!(scheduled_delay(0xffff), 8_282_290);
+        assert_eq!(scheduled_delay(1), 1);
+        assert_eq!(scheduled_delay(0), 0);
+    }
+
+    #[test]
+    fn mld_report_schedule_merges_pending_queries() {
+        let earlier = crate::time::Instant::from_millis(10);
+        let later = crate::time::Instant::from_millis(20);
+
+        let mut state = State::new();
+        state.schedule_mld_report(Some(GROUP_A), later);
+        state.schedule_mld_report(Some(GROUP_A), earlier);
+        assert_specific(&state, GROUP_A, earlier);
+
+        let mut state = State::new();
+        state.schedule_mld_report(Some(GROUP_A), later);
+        state.schedule_mld_report(None, earlier);
+        assert_general(&state, earlier);
+        state.schedule_mld_report(Some(GROUP_A), later);
+        assert_general(&state, earlier);
+
+        let mut state = State::new();
+        state.schedule_mld_report(Some(GROUP_A), later);
+        state.schedule_mld_report(Some(GROUP_B), earlier);
+        assert_general(&state, earlier);
+    }
+
+    #[test]
+    fn multicast_poll_at_includes_state_work() {
+        let mld_timeout = crate::time::Instant::from_millis(20);
+        let mut state = State::new();
+        state
+            .groups
+            .insert(GROUP_A.into(), GroupState::Joined)
+            .unwrap();
+        assert_eq!(state.poll_at(), None);
+
+        state.mld_report_state = MldReportState::ToGeneralQuery {
+            timeout: mld_timeout,
+        };
+        assert_eq!(state.poll_at(), Some(mld_timeout));
+
+        #[cfg(feature = "proto-ipv4")]
+        {
+            let igmp_timeout = crate::time::Instant::from_millis(10);
+            state.igmp_report_state = IgmpReportState::ToSpecificQuery {
+                version: IgmpVersion::Version2,
+                timeout: igmp_timeout,
+                group: Ipv4Address::new(224, 0, 0, 1),
+            };
+            assert_eq!(state.poll_at(), Some(igmp_timeout));
+        }
+
+        state
+            .groups
+            .insert(GROUP_A.into(), GroupState::Joining)
+            .unwrap();
+        assert_eq!(state.poll_at(), Some(crate::time::Instant::ZERO));
+        state
+            .groups
+            .insert(GROUP_A.into(), GroupState::Leaving)
+            .unwrap();
+        assert_eq!(state.poll_at(), Some(crate::time::Instant::ZERO));
+    }
+
+    #[test]
+    fn mld_due_report_survives_tx_unavailable() {
+        let (mut iface, mut sockets, mut device) = setup(Medium::Ethernet);
+        let now = crate::time::Instant::from_millis(10);
+        iface.inner.multicast.groups.clear();
+        iface
+            .inner
+            .multicast
+            .groups
+            .insert(GROUP_A.into(), GroupState::Joined)
+            .unwrap();
+        iface.inner.multicast.mld_report_state = MldReportState::ToSpecificQuery {
+            group: GROUP_A,
+            timeout: now,
+        };
+
+        let mut unavailable = TxUnavailable {
+            caps: device.capabilities(),
+            transmit_calls: 0,
+        };
+        iface.poll_egress(now, &mut unavailable, &mut sockets);
+        assert_eq!(unavailable.transmit_calls, 1);
+        assert_specific(&iface.inner.multicast, GROUP_A, now);
+        assert_eq!(iface.poll_at(now, &sockets), Some(now));
+
+        iface.poll_egress(now, &mut device, &mut sockets);
+        assert_eq!(device.tx_queue.len(), 1);
+        assert!(matches!(
+            iface.inner.multicast.mld_report_state,
+            MldReportState::Inactive
+        ));
+        iface.poll_egress(now, &mut device, &mut sockets);
+        assert_eq!(device.tx_queue.len(), 1);
+    }
+
+    #[test]
+    fn mld_stale_reports_clear_without_transmit() {
+        let (mut iface, mut sockets, device) = setup(Medium::Ethernet);
+        let now = crate::time::Instant::from_millis(10);
+        iface.inner.multicast.groups.clear();
+
+        iface.inner.multicast.mld_report_state = MldReportState::ToSpecificQuery {
+            group: GROUP_A,
+            timeout: now,
+        };
+        let mut unavailable = TxUnavailable {
+            caps: device.capabilities(),
+            transmit_calls: 0,
+        };
+        iface.poll_egress(now, &mut unavailable, &mut sockets);
+        assert_eq!(unavailable.transmit_calls, 0);
+        assert!(matches!(
+            iface.inner.multicast.mld_report_state,
+            MldReportState::Inactive
+        ));
+
+        iface.inner.multicast.mld_report_state = MldReportState::ToGeneralQuery { timeout: now };
+        iface.poll_egress(now, &mut unavailable, &mut sockets);
+        assert_eq!(unavailable.transmit_calls, 0);
+        assert!(matches!(
+            iface.inner.multicast.mld_report_state,
+            MldReportState::Inactive
+        ));
     }
 }

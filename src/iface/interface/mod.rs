@@ -621,7 +621,15 @@ impl Interface {
 
         #[cfg(feature = "proto-ipv6-slaac")]
         if self.inner.slaac_enabled {
-            res = res.min(self.inner.slaac.poll_at(timestamp));
+            res = res
+                .into_iter()
+                .chain(self.inner.slaac.poll_at(timestamp))
+                .min();
+        }
+
+        #[cfg(feature = "multicast")]
+        {
+            res = res.into_iter().chain(self.inner.multicast.poll_at()).min();
         }
 
         res

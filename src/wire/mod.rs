@@ -264,6 +264,8 @@ pub use self::ndiscoption::{
 };
 
 #[cfg(feature = "proto-ipv6")]
+pub(crate) use self::mld::max_resp_delay as mldv2_max_resp_delay;
+#[cfg(feature = "proto-ipv6")]
 pub use self::mld::{
     AddressRecord as MldAddressRecord, AddressRecordRepr as MldAddressRecordRepr,
     RecordType as MldRecordType, Repr as MldRepr,

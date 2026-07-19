@@ -639,7 +639,7 @@ impl InterfaceInner {
     pub(super) fn mldv2_report_packet<'any>(
         &self,
         records: &'any [MldAddressRecordRepr<'any>],
-    ) -> Option<Packet<'any>> {
+    ) -> Packet<'any> {
         // Per [RFC 3810 § 5.2.13], source addresses must be link-local, falling
         // back to the unspecified address if we haven't acquired one.
         // [RFC 3810 § 5.2.13]: https://tools.ietf.org/html/rfc3810#section-5.2.13
@@ -669,7 +669,7 @@ impl InterfaceInner {
             .sum::<usize>();
 
         // All MLDv2 messages must be sent with an IPv6 Hop limit of 1.
-        Some(Packet::new_ipv6(
+        Packet::new_ipv6(
             Ipv6Repr {
                 src_addr,
                 dst_addr,
@@ -681,7 +681,7 @@ impl InterfaceInner {
                 hop_limit: 1,
             },
             IpPayload::HopByHopIcmpv6(hbh_repr, Icmpv6Repr::Mld(mld_repr)),
-        ))
+        )
     }
 }
 
