@@ -1,5 +1,5 @@
 use std::io;
-#[cfg(any(target_os = "macos", target_os = "ios"))]
+#[cfg(any(target_os = "macos", target_os = "ios", target_os = "freebsd"))]
 use std::mem;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 
@@ -43,22 +43,28 @@ const BIOCIMMEDIATE: libc::c_ulong = 0x80044270;
 /// get interface MTU
 #[cfg(any(target_os = "macos", target_os = "ios"))]
 const SIOCGIFMTU: libc::c_ulong = 0xc0206933;
-#[cfg(any(
-    target_os = "macos",
-    target_os = "ios",
-    target_os = "openbsd",
-    all(
-        any(target_os = "netbsd", target_os = "freebsd"),
-        target_pointer_width = "32"
-    )
-))]
+// These BPF timestamp fields remain 32-bit on the supported targets.
+#[cfg(any(target_os = "macos", target_os = "ios", target_os = "openbsd"))]
 const BPF_HEADER_LAYOUT: HeaderLayout = HeaderLayout::new(8, 12, 16, 4);
 
-#[cfg(all(
-    any(target_os = "netbsd", target_os = "freebsd"),
-    target_pointer_width = "64"
-))]
+// NetBSD's BPF timestamp ABI is independent of libc::timeval.
+#[cfg(all(target_os = "netbsd", target_pointer_width = "32"))]
+const BPF_HEADER_LAYOUT: HeaderLayout = HeaderLayout::new(8, 12, 16, 4);
+
+#[cfg(all(target_os = "netbsd", target_pointer_width = "64"))]
 const BPF_HEADER_LAYOUT: HeaderLayout = HeaderLayout::new(16, 20, 24, 8);
+
+// FreeBSD bpf_hdr starts with libc::timeval and BPF_WORDALIGN uses sizeof(long).
+#[cfg(target_os = "freebsd")]
+const BPF_HEADER_LAYOUT: HeaderLayout = {
+    let timestamp_len = mem::size_of::<libc::timeval>();
+    HeaderLayout::new(
+        timestamp_len,
+        timestamp_len + 4,
+        timestamp_len + 8,
+        mem::size_of::<libc::c_long>(),
+    )
+};
 
 #[cfg(any(target_os = "macos", target_os = "ios"))]
 type BpfIfreq = libc::ifreq;

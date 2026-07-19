@@ -91,8 +91,9 @@ mod test {
     use super::*;
 
     const DARWIN_OPENBSD: HeaderLayout = HeaderLayout::new(8, 12, 16, 4);
-    const NETBSD_FREEBSD_32: HeaderLayout = HeaderLayout::new(8, 12, 16, 4);
-    const NETBSD_FREEBSD_64: HeaderLayout = HeaderLayout::new(16, 20, 24, 8);
+    const NETBSD_32_FREEBSD_I686: HeaderLayout = HeaderLayout::new(8, 12, 16, 4);
+    const FREEBSD_32_TIME64: HeaderLayout = HeaderLayout::new(16, 20, 24, 4);
+    const NETBSD_64_FREEBSD_64: HeaderLayout = HeaderLayout::new(16, 20, 24, 8);
 
     fn record(
         layout: HeaderLayout,
@@ -121,15 +122,23 @@ mod test {
         for (layout, header_len) in [
             (DARWIN_OPENBSD, 18),
             (DARWIN_OPENBSD, 30),
-            (NETBSD_FREEBSD_32, 18),
-            (NETBSD_FREEBSD_64, 34),
-            (NETBSD_FREEBSD_64, 26),
+            (NETBSD_32_FREEBSD_I686, 18),
+            (NETBSD_64_FREEBSD_64, 34),
+            (NETBSD_64_FREEBSD_64, 26),
         ] {
             let bytes = record(layout, header_len, 3, 3, b"one", false);
             let parsed = parse_record(&bytes, 0, layout).unwrap();
             assert_eq!(parsed.packet, b"one");
             assert_eq!(parsed.next_offset, bytes.len());
         }
+    }
+
+    #[test]
+    fn parses_freebsd_32_time64_layout() {
+        let bytes = record(FREEBSD_32_TIME64, 26, 3, 3, b"one", false);
+        assert!(parse_record(&bytes, 0, NETBSD_32_FREEBSD_I686).is_err());
+        let parsed = parse_record(&bytes, 0, FREEBSD_32_TIME64).unwrap();
+        assert_eq!(parsed.packet, b"one");
     }
 
     #[test]
@@ -149,10 +158,10 @@ mod test {
 
     #[test]
     fn accepts_final_record_without_alignment_padding() {
-        let bytes = record(NETBSD_FREEBSD_64, 26, 3, 3, b"end", false);
-        assert_ne!(bytes.len() % NETBSD_FREEBSD_64.alignment, 0);
+        let bytes = record(NETBSD_64_FREEBSD_64, 26, 3, 3, b"end", false);
+        assert_ne!(bytes.len() % NETBSD_64_FREEBSD_64.alignment, 0);
 
-        let parsed = parse_record(&bytes, 0, NETBSD_FREEBSD_64).unwrap();
+        let parsed = parse_record(&bytes, 0, NETBSD_64_FREEBSD_64).unwrap();
         assert_eq!(parsed.packet, b"end");
         assert_eq!(parsed.next_offset, bytes.len());
     }
