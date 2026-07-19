@@ -135,10 +135,22 @@ mod test {
 
     #[test]
     fn parses_freebsd_32_time64_layout() {
-        let bytes = record(FREEBSD_32_TIME64, 26, 3, 3, b"one", false);
+        let mut bytes = record(FREEBSD_32_TIME64, 26, 7, 7, b"first!!", true);
+        let second_offset = bytes.len();
+        assert_eq!(second_offset, 36);
+        bytes.extend(record(FREEBSD_32_TIME64, 26, 3, 3, b"two", false));
+
         assert!(parse_record(&bytes, 0, NETBSD_32_FREEBSD_I686).is_err());
-        let parsed = parse_record(&bytes, 0, FREEBSD_32_TIME64).unwrap();
-        assert_eq!(parsed.packet, b"one");
+
+        let first = parse_record(&bytes, 0, FREEBSD_32_TIME64).unwrap();
+        assert_eq!(first.packet, b"first!!");
+        assert_eq!(first.next_offset, second_offset);
+
+        let align8 = HeaderLayout::new(16, 20, 24, 8);
+        assert_eq!(parse_record(&bytes, 0, align8).unwrap().next_offset, 40);
+
+        let second = parse_record(&bytes, first.next_offset, FREEBSD_32_TIME64).unwrap();
+        assert_eq!(second.packet, b"two");
     }
 
     #[test]
