@@ -1207,6 +1207,20 @@ mod test {
     #[cfg(feature = "proto-ipv4")]
     const DST_ADDR: Ipv4Address = Ipv4Address::new(192, 168, 1, 2);
 
+    #[test]
+    #[cfg(feature = "proto-ipv4")]
+    fn test_checksum_roundtrip_with_wide_fold_carry() {
+        let mut bytes =
+            core::array::from_fn::<_, 84, _>(|i| (i as u8).wrapping_mul(117).wrapping_add(28));
+        let mut packet = Packet::new_unchecked(&mut bytes);
+        packet.set_header_len(20);
+
+        let addr = IpAddress::Ipv4(Ipv4Address::UNSPECIFIED);
+        packet.fill_checksum(&addr, &addr);
+
+        assert!(packet.verify_checksum(&addr, &addr));
+    }
+
     #[cfg(feature = "proto-ipv4")]
     static PACKET_BYTES: [u8; 28] = [
         0xbf, 0x00, 0x00, 0x50, 0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0x60, 0x35, 0x01,

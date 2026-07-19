@@ -779,14 +779,9 @@ pub mod checksum {
     /// Fold a 64-bit one's complement accumulator down to a 16-bit value
     /// (native byte order).
     #[inline(always)]
-    fn fold_u64(mut accum: u64) -> u16 {
-        // Two 32-bit halves -> at most 33 bits.
-        accum = (accum >> 32) + (accum & 0xffff_ffff);
-        // Two 16-bit halves -> at most 17 bits.
-        accum = (accum >> 16) + (accum & 0xffff);
-        // One more fold to absorb the final carry.
-        accum = (accum >> 16) + (accum & 0xffff);
-        accum as u16
+    fn fold_u64(accum: u64) -> u16 {
+        let accum = accum.wrapping_add(accum.rotate_right(32));
+        propagate_carries((accum >> 32) as u32)
     }
 
     /// Compute an RFC 1071 compliant checksum (without the final complement).
@@ -959,6 +954,11 @@ pub mod checksum {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        #[test]
+        fn checksum_fold_propagates_carry_from_low_half() {
+            assert_eq!(fold_u64(0x0001_0000_ffff_ffff), 1);
+        }
 
         /// Cross-check the wide-word implementation against the reference across
         /// a spread of lengths, alignments, and content patterns.
