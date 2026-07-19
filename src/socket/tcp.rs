@@ -1094,6 +1094,10 @@ impl<'a> Socket<'a> {
 
             #[cfg(feature = "socket-tcp-cubic")]
             CongestionControl::Cubic => AnyController::Cubic(cubic::Cubic::new()),
+        };
+
+        if self.congestion_controller.manages_window() {
+            self.cancel_no_control_retry();
         }
     }
 
@@ -1954,6 +1958,10 @@ impl<'a> Socket<'a> {
 
         self.state = state;
 
+        if !matches!(state, State::Established | State::CloseWait) {
+            self.cancel_no_control_retry();
+        }
+
         // Dynamic-buffer: keep the state setter from eagerly clearing
         // buffers in `Closed`. Some callers still need the queued lengths
         // after the transition, e.g. to build an outbound RST ACK or to
@@ -2642,8 +2650,7 @@ impl<'a> Socket<'a> {
         let is_window_update = new_remote_win_len != self.remote_win_len;
         self.remote_win_len = new_remote_win_len;
         if new_remote_win_len == 0 && self.flags.contains(Flags::NO_CONTROL_RETRY) {
-            self.flags.remove(Flags::NO_CONTROL_RETRY);
-            self.local_rx_dup_acks = 0;
+            self.cancel_no_control_retry();
             net_debug!("cancelled NoControl retry after zero-window update");
         }
 
@@ -3231,8 +3238,25 @@ impl<'a> Socket<'a> {
     }
 
     #[inline]
-    fn has_unsent_or_control_to_transmit(&self) -> bool {
+    fn no_control_retry_eligible(&self) -> bool {
+        self.flags.contains(Flags::NO_CONTROL_RETRY)
+            && !self.congestion_controller.manages_window()
+            && matches!(self.state, State::Established | State::CloseWait)
+            && self.remote_win_len > 0
+            && !self.tx_buffer.is_empty()
+    }
+
+    #[inline]
+    fn cancel_no_control_retry(&mut self) {
         if self.flags.contains(Flags::NO_CONTROL_RETRY) {
+            self.flags.remove(Flags::NO_CONTROL_RETRY);
+            self.local_rx_dup_acks = 0;
+        }
+    }
+
+    #[inline]
+    fn has_unsent_or_control_to_transmit(&self) -> bool {
+        if self.no_control_retry_eligible() {
             return true;
         }
         match self.state {
@@ -3430,9 +3454,7 @@ impl<'a> Socket<'a> {
         // it rewinds `remote_last_seq` so the cached value is stale — refresh
         // it there.
         let retransmit_due = self.timer.should_retransmit(cx.now());
-        let no_control_retry = self.flags.contains(Flags::NO_CONTROL_RETRY)
-            && self.remote_win_len > 0
-            && !retransmit_due;
+        let mut no_control_retry = self.no_control_retry_eligible() && !retransmit_due;
         let mut want_send =
             egress_interest.seq_candidate && (no_control_retry || self.seq_to_transmit(cx));
 
@@ -3444,7 +3466,7 @@ impl<'a> Socket<'a> {
         } else if retransmit_due && (!want_send || self.flags.contains(Flags::NO_CONTROL_RETRY)) {
             // The retransmission backstop has priority over a queued
             // one-segment repair derived from older ACK state.
-            self.flags.remove(Flags::NO_CONTROL_RETRY);
+            self.cancel_no_control_retry();
             self.local_rx_dup_acks = 0;
 
             // Octets in flight, measured before the cursor rewind below resets
@@ -3522,6 +3544,14 @@ impl<'a> Socket<'a> {
                 let rto = self.rtte.retransmission_timeout();
                 self.timer.set_for_retransmit(cx.now(), rto);
             }
+        }
+
+        // A timer may have transitioned the socket out of a retry-capable
+        // state. Do not let the send decision cached above survive that
+        // transition and borrow payload for a control-only segment.
+        if no_control_retry && !self.no_control_retry_eligible() {
+            no_control_retry = false;
+            want_send = egress_interest.seq_candidate && self.seq_to_transmit(cx);
         }
 
         #[cfg(feature = "socket-tcp-pause-synack")]
@@ -3836,8 +3866,7 @@ impl<'a> Socket<'a> {
             );
             self.rtte.on_retransmit();
             self.remote_last_seq = normal_tx_cursor;
-            self.flags.remove(Flags::NO_CONTROL_RETRY);
-            self.local_rx_dup_acks = 0;
+            self.cancel_no_control_retry();
         } else {
             self.remote_last_seq = new_remote_last_seq;
             // Restore invariant I1: the segment we just emitted may end exactly
@@ -3908,7 +3937,7 @@ impl<'a> Socket<'a> {
         } else if self.state == State::Closed {
             // Socket was aborted, we have an RST packet to transmit.
             PollAt::Now
-        } else if self.flags.contains(Flags::NO_CONTROL_RETRY) && self.remote_win_len > 0 {
+        } else if self.no_control_retry_eligible() {
             PollAt::Now
         } else if self.seq_to_transmit(cx) {
             // We have a data or flag packet to transmit.
@@ -8545,6 +8574,31 @@ mod test {
         s
     }
 
+    /// Enter active NoControl recovery and schedule its one-segment
+    /// duplicate-ACK rescue without dispatching it.
+    fn socket_with_pending_no_control_retry() -> TestSocket {
+        let mut s = socket_with_four_segments_in_flight();
+        s.set_congestion_control(CongestionControl::None);
+        let recovery_point = s.local_seq_next;
+        let una = s.local_seq_no;
+        s.set_recovery_point(Some(recovery_point));
+        s.local_rx_last_ack = Some(una);
+        s.local_rx_dup_acks = 0;
+
+        for t in [1200, 1201, 1202] {
+            send!(s, time t, TcpRepr {
+                seq_number: REMOTE_SEQ + 1,
+                ack_number: Some(una),
+                ..SEND_TEMPL
+            });
+        }
+
+        assert!(s.flags.contains(Flags::NO_CONTROL_RETRY));
+        assert_eq!(s.local_rx_dup_acks, DUP_ACK_THRESHOLD);
+        assert_eq!(s.remote_last_seq, s.local_seq_next);
+        s
+    }
+
     /// Three duplicate ACKs reporting segments 2 and 4 as SACKed.
     #[cfg(any(
         feature = "socket-tcp-cubic",
@@ -9264,6 +9318,115 @@ mod test {
     }
 
     #[test]
+    fn no_control_pending_retry_is_cancelled_before_abort_rst() {
+        let mut s = socket_with_pending_no_control_retry();
+        let snd_nxt = s.local_seq_next;
+
+        s.abort();
+
+        assert_eq!(s.state, State::Closed);
+        assert!(!s.flags.contains(Flags::NO_CONTROL_RETRY));
+        assert_eq!(s.local_rx_dup_acks, 0);
+        assert_eq!(s.remote_last_seq, snd_nxt);
+        assert_eq!(s.local_seq_next, snd_nxt);
+
+        recv!(s, time 1210, Ok(TcpRepr {
+            control:    TcpControl::Rst,
+            seq_number: snd_nxt,
+            ack_number: Some(REMOTE_SEQ + 1),
+            ..RECV_TEMPL
+        }), exact);
+        assert_eq!(s.remote_last_seq, snd_nxt);
+        assert_eq!(s.local_seq_next, snd_nxt);
+        assert_eq!(s.socket.poll_at(&mut s.cx), PollAt::Ingress);
+        recv_nothing!(s, time 1210);
+    }
+
+    #[test]
+    fn no_control_pending_retry_is_cancelled_before_inactivity_timeout_rst() {
+        let mut s = socket_with_pending_no_control_retry();
+        let snd_nxt = s.local_seq_next;
+        s.set_timeout(Some(Duration::from_millis(10)));
+
+        recv!(s, time 1212, Ok(TcpRepr {
+            control:    TcpControl::Rst,
+            seq_number: snd_nxt,
+            ack_number: Some(REMOTE_SEQ + 1),
+            ..RECV_TEMPL
+        }), exact);
+
+        assert_eq!(s.state, State::Closed);
+        assert!(!s.flags.contains(Flags::NO_CONTROL_RETRY));
+        assert_eq!(s.local_rx_dup_acks, 0);
+        assert_eq!(s.remote_last_seq, snd_nxt);
+        assert_eq!(s.local_seq_next, snd_nxt);
+        assert_eq!(s.socket.poll_at(&mut s.cx), PollAt::Ingress);
+        recv_nothing!(s, time 1212);
+    }
+
+    #[test]
+    fn no_control_pending_retry_is_cancelled_before_close_fin() {
+        let mut s = socket_with_pending_no_control_retry();
+        let snd_nxt = s.local_seq_next;
+
+        s.close();
+
+        assert_eq!(s.state, State::FinWait1);
+        assert!(!s.flags.contains(Flags::NO_CONTROL_RETRY));
+        assert_eq!(s.local_rx_dup_acks, 0);
+        assert_eq!(s.remote_last_seq, snd_nxt);
+        assert_eq!(s.local_seq_next, snd_nxt);
+
+        recv!(s, time 1210, Ok(TcpRepr {
+            control:    TcpControl::Fin,
+            seq_number: snd_nxt,
+            ack_number: Some(REMOTE_SEQ + 1),
+            ..RECV_TEMPL
+        }), exact);
+        assert_eq!(s.remote_last_seq, snd_nxt + 1);
+        assert_eq!(s.local_seq_next, snd_nxt + 1);
+        assert!(!s.flags.contains(Flags::NO_CONTROL_RETRY));
+        assert_eq!(s.local_rx_dup_acks, 0);
+        recv_nothing!(s, time 1211);
+    }
+
+    #[cfg(feature = "socket-tcp-reno")]
+    #[test]
+    fn no_control_pending_retry_is_cancelled_when_switching_to_reno() {
+        let mut s = socket_with_pending_no_control_retry();
+        let snd_nxt = s.local_seq_next;
+
+        s.set_congestion_control(CongestionControl::Reno);
+
+        assert_eq!(s.congestion_control(), CongestionControl::Reno);
+        assert!(s.congestion_controller.manages_window());
+        assert!(!s.flags.contains(Flags::NO_CONTROL_RETRY));
+        assert_eq!(s.local_rx_dup_acks, 0);
+        assert_eq!(s.remote_last_seq, snd_nxt);
+        assert_eq!(s.local_seq_next, snd_nxt);
+        assert!(!matches!(s.socket.poll_at(&mut s.cx), PollAt::Now));
+        recv_nothing!(s, time 1210);
+    }
+
+    #[cfg(feature = "socket-tcp-cubic")]
+    #[test]
+    fn no_control_pending_retry_is_cancelled_when_switching_to_cubic() {
+        let mut s = socket_with_pending_no_control_retry();
+        let snd_nxt = s.local_seq_next;
+
+        s.set_congestion_control(CongestionControl::Cubic);
+
+        assert_eq!(s.congestion_control(), CongestionControl::Cubic);
+        assert!(s.congestion_controller.manages_window());
+        assert!(!s.flags.contains(Flags::NO_CONTROL_RETRY));
+        assert_eq!(s.local_rx_dup_acks, 0);
+        assert_eq!(s.remote_last_seq, snd_nxt);
+        assert_eq!(s.local_seq_next, snd_nxt);
+        assert!(!matches!(s.socket.poll_at(&mut s.cx), PollAt::Now));
+        recv_nothing!(s, time 1210);
+    }
+
+    #[test]
     fn no_control_partial_ack_with_empty_scoreboard_before_rto_does_not_retry() {
         let mut s = socket_with_four_segments_in_flight();
         s.set_congestion_control(CongestionControl::None);
@@ -9432,6 +9595,47 @@ mod test {
         assert!(!s.flags.contains(Flags::NO_CONTROL_RETRY));
         assert_eq!(s.timer, restarted_timer);
         recv_nothing!(s, time 1202);
+    }
+
+    #[test]
+    fn no_control_rto_without_pending_retry_resets_duplicate_ack_triplet() {
+        let mut s = socket_with_four_segments_in_flight();
+        s.set_congestion_control(CongestionControl::None);
+        let una = s.local_seq_no;
+        let recovery_point = s.local_seq_next;
+        s.set_recovery_point(Some(recovery_point));
+        s.local_rx_last_ack = Some(una);
+        s.local_rx_dup_acks = DUP_ACK_THRESHOLD - 1;
+        s.timer = Timer::Retransmit {
+            expires_at: Instant::from_millis_const(2_000),
+        };
+
+        recv!(s, time 2000, Ok(TcpRepr {
+            seq_number: una,
+            ack_number: Some(REMOTE_SEQ + 1),
+            payload:    &b"xxxxxx"[..],
+            ..RECV_TEMPL
+        }));
+
+        assert!(!s.flags.contains(Flags::NO_CONTROL_RETRY));
+        assert_eq!(s.local_rx_dup_acks, 0);
+
+        // Model the quiescent point reached after the RTO walk. A fresh
+        // duplicate-ACK triplet must start at zero: the first two ACKs stay
+        // inert, and only the third authorizes the one-segment rescue.
+        s.remote_last_seq = recovery_point;
+        for (index, time) in [2_001, 2_002, 2_003].into_iter().enumerate() {
+            send!(s, time time, TcpRepr {
+                seq_number: REMOTE_SEQ + 1,
+                ack_number: Some(una),
+                ..SEND_TEMPL
+            });
+            assert_eq!(s.local_rx_dup_acks, (index + 1) as u8);
+            assert_eq!(
+                s.flags.contains(Flags::NO_CONTROL_RETRY),
+                index + 1 == DUP_ACK_THRESHOLD as usize
+            );
+        }
     }
 
     #[test]
