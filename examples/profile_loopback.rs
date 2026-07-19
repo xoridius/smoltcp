@@ -872,7 +872,7 @@ impl Lane {
         }
         let stats = LaneStats {
             max_pool_depth: pool.len(),
-            reserved_payload_bytes: depth * mtu,
+            reserved_payload_bytes: pool.iter().map(|packet| packet.buf.capacity()).sum(),
             reserved_packet_slot_bytes: (queue.capacity() + pool.capacity())
                 * core::mem::size_of::<Packet>(),
             ..LaneStats::default()
@@ -918,15 +918,18 @@ fn print_lane_stats(label: &str, stats: LaneStats) {
     println!("    max queue depth:      {}", stats.max_queue_depth);
     println!("    max pool depth:       {}", stats.max_pool_depth);
     println!(
-        "    reserved payload:     {} KiB",
+        "    reserved payload:     {} bytes ({} KiB)",
+        stats.reserved_payload_bytes,
         stats.reserved_payload_bytes / 1024
     );
     println!(
-        "    reserved pkt slots:   {} KiB",
+        "    reserved pkt slots:   {} bytes ({} KiB)",
+        stats.reserved_packet_slot_bytes,
         stats.reserved_packet_slot_bytes / 1024
     );
     println!(
-        "    reserved total:       {} KiB  (harness packet pool, not smoltcp socket memory)",
+        "    reserved total:       {} bytes ({} KiB)  (harness packet pool, not smoltcp socket memory)",
+        stats.reserved_total_bytes(),
         stats.reserved_total_bytes() / 1024
     );
 }
@@ -1472,10 +1475,11 @@ mod tests {
     fn lane_stats_reports_reserved_packet_memory() {
         let lane = Lane::new(1500, 3);
         let stats = lane.stats();
+        let payload_bytes = lane.pool.iter().map(|packet| packet.buf.capacity()).sum();
         let packet_slot_bytes =
             (lane.queue.capacity() + lane.pool.capacity()) * core::mem::size_of::<Packet>();
 
-        assert_eq!(stats.reserved_payload_bytes, 3 * 1500);
+        assert_eq!(stats.reserved_payload_bytes, payload_bytes);
         assert_eq!(stats.reserved_packet_slot_bytes, packet_slot_bytes);
         assert_eq!(
             stats.reserved_total_bytes(),
@@ -1786,7 +1790,6 @@ fn setup_paired_endpoints(
     mtu: usize,
     queue_depth: usize,
     offload: bool,
-    _mode: RunMode,
 ) -> (Endpoint<'static>, Endpoint<'static>, LaneRc, LaneRc) {
     let lane_a: LaneRc = Rc::new(RefCell::new(Lane::new(mtu, queue_depth)));
     let lane_b: LaneRc = Rc::new(RefCell::new(Lane::new(mtu, queue_depth)));
@@ -2144,7 +2147,7 @@ impl<'a> Report<'a> {
     }
 }
 
-fn shape_firehose(seconds: u64, offload: bool, _mode: RunMode) {
+fn shape_firehose(seconds: u64, offload: bool) {
     const BUF: usize = 256 * 1024;
     let lane_a: LaneRc = Rc::new(RefCell::new(Lane::new(1500, 256)));
     let lane_b: LaneRc = Rc::new(RefCell::new(Lane::new(1500, 256)));
@@ -2295,7 +2298,7 @@ fn shape_firehose(seconds: u64, offload: bool, _mode: RunMode) {
     print_lane_stats("firehose", collect_lane_stats(&[&lane_a, &lane_b]));
 }
 
-fn shape_small(seconds: u64, offload: bool, _mode: RunMode) {
+fn shape_small(seconds: u64, offload: bool) {
     // Force tiny segments by limiting the socket buffer; with a 1500 MTU the
     // client never fills more than a single small write at a time.
     const BUF: usize = 4 * 1024;
@@ -2410,7 +2413,7 @@ fn shape_small(seconds: u64, offload: bool, _mode: RunMode) {
     print_lane_stats("small", collect_lane_stats(&[&lane_a, &lane_b]));
 }
 
-fn shape_pingpong(seconds: u64, offload: bool, _mode: RunMode) {
+fn shape_pingpong(seconds: u64, offload: bool) {
     const BUF: usize = 16 * 1024;
     let lane_a: LaneRc = Rc::new(RefCell::new(Lane::new(1500, 256)));
     let lane_b: LaneRc = Rc::new(RefCell::new(Lane::new(1500, 256)));
@@ -2540,7 +2543,7 @@ fn shape_pingpong(seconds: u64, offload: bool, _mode: RunMode) {
     print_lane_stats("pingpong", collect_lane_stats(&[&lane_a, &lane_b]));
 }
 
-fn shape_udp_firehose(seconds: u64, offload: bool, _mode: RunMode) {
+fn shape_udp_firehose(seconds: u64, offload: bool) {
     // Pure packet forwarding — no flow control, no cwnd. This is the closest
     // analogue to a packet tunnel forwarding fully-formed packets between peers.
     const PAYLOAD: usize = 1400;
@@ -3621,37 +3624,23 @@ impl MultiTcpWorkload {
 }
 
 #[cfg(feature = "socket-tcp-dynamic-buffer")]
-fn shape_multi_tcp(
-    seconds: u64,
-    n_threads: usize,
-    flows_per_thread: usize,
-    offload: bool,
-    mode: RunMode,
-) {
+fn shape_multi_tcp(seconds: u64, n_threads: usize, flows_per_thread: usize, offload: bool) {
     shape_multi_tcp_impl(
         seconds,
         n_threads,
         flows_per_thread,
         offload,
-        mode,
         MultiTcpWorkload::Echo,
     );
 }
 
 #[cfg(feature = "socket-tcp-dynamic-buffer")]
-fn shape_multi_tcp_sink(
-    seconds: u64,
-    n_threads: usize,
-    flows_per_thread: usize,
-    offload: bool,
-    mode: RunMode,
-) {
+fn shape_multi_tcp_sink(seconds: u64, n_threads: usize, flows_per_thread: usize, offload: bool) {
     shape_multi_tcp_impl(
         seconds,
         n_threads,
         flows_per_thread,
         offload,
-        mode,
         MultiTcpWorkload::Sink,
     );
 }
@@ -3662,7 +3651,6 @@ fn shape_multi_tcp_impl(
     n_threads: usize,
     flows_per_thread: usize,
     offload: bool,
-    mode: RunMode,
     workload: MultiTcpWorkload,
 ) {
     use std::time::Instant as StdInstant;
@@ -3686,7 +3674,7 @@ fn shape_multi_tcp_impl(
             // clash if anything inspects them (they won't — lanes are isolated).
             let base = 10 + tid as u8;
             let (mut server, mut client, lane_a, lane_b) =
-                setup_paired_endpoints(base, 1500, qd, offload, mode);
+                setup_paired_endpoints(base, 1500, qd, offload);
 
             let mut srv_handles = Vec::with_capacity(flows_per_thread);
             let mut cli_handles = Vec::with_capacity(flows_per_thread);
@@ -3980,8 +3968,7 @@ fn shape_churn(seconds: u64, target_conn_per_sec: usize, offload: bool, mode: Ru
     let pool_bytes: usize = SLOTS * 2 * MAX_BUF as usize;
     let pool = tcp::MemoryPool::new(pool_bytes);
 
-    let (mut server, mut client, lane_a, lane_b) =
-        setup_paired_endpoints(10, 1500, qd, offload, mode);
+    let (mut server, mut client, lane_a, lane_b) = setup_paired_endpoints(10, 1500, qd, offload);
 
     // Pre-allocate a ring of socket handles. Each "churn slot" is a pair
     // we cycle through; once a pair is fully torn down we recycle the slot.
@@ -4161,8 +4148,7 @@ fn shape_idle_hot(seconds: u64, n_idle: usize, n_active: usize, offload: bool, m
         .max(2 * MAX_BUF as usize);
     let pool = tcp::MemoryPool::new(pool_bytes);
 
-    let (mut server, mut client, lane_a, lane_b) =
-        setup_paired_endpoints(10, 1500, qd, offload, mode);
+    let (mut server, mut client, lane_a, lane_b) = setup_paired_endpoints(10, 1500, qd, offload);
 
     // Active flows: open & connect.
     let mut srv_active: Vec<smoltcp::iface::SocketHandle> = Vec::with_capacity(n_active);
@@ -4443,14 +4429,14 @@ fn main() -> ExitCode {
     let offload = config.offload_checksums;
     let mode = config.mode;
     match config.shape {
-        TrafficShape::Firehose => shape_firehose(seconds, offload, mode),
-        TrafficShape::PingPong => shape_pingpong(seconds, offload, mode),
-        TrafficShape::Small => shape_small(seconds, offload, mode),
-        TrafficShape::Udp => shape_udp_firehose(seconds, offload, mode),
+        TrafficShape::Firehose => shape_firehose(seconds, offload),
+        TrafficShape::PingPong => shape_pingpong(seconds, offload),
+        TrafficShape::Small => shape_small(seconds, offload),
+        TrafficShape::Udp => shape_udp_firehose(seconds, offload),
         TrafficShape::All => {
-            shape_udp_firehose(seconds, offload, mode);
-            shape_small(seconds, offload, mode);
-            shape_pingpong(seconds, offload, mode);
+            shape_udp_firehose(seconds, offload);
+            shape_small(seconds, offload);
+            shape_pingpong(seconds, offload);
         }
         TrafficShape::ManyTcp { flows } => shape_many_tcp(seconds, flows.get(), offload, mode),
         TrafficShape::ManyTcpFair { flows } => {
@@ -4462,26 +4448,14 @@ fn main() -> ExitCode {
             threads,
             flows_per_thread,
         } => {
-            shape_multi_tcp(
-                seconds,
-                threads.get(),
-                flows_per_thread.get(),
-                offload,
-                mode,
-            );
+            shape_multi_tcp(seconds, threads.get(), flows_per_thread.get(), offload);
         }
         #[cfg(feature = "socket-tcp-dynamic-buffer")]
         TrafficShape::MultiTcpSink {
             threads,
             flows_per_thread,
         } => {
-            shape_multi_tcp_sink(
-                seconds,
-                threads.get(),
-                flows_per_thread.get(),
-                offload,
-                mode,
-            );
+            shape_multi_tcp_sink(seconds, threads.get(), flows_per_thread.get(), offload);
         }
         #[cfg(feature = "socket-tcp-dynamic-buffer")]
         TrafficShape::Churn { rate } => {
