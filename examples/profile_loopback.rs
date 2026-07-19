@@ -7,7 +7,7 @@
 //!   * throughput (Gbps app, Gbps wire, Mpps)
 //!   * per-poll latency: mean / p50 / p90 / p99 / max
 //!   * allocation count + bytes allocated (instrumented allocator)
-//!   * RSS / footprint (Linux `/proc`; macOS Mach task info)
+//!   * process memory (Linux RSS; Apple physical footprint)
 //!   * smoltcp Socket footprint of relevant sockets
 //!   * `cycles_estimate` per packet from a 2.4 GHz reference
 //!
@@ -51,6 +51,9 @@ use std::rc::Rc;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant as StdInstant;
+
+mod process_memory;
+use process_memory::{process_memory_bytes, process_memory_label, signed_delta};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum RunMode {
@@ -330,87 +333,6 @@ static A: CountingAlloc = CountingAlloc;
 #[cfg(feature = "dhat-heap")]
 #[global_allocator]
 static A: dhat::Alloc = dhat::Alloc;
-
-/// Read process resident memory in bytes.
-fn rss_bytes() -> u64 {
-    #[cfg(target_os = "linux")]
-    {
-        let s = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
-        for line in s.lines() {
-            if let Some(rest) = line.strip_prefix("VmRSS:") {
-                let kib: u64 = rest
-                    .split_whitespace()
-                    .next()
-                    .and_then(|n| n.parse().ok())
-                    .unwrap_or(0);
-                return kib * 1024;
-            }
-        }
-        0
-    }
-    #[cfg(target_os = "macos")]
-    {
-        macos_phys_footprint_bytes().unwrap_or(0)
-    }
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    {
-        0
-    }
-}
-
-#[cfg(target_os = "macos")]
-#[repr(C)]
-#[derive(Clone, Copy, Default)]
-struct TaskVmInfo {
-    virtual_size: u64,
-    region_count: i32,
-    page_size: i32,
-    resident_size: u64,
-    resident_size_peak: u64,
-    device: u64,
-    device_peak: u64,
-    internal: u64,
-    internal_peak: u64,
-    external: u64,
-    external_peak: u64,
-    reusable: u64,
-    reusable_peak: u64,
-    purgeable_volatile_pmap: u64,
-    purgeable_volatile_resident: u64,
-    purgeable_volatile_virtual: u64,
-    compressed: u64,
-    compressed_peak: u64,
-    compressed_lifetime: u64,
-    phys_footprint: u64,
-}
-
-#[cfg(target_os = "macos")]
-unsafe extern "C" {
-    fn mach_task_self() -> u32;
-    fn task_info(task: u32, flavor: i32, info: *mut i32, count: *mut u32) -> i32;
-}
-
-#[cfg(target_os = "macos")]
-fn macos_phys_footprint_bytes() -> Option<u64> {
-    const KERN_SUCCESS: i32 = 0;
-    const TASK_VM_INFO: i32 = 22;
-
-    let mut info = TaskVmInfo::default();
-    let mut count = (core::mem::size_of::<TaskVmInfo>() / core::mem::size_of::<i32>()) as u32;
-    let kr = unsafe {
-        task_info(
-            mach_task_self(),
-            TASK_VM_INFO,
-            (&mut info as *mut TaskVmInfo).cast::<i32>(),
-            &mut count,
-        )
-    };
-    if kr == KERN_SUCCESS {
-        Some(info.phys_footprint.max(info.resident_size))
-    } else {
-        None
-    }
-}
 
 /// Read voluntary + involuntary context-switch counts from
 /// /proc/self/status on Linux. macOS users should use Instruments System
@@ -801,11 +723,11 @@ fn validate_fairness(shape: &str, fairness: &Fairness) -> Result<(), String> {
     Ok(())
 }
 
-/// Periodic RSS sample. We collect (elapsed_ms, rss, alloc_bytes) snapshots
-/// during a many-flow run so we can see whether memory grows over time
+/// Periodic process-memory samples paired with allocator activity show
+/// whether memory grows over a many-flow run
 /// (= leak) or plateaus (= bounded, healthy).
 struct MemTrace {
-    samples: Vec<(u64, u64, u64)>, // (ms_since_start, rss_bytes, alloc_bytes_delta)
+    samples: Vec<(u64, u64, u64)>, // (ms_since_start, memory_bytes, alloc_bytes_delta)
     start_wall: StdInstant,
     start_alloc: u64,
 }
@@ -825,10 +747,10 @@ impl MemTrace {
         let elapsed = now.duration_since(self.start_wall).as_millis() as u64;
         let last = self.samples.last().map(|s| s.0).unwrap_or(0);
         if self.samples.is_empty() || elapsed >= last + interval_ms {
-            let rss = rss_bytes();
+            let memory = process_memory_bytes();
             let alloc_now = ALLOC_BYTES.load(Ordering::Relaxed);
             self.samples
-                .push((elapsed, rss, alloc_now - self.start_alloc));
+                .push((elapsed, memory, alloc_now - self.start_alloc));
         }
     }
     fn print(&self) {
@@ -838,24 +760,26 @@ impl MemTrace {
         println!();
         println!("  memory trace (snapshot every ~250 ms):");
         println!(
-            "    {:>8}   {:>10}   {:>10}",
-            "t_ms", "rss_bytes", "alloc_delta"
+            "    {:>8}   {:>22}   {:>10}",
+            "t_ms",
+            process_memory_label(),
+            "alloc_delta"
         );
-        for (t, rss, alloc) in &self.samples {
-            println!("    {:>8}   {:>10}   {:>10}", t, rss, alloc);
+        for (t, memory, alloc) in &self.samples {
+            println!("    {t:>8}   {memory:>22}   {alloc:>10}");
         }
-        // Detect monotonic RSS growth as a leak signal: if last RSS is
-        // > 1.5× the median RSS, flag it.
-        let mut rss_sorted: Vec<u64> = self.samples.iter().map(|s| s.1).collect();
-        rss_sorted.sort_unstable();
-        let median = rss_sorted[rss_sorted.len() / 2];
+        // Flag when the last sample is materially above the run's median.
+        let mut memory_sorted: Vec<u64> = self.samples.iter().map(|s| s.1).collect();
+        memory_sorted.sort_unstable();
+        let median = memory_sorted[memory_sorted.len() / 2];
         let last = self.samples.last().unwrap().1;
         let verdict = if last as f64 > 1.5 * median as f64 {
             "GROWTH (possible leak)"
         } else {
             "bounded"
         };
-        println!("    RSS verdict: {verdict} (last={last}, median={median})");
+        let metric = process_memory_label();
+        println!("    {metric} verdict: {verdict} (last={last}, median={median})");
     }
 }
 
@@ -1705,7 +1629,7 @@ mod tests {
             alloc_bytes: 1_000,
             alloc_count: 10,
             free_bytes: 400,
-            rss: 8_192,
+            process_memory: 8_192,
             ctxsw_voluntary: 0,
             ctxsw_nonvoluntary: 0,
             cpu_ns: 0,
@@ -1715,7 +1639,7 @@ mod tests {
             alloc_bytes: 1_600,
             alloc_count: 14,
             free_bytes: 850,
-            rss: 12_288,
+            process_memory: 12_288,
             ctxsw_voluntary: 0,
             ctxsw_nonvoluntary: 0,
             cpu_ns: 0,
@@ -1724,8 +1648,8 @@ mod tests {
 
         let report = MultiTcpMemoryReport::from_snapshots(before, after, 65_536, 0);
 
-        assert_eq!(report.rss_start, 8_192);
-        assert_eq!(report.rss_end, 12_288);
+        assert_eq!(report.process_memory_start, 8_192);
+        assert_eq!(report.process_memory_end, 12_288);
         assert_eq!(report.bytes_allocated, 600);
         assert_eq!(report.bytes_freed, 450);
         assert_eq!(report.net_heap_delta, 150);
@@ -2045,7 +1969,7 @@ fn add_tcp_socket_dyn(
     ep.sockets.add(socket)
 }
 
-/// Snapshot of the allocator counters + RSS at one instant. Take two and
+/// Snapshot of allocator counters and process memory at one instant. Take two and
 /// `diff()` them to see what happened during a phase.
 #[derive(Copy, Clone)]
 struct AllocSnap {
@@ -2053,7 +1977,7 @@ struct AllocSnap {
     alloc_count: u64,
     /// Live bytes = alloc_bytes - free_bytes, used to show net heap growth.
     free_bytes: u64,
-    rss: u64,
+    process_memory: u64,
     /// Voluntary context switches — process blocked or yielded.
     /// Hot-loop shapes should see this stay tiny.
     ctxsw_voluntary: u64,
@@ -2109,7 +2033,7 @@ impl AllocSnap {
             alloc_bytes: ALLOC_BYTES.load(Ordering::Relaxed),
             alloc_count: ALLOC_COUNT.load(Ordering::Relaxed),
             free_bytes: FREE_BYTES.load(Ordering::Relaxed),
-            rss: rss_bytes(),
+            process_memory: process_memory_bytes(),
             ctxsw_voluntary: cv,
             ctxsw_nonvoluntary: cn,
             cpu_ns: thread_cpu_ns(),
@@ -2119,12 +2043,12 @@ impl AllocSnap {
 }
 
 #[cfg(feature = "socket-tcp-dynamic-buffer")]
-fn alloc_counters_with_rss(rss: u64) -> AllocSnap {
+fn alloc_counters_with_memory(process_memory: u64) -> AllocSnap {
     AllocSnap {
         alloc_bytes: ALLOC_BYTES.load(Ordering::Relaxed),
         alloc_count: ALLOC_COUNT.load(Ordering::Relaxed),
         free_bytes: FREE_BYTES.load(Ordering::Relaxed),
-        rss,
+        process_memory,
         ctxsw_voluntary: 0,
         ctxsw_nonvoluntary: 0,
         cpu_ns: 0,
@@ -2134,8 +2058,8 @@ fn alloc_counters_with_rss(rss: u64) -> AllocSnap {
 
 #[cfg(feature = "socket-tcp-dynamic-buffer")]
 struct MultiTcpMemoryReport {
-    rss_start: u64,
-    rss_end: u64,
+    process_memory_start: u64,
+    process_memory_end: u64,
     bytes_allocated: u64,
     bytes_freed: u64,
     net_heap_delta: i128,
@@ -2155,8 +2079,8 @@ impl MultiTcpMemoryReport {
         let bytes_allocated = after.alloc_bytes.saturating_sub(before.alloc_bytes);
         let bytes_freed = after.free_bytes.saturating_sub(before.free_bytes);
         Self {
-            rss_start: before.rss,
-            rss_end: after.rss,
+            process_memory_start: before.process_memory,
+            process_memory_end: after.process_memory,
             bytes_allocated,
             bytes_freed,
             net_heap_delta: bytes_allocated as i128 - bytes_freed as i128,
@@ -2180,15 +2104,21 @@ impl MultiTcpMemoryReport {
         println!("    allocation count:      {}", self.allocation_count);
         println!();
         println!("  process memory:");
+        let metric = process_memory_label();
+        let delta = signed_delta(self.process_memory_end, self.process_memory_start);
         println!(
-            "    rss start:              {}  ({:.1} MiB)",
-            self.rss_start,
-            self.rss_start as f64 / (1024.0 * 1024.0)
+            "    {metric} start:         {}  ({:.1} MiB)",
+            self.process_memory_start,
+            self.process_memory_start as f64 / (1024.0 * 1024.0)
         );
         println!(
-            "    rss end:                {}  ({:.1} MiB)",
-            self.rss_end,
-            self.rss_end as f64 / (1024.0 * 1024.0)
+            "    {metric} end:           {}  ({:.1} MiB)",
+            self.process_memory_end,
+            self.process_memory_end as f64 / (1024.0 * 1024.0)
+        );
+        println!(
+            "    {metric} delta:         {delta:+}  ({:+.1} MiB)",
+            delta as f64 / (1024.0 * 1024.0)
         );
     }
 }
@@ -2302,15 +2232,24 @@ impl<'a> Report<'a> {
         println!("    allocation count:      {:>10}", alloc_count);
         println!();
         println!("  process memory:");
-        println!(
-            "    rss start:             {:>10}  ({:.1} MiB)",
-            self.alloc_before.rss,
-            self.alloc_before.rss as f64 / (1024.0 * 1024.0)
+        let metric = process_memory_label();
+        let memory_delta = signed_delta(
+            self.alloc_after.process_memory,
+            self.alloc_before.process_memory,
         );
         println!(
-            "    rss end:               {:>10}  ({:.1} MiB)",
-            self.alloc_after.rss,
-            self.alloc_after.rss as f64 / (1024.0 * 1024.0)
+            "    {metric} start:        {:>10}  ({:.1} MiB)",
+            self.alloc_before.process_memory,
+            self.alloc_before.process_memory as f64 / (1024.0 * 1024.0)
+        );
+        println!(
+            "    {metric} end:          {:>10}  ({:.1} MiB)",
+            self.alloc_after.process_memory,
+            self.alloc_after.process_memory as f64 / (1024.0 * 1024.0)
+        );
+        println!(
+            "    {metric} delta:        {memory_delta:>+10}  ({:+.1} MiB)",
+            memory_delta as f64 / (1024.0 * 1024.0)
         );
 
         let cv = self.alloc_after.ctxsw_voluntary - self.alloc_before.ctxsw_voluntary;
@@ -2885,7 +2824,7 @@ fn shape_udp_firehose(seconds: u64, offload: bool) -> Result<(), String> {
 /// its own (src_port, dst_port) tuple so the stack treats them independently.
 ///
 /// Verifies two properties:
-///   * memory stays bounded (RSS trace + net heap delta)
+///   * memory stays bounded (process-memory trace + net heap delta)
 ///   * no flow is starved (Jain index + per-flow percentiles)
 fn shape_many_tcp(seconds: u64, n: usize, offload: bool, mode: RunMode) -> Result<(), String> {
     // Per-flow buffer sized small enough to keep total memory reasonable
@@ -3074,7 +3013,7 @@ fn shape_many_tcp(seconds: u64, n: usize, offload: bool, mode: RunMode) -> Resul
 
         iters = iters.wrapping_add(1);
         // ~4x/sec — cheap enough not to perturb throughput, dense enough to
-        // see RSS trajectory.
+        // see the process-memory trajectory.
         if mode.sample_memory() {
             mem_trace.maybe_sample(250);
         }
@@ -4190,13 +4129,13 @@ fn shape_multi_tcp_impl(
     // Wait until every worker has connected its sockets, then bracket only the
     // steady phase. Workers remain blocked before start and after finish.
     workers.wait_ready();
-    let rss_start = rss_bytes();
-    let alloc_before = alloc_counters_with_rss(rss_start);
+    let memory_start = process_memory_bytes();
+    let alloc_before = alloc_counters_with_memory(memory_start);
     workers.start();
     let results = workers.wait_finished();
-    let mut alloc_after = alloc_counters_with_rss(0);
+    let mut alloc_after = alloc_counters_with_memory(0);
     let pool_active = pool.used();
-    alloc_after.rss = rss_bytes();
+    alloc_after.process_memory = process_memory_bytes();
     workers.release_and_join();
     let pool_after_teardown = pool.used();
     let memory_report = MultiTcpMemoryReport::from_snapshots(
@@ -4513,8 +4452,20 @@ fn shape_churn(
         pool_after_teardown / 1024
     );
     println!("  pool budget:            {} KiB", pool_bytes / 1024);
-    println!("  RSS start:              {} KiB", alloc_before.rss / 1024);
-    println!("  RSS end:                {} KiB", alloc_after.rss / 1024);
+    let metric = process_memory_label();
+    let memory_delta = signed_delta(alloc_after.process_memory, alloc_before.process_memory);
+    println!(
+        "  {metric} start:         {} KiB",
+        alloc_before.process_memory / 1024
+    );
+    println!(
+        "  {metric} end:           {} KiB",
+        alloc_after.process_memory / 1024
+    );
+    println!(
+        "  {metric} delta:         {:+.1} KiB",
+        memory_delta as f64 / 1024.0
+    );
     println!("  bytes allocated:        {alloc_bytes}");
     println!("  bytes freed:            {free_bytes}");
     println!(
@@ -4606,7 +4557,7 @@ fn shape_idle_hot(
         let _ = add_tcp_socket_dyn(&mut client, MAX_BUF, &pool);
     }
 
-    let rss_after_create = rss_bytes();
+    let memory_after_create = process_memory_bytes();
     let pool_after_create = pool.used();
 
     let clock_start = StdInstant::now();
@@ -4724,8 +4675,8 @@ fn shape_idle_hot(
     let elapsed = steady_start.elapsed().as_secs_f64();
     let mut alloc_after = AllocSnap::now();
     let pool_steady = pool.used();
-    let rss_end = rss_bytes();
-    alloc_after.rss = rss_end;
+    let memory_end = process_memory_bytes();
+    alloc_after.process_memory = memory_end;
     let lane_stats = collect_lane_stats(&[&lane_a, &lane_b]);
     drop(server);
     drop(client);
@@ -4736,9 +4687,6 @@ fn shape_idle_hot(
         pool_steady,
         pool_after_teardown,
     );
-    let harness_reserved = lane_stats.reserved_total_bytes() as u64;
-    let rss_after_create_less_harness = rss_after_create.saturating_sub(harness_reserved);
-    let rss_end_less_harness = rss_end.saturating_sub(harness_reserved);
     let gbps = (recvd as f64 * 8.0) / elapsed / 1e9;
 
     println!("\n========== shape: idle_hot ==========");
@@ -4750,10 +4698,10 @@ fn shape_idle_hot(
         MAX_BUF / 1024,
     );
     println!("  pool budget:            {} KiB", pool_bytes / 1024);
-    println!("  RSS post-create:        {} KiB", rss_after_create / 1024);
+    let metric = process_memory_label();
     println!(
-        "  RSS post-create less harness: {} KiB  (excludes harness packet pool)",
-        rss_after_create_less_harness / 1024
+        "  {metric} post-create:   {} KiB",
+        memory_after_create / 1024
     );
     println!(
         "  pool used post-create:  {} KiB  (expect ~0)",
@@ -4763,10 +4711,6 @@ fn shape_idle_hot(
     println!("  app sent / recvd:       {} / {}", sent, recvd);
     println!("  active throughput:      {gbps:.3} Gbps");
     memory_report.print();
-    println!(
-        "  RSS end less harness:   {} KiB  (excludes harness packet pool)",
-        rss_end_less_harness / 1024
-    );
     println!(
         "  expected: idle pool charge ~= 0 KiB; steady upper bound is {} KiB (active client/server sockets x rx/tx max)",
         expected_steady_bytes / 1024

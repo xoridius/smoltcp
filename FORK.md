@@ -127,9 +127,9 @@ notes, not as standing values in this file.
 | Did loss recovery or congestion control regress? | `./ci.sh netsim` for the stable NoControl sweep (§15), plus targeted TCP tests. Run `netsim_cubic`/`netsim_reno` manually when touching congestion controllers. |
 | What is tunnel-like throughput? | `./ci.sh profile-smoke` first, then `profile_loopback --mode bench udp <seconds>` and the same run with `offload` (§4.2, §4.3). |
 | Are many flows fair and bounded? | `./ci.sh profile-smoke` first, then `many_tcp_fair`, `many_tcp`, and `many_udp` (§4.2). |
-| Are dynamic TCP buffers safe for packet-tunnel memory budgets? | `./ci.sh ios-gate`, then `dynbuf_memcompare` plus `idle_hot` and `churn` (§4.2.1, §14.6). Subtract lane `reserved total`; it is harness memory. |
+| Are dynamic TCP buffers safe for packet-tunnel memory budgets? | `./ci.sh ios-gate`, then `dynbuf_memcompare` plus `idle_hot` and `churn` (§4.2.1, §14.6). Compare raw process memory; report lane `reserved total` separately. |
 | Where is CPU time going? | `perf record` / `perf report`, `cargo flamegraph`, or `samply` (§5). |
-| Where is heap growth coming from? | Built-in RSS/allocator fields first, then `heaptrack`, Massif, or `dhat-heap` (§6). |
+| Where is heap growth coming from? | Built-in process-memory/allocator fields first, then `heaptrack`, Massif, or `dhat-heap` (§6). |
 | Is parser hardening still covered? | `./ci.sh fuzz-build`, `./ci.sh fuzz-smoke`, and Miri proof lanes (§7). `fuzz-smoke` defaults to the broad `wire_parsers` target. |
 | Did socket footprints change? | `./ci.sh sizecheck` (§4.4). |
 | Did codegen for checksum paths change? | Cross-target assembly checks (§5.3). |
@@ -207,7 +207,7 @@ cargo run --release --example profile_loopback -- --mode bench <shape> <seconds>
 
 `--mode bench` is the default and prints steady-state benchmark metrics.
 `--mode trace` keeps the workload shape stable for Instruments capture and
-disables periodic RSS sampling so the trace is not polluted by polling.
+disables periodic process-memory sampling so the trace is not polluted by polling.
 
 Single-flow shapes (saturated one connection):
 
@@ -232,7 +232,7 @@ Sweep N to characterize scaling:
 ```
 for n in 50 100 200 500 1000 2000; do
   cargo run --release --example profile_loopback -- --mode bench many_tcp 5 $n 2>&1 | \
-    grep -E "throughput \(app|Jain|verdict|RSS verdict"
+    grep -E "throughput \(app|Jain|verdict"
 done
 ```
 
@@ -245,7 +245,7 @@ Report fields to read:
 | `poll-cycle latency: p50 / p99` | Tail latency of a single `Interface::poll` invocation. |
 | `Jain` | Per-flow fairness index. `many_tcp_fair` is the deterministic TCP fairness signal; `many_tcp` is a high-throughput stress shape. |
 | `verdict` | Single-line pass/fail style summary for fairness + starvation. |
-| `RSS verdict` | `bounded` or `GROWTH`. GROWTH means the median RSS over the run is materially smaller than the final RSS — leak suspect. |
+| `<metric> verdict` | `bounded` or `GROWTH`. GROWTH means the median process-memory sample is materially smaller than the final sample — leak suspect. |
 | `net heap delta` | Should be a small constant. Non-constant values mean smoltcp itself allocated on the hot path → bug. |
 | `lane stats` | Harness packet-pool health. Trace-mode performance claims require `fallback allocs == 0`. |
 
@@ -504,7 +504,7 @@ Useful for showing call chains at a glance in a single image.
 ### 6.1 Harness built-in metrics
 
 Every shape's report already includes the steady-state allocator state and
-RSS bookends:
+process-memory bookends:
 
 ```
 steady-state allocations:
@@ -514,27 +514,28 @@ steady-state allocations:
   allocation count:       N
 
 process memory:
-  rss start:              ...
-  rss end:                ...
+  <metric> start:         ...
+  <metric> end:           ...
+  <metric> delta:         ...
 ```
 
-`many_*`, `churn`, and `idle_hot` additionally print an RSS/footprint
-trajectory sampled periodically in `--mode bench`. On Linux this reads
-`/proc/self/status`; on macOS it uses Mach task VM info. `--mode trace`
-disables periodic samples so Instruments captures are cleaner.
+`many_*`, `churn`, and `idle_hot` additionally print a process-memory
+trajectory sampled periodically in `--mode bench`. `linux_rss` is the resident
+page count from `/proc/self/statm`; `apple_phys_footprint` is the exact
+`task_vm_info.phys_footprint` on Apple platforms. `--mode trace` disables
+periodic samples so Instruments captures are cleaner.
 
 Interpretation rules:
 
 - **`net heap delta` should be a small constant**. Anything else means
   smoltcp itself allocated on the hot path — a regression to investigate.
-- **`RSS verdict: bounded`** when final RSS stays within the harness threshold
+- **`<metric> verdict: bounded`** when the final sample stays within the harness threshold
   relative to the median. `GROWTH` flags a possible leak; drop into
   massif/heaptrack to confirm.
 - **`reserved total` in lane stats is profiling-harness memory**, not smoltcp
   socket memory. The paired in-memory link preallocates packet buffers so
-  trace-mode runs avoid allocator noise. For iOS packet-tunnel budget claims,
-  use the TCP pool readings and `dynbuf_memcompare`; the lane reservation is
-  a local transport artifact that `NEPacketTunnelFlow` does not allocate.
+  trace-mode runs avoid allocator noise. Report that virtual capacity beside
+  raw process memory; never subtract it from RSS or physical footprint.
 - **`bytes allocated` should closely track `bytes freed`** in steady state. A persistent imbalance
   means a buffer that isn't returning to its pool, a held reference, or a
   growing data structure.
@@ -549,7 +550,7 @@ valgrind --tool=massif --pages-as-heap=no \
 ms_print "$MASSIF_DIR/massif.out" | less
 ```
 
-Per-allocation-site heap trajectory. Use when the harness's `RSS verdict`
+Per-allocation-site heap trajectory. Use when the harness's process-memory verdict
 flags growth and you need to identify the source.
 
 ### 6.3 heaptrack
@@ -916,11 +917,11 @@ Use separate shapes for separate claims:
 
 | Shape | Evidence role | Gate |
 |---|---|---|
-| `many_tcp` | High-throughput TCP stress, memory growth, and starvation discovery. | zero-flow count must stay 0; RSS verdict should be `bounded`; Jain is diagnostic because the hot loop intentionally favors throughput. |
-| `many_tcp_fair` | Deterministic TCP fairness. One flow gets one bounded send/drain opportunity per round, and the start flow rotates each round. | Jain >= 0.95, zero-flow count 0, RSS bounded, lane fallback allocs 0 in trace mode. |
-| `many_udp` | UDP control shape without TCP flow-control or cwnd effects. | Jain should be 1.00 or close to it; RSS bounded. |
+| `many_tcp` | High-throughput TCP stress, memory growth, and starvation discovery. | zero-flow count must stay 0; the process-memory verdict should be `bounded`; Jain is diagnostic because the hot loop intentionally favors throughput. |
+| `many_tcp_fair` | Deterministic TCP fairness. One flow gets one bounded send/drain opportunity per round, and the start flow rotates each round. | Jain >= 0.95, zero-flow count 0, process memory bounded, lane fallback allocs 0 in trace mode. |
+| `many_udp` | UDP control shape without TCP flow-control or cwnd effects. | Jain should be 1.00 or close to it; process memory bounded. |
 
-RSS verdict other than `bounded` is a leak or unbounded buffer-growth signal.
+A process-memory verdict other than `bounded` is a leak or unbounded buffer-growth signal.
 Nonzero lane fallback allocations in trace mode mean the harness pool, not
 smoltcp, polluted the trace; do not quote that run as performance evidence.
 
@@ -1072,7 +1073,7 @@ where the cost comes from.
 
 Measure legacy and dynamic idle sockets as separate processes. The
 convenience `both` mode is useful for smoke checks, but allocator state
-from the first phase can affect the second phase's RSS and must not be
+from the first phase can affect the second phase's process memory and must not be
 used as evidence.
 
 ```
@@ -1158,7 +1159,7 @@ Rationale:
   headroom for wire/device buffers, the `Interface`, non-TCP sockets, the
   consumer's own state, and the Network-framework overhead the extension
   pays regardless. The pool bounds the worst case; idle flows cost ~0
-  (`dynbuf_memcompare`: ~0.5 KiB/flow RSS vs ~55 KiB/flow for legacy
+  (`dynbuf_memcompare`: ~0.5 KiB/flow process memory vs ~55 KiB/flow for legacy
   64 KiB fixed buffers).
 - **`rx_max = tx_max = 64 KiB`** keeps the window-scale shift at 1 and is
   enough to fill typical mobile BDPs (e.g. 100 Mbit/s × 5 ms ≈ 62 KB).
@@ -1179,10 +1180,9 @@ redundant in-order pass after the holes.
 
 Validate a configuration change with `./ci.sh ios-gate`, then run longer
 `dynbuf_memcompare`, `churn`, and `idle_hot` shapes (§4.2.1) when changing pool
-or buffer sizing. When using `profile_loopback` on macOS, keep the printed lane
-`reserved total` out of the iOS memory budget: it is the harness's preallocated
-paired-link packet pool, not memory that dynamic TCP sockets or
-`NEPacketTunnelFlow` consume in a packet tunnel extension.
+or buffer sizing. Keep the printed lane `reserved total` beside the raw process
+metric as a separate harness-capacity diagnostic; allocated capacity cannot be
+subtracted from resident memory or physical footprint.
 
 ## 15. SACK-based selective retransmission
 
