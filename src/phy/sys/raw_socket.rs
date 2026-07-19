@@ -86,7 +86,7 @@ impl RawSocketDesc {
         Ok(())
     }
 
-    pub fn recv(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+    pub fn recv<'a>(&mut self, buffer: &'a mut [u8]) -> io::Result<&'a [u8]> {
         unsafe {
             let len = libc::recv(
                 self.as_raw_fd(),
@@ -97,7 +97,7 @@ impl RawSocketDesc {
             if len == -1 {
                 return Err(io::Error::last_os_error());
             }
-            Ok(len as usize)
+            Ok(&buffer[..len as usize])
         }
     }
 

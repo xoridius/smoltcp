@@ -13,7 +13,7 @@ pub struct RawSocket {
     medium: Medium,
     lower: Rc<RefCell<sys::RawSocketDesc>>,
     mtu: usize,
-    rx_buffer_len: usize,
+    rx_buffer: Vec<u8>,
 }
 
 impl AsRawFd for RawSocket {
@@ -57,14 +57,14 @@ impl RawSocket {
             medium,
             lower: Rc::new(RefCell::new(lower)),
             mtu,
-            rx_buffer_len,
+            rx_buffer: vec![0; rx_buffer_len],
         })
     }
 }
 
 impl Device for RawSocket {
     type RxToken<'a>
-        = RxToken
+        = RxToken<'a>
     where
         Self: 'a;
     type TxToken<'a>
@@ -81,17 +81,17 @@ impl Device for RawSocket {
     }
 
     fn receive(&mut self, _timestamp: Instant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
-        let mut lower = self.lower.borrow_mut();
-        let mut buffer = vec![0; self.rx_buffer_len];
-        match lower.recv(&mut buffer[..]) {
-            Ok(size) => {
-                buffer.resize(size, 0);
-                let rx = RxToken { buffer };
-                let tx = TxToken {
+        let packet = {
+            let mut lower = self.lower.borrow_mut();
+            lower.recv(&mut self.rx_buffer[..])
+        };
+        match packet {
+            Ok(buffer) => Some((
+                RxToken { buffer },
+                TxToken {
                     lower: self.lower.clone(),
-                };
-                Some((rx, tx))
-            }
+                },
+            )),
             Err(err) if err.kind() == io::ErrorKind::WouldBlock => None,
             Err(err) => {
                 net_debug!("phy: rx failed: {}", err);
@@ -108,16 +108,16 @@ impl Device for RawSocket {
 }
 
 #[doc(hidden)]
-pub struct RxToken {
-    buffer: Vec<u8>,
+pub struct RxToken<'a> {
+    buffer: &'a [u8],
 }
 
-impl phy::RxToken for RxToken {
+impl phy::RxToken for RxToken<'_> {
     fn consume<R, F>(self, f: F) -> R
     where
         F: FnOnce(&[u8]) -> R,
     {
-        f(&self.buffer[..])
+        f(self.buffer)
     }
 }
 

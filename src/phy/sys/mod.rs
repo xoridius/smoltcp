@@ -10,6 +10,20 @@ mod imp;
 
 #[cfg(all(
     feature = "phy-raw_socket",
+    unix,
+    any(
+        test,
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_os = "freebsd"
+    )
+))]
+mod bpf_records;
+
+#[cfg(all(
+    feature = "phy-raw_socket",
     not(any(target_os = "linux", target_os = "android")),
     unix
 ))]

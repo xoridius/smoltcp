@@ -10,12 +10,13 @@ fn main() {
     let mut socket = RawSocket::new(ifname.as_ref(), smoltcp::phy::Medium::Ethernet).unwrap();
     loop {
         phy_wait(socket.as_raw_fd(), None).unwrap();
-        let (rx_token, _) = socket.receive(Instant::now()).unwrap();
-        rx_token.consume(|buffer| {
-            println!(
-                "{}",
-                PrettyPrinter::<EthernetFrame<&[u8]>>::new("", &buffer)
-            );
-        })
+        while let Some((rx_token, _)) = socket.receive(Instant::now()) {
+            rx_token.consume(|buffer| {
+                println!(
+                    "{}",
+                    PrettyPrinter::<EthernetFrame<&[u8]>>::new("", &buffer)
+                );
+            })
+        }
     }
 }
