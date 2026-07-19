@@ -403,10 +403,12 @@ pub struct PrefixInformation {
 }
 
 impl PrefixInformation {
-    /// Validates the prefix information option against check a, b, c in
-    /// <https://www.rfc-editor.org/rfc/rfc4862#section-5.5.3>
+    /// Validates the prefix length against
+    /// <https://www.rfc-editor.org/rfc/rfc4861#section-4.6.2> and checks a, b, c in
+    /// <https://www.rfc-editor.org/rfc/rfc4862#section-5.5.3>.
     pub fn is_valid_prefix_info(&self) -> bool {
-        self.flags.contains(PrefixInfoFlags::ADDRCONF)
+        self.prefix_len <= 128
+            && self.flags.contains(PrefixInfoFlags::ADDRCONF)
             && !self.prefix.is_link_local()
             && self.preferred_lifetime <= self.valid_lifetime
     }
@@ -767,6 +769,26 @@ mod test {
         let mut opt = NdiscOption::new_unchecked(&mut bytes);
         repr.emit(&mut opt);
         assert_eq!(&opt.into_inner()[..], &PREFIX_OPT_BYTES[..]);
+    }
+
+    fn prefix_information(prefix_len: u8) -> PrefixInformation {
+        PrefixInformation {
+            prefix_len,
+            flags: PrefixInfoFlags::ADDRCONF,
+            valid_lifetime: Duration::from_secs(600),
+            preferred_lifetime: Duration::from_secs(300),
+            prefix: Ipv6Address::new(0x2001, 0xdb8, 0x3, 0, 0, 0, 0, 0),
+        }
+    }
+
+    #[test]
+    fn test_prefix_information_rejects_prefix_len_129() {
+        assert!(!prefix_information(129).is_valid_prefix_info());
+    }
+
+    #[test]
+    fn test_prefix_information_rejects_prefix_len_255() {
+        assert!(!prefix_information(255).is_valid_prefix_info());
     }
 
     #[test]
