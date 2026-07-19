@@ -77,10 +77,6 @@ impl RunMode {
     fn sample_memory(self) -> bool {
         matches!(self, Self::Bench)
     }
-
-    fn strict_lane_pool(self) -> bool {
-        matches!(self, Self::Trace)
-    }
 }
 
 /// Tracks every allocation routed through the global allocator. We only count
@@ -592,8 +588,8 @@ impl Packet {
 
 #[derive(Clone, Copy, Debug, Default)]
 struct LaneStats {
-    fallback_allocs: u64,
-    pool_misses: u64,
+    tx_backpressure: u64,
+    rx_backpressure: u64,
     max_queue_depth: usize,
     max_pool_depth: usize,
     reserved_payload_bytes: usize,
@@ -602,8 +598,8 @@ struct LaneStats {
 
 impl LaneStats {
     fn merge(&mut self, other: Self) {
-        self.fallback_allocs += other.fallback_allocs;
-        self.pool_misses += other.pool_misses;
+        self.tx_backpressure += other.tx_backpressure;
+        self.rx_backpressure += other.rx_backpressure;
         self.max_queue_depth = self.max_queue_depth.max(other.max_queue_depth);
         self.max_pool_depth = self.max_pool_depth.max(other.max_pool_depth);
         self.reserved_payload_bytes += other.reserved_payload_bytes;
@@ -623,43 +619,27 @@ struct Lane {
     queue: VecDeque<Packet>,
     pool: Vec<Packet>,
     stats: LaneStats,
-    strict_pool: bool,
 }
 
 impl Lane {
-    fn new(mtu: usize, depth: usize, mode: RunMode) -> Self {
+    fn new(mtu: usize, depth: usize) -> Self {
+        let queue = VecDeque::with_capacity(depth);
         let mut pool = Vec::with_capacity(depth);
         for _ in 0..depth {
             pool.push(Packet::with_capacity(mtu));
         }
         let stats = LaneStats {
             max_pool_depth: pool.len(),
+            reserved_payload_bytes: depth * mtu,
+            reserved_packet_slot_bytes: (queue.capacity() + pool.capacity())
+                * core::mem::size_of::<Packet>(),
             ..LaneStats::default()
         };
-        Self {
-            queue: VecDeque::with_capacity(depth),
-            pool,
-            stats,
-            strict_pool: mode.strict_lane_pool(),
-        }
+        Self { queue, pool, stats }
     }
 
-    /// Borrow an empty buffer (allocating only if the pool runs dry).
-    fn take_pkt(&mut self, mtu: usize) -> Packet {
-        if let Some(pkt) = self.pool.pop() {
-            return pkt;
-        }
-
-        self.stats.pool_misses += 1;
-        if self.strict_pool {
-            panic!(
-                "trace-mode packet pool exhausted: mtu={mtu}, queued={}, pool_misses={}",
-                self.queue.len(),
-                self.stats.pool_misses
-            );
-        }
-        self.stats.fallback_allocs += 1;
-        Packet::with_capacity(mtu)
+    fn try_take_packet(&mut self) -> Option<Packet> {
+        self.pool.pop()
     }
 
     fn queue_pkt(&mut self, pkt: Packet) {
@@ -674,20 +654,7 @@ impl Lane {
     }
 
     fn stats(&self) -> LaneStats {
-        let reserved_payload_bytes = self
-            .queue
-            .iter()
-            .chain(self.pool.iter())
-            .map(|pkt| pkt.buf.capacity())
-            .sum();
-        let reserved_packet_slot_bytes =
-            (self.queue.capacity() + self.pool.capacity()) * core::mem::size_of::<Packet>();
-
-        LaneStats {
-            reserved_payload_bytes,
-            reserved_packet_slot_bytes,
-            ..self.stats
-        }
+        self.stats
     }
 }
 
@@ -704,8 +671,8 @@ fn collect_lane_stats(lanes: &[&LaneRc]) -> LaneStats {
 fn print_lane_stats(label: &str, stats: LaneStats) {
     println!();
     println!("  lane stats ({label}):");
-    println!("    fallback allocs:      {}", stats.fallback_allocs);
-    println!("    pool misses:          {}", stats.pool_misses);
+    println!("    TX backpressure:      {}", stats.tx_backpressure);
+    println!("    RX backpressure:      {}", stats.rx_backpressure);
     println!("    max queue depth:      {}", stats.max_queue_depth);
     println!("    max pool depth:       {}", stats.max_pool_depth);
     println!(
@@ -726,9 +693,173 @@ fn print_lane_stats(label: &str, stats: LaneStats) {
 mod tests {
     use super::*;
 
+    fn lane(mtu: usize, depth: usize) -> LaneRc {
+        Rc::new(RefCell::new(Lane::new(mtu, depth)))
+    }
+
+    fn queue_packet(lane: &LaneRc, bytes: &[u8]) {
+        let mut lane = lane.borrow_mut();
+        let mut packet = lane
+            .try_take_packet()
+            .expect("packet pool exhausted in test setup");
+        packet.buf[..bytes.len()].copy_from_slice(bytes);
+        packet.len = bytes.len();
+        lane.queue_pkt(packet);
+    }
+
+    fn device(tx: &LaneRc, rx: &LaneRc, mtu: usize) -> PairedDevice {
+        PairedDevice::new(tx.clone(), rx.clone(), mtu, false)
+    }
+
+    #[test]
+    fn transmit_reserves_packet_before_returning_token() {
+        let tx = lane(64, 2);
+        let rx = lane(64, 2);
+        let mut device = device(&tx, &rx, 64);
+
+        let token = device.transmit(Instant::from_millis(0)).unwrap();
+
+        assert_eq!(tx.borrow().pool.len(), 1);
+        drop(token);
+    }
+
+    #[test]
+    fn standalone_transmit_preserves_last_response_credit() {
+        let tx = lane(64, 2);
+        let rx = lane(64, 2);
+        queue_packet(&tx, &[1]);
+        let mut device = device(&tx, &rx, 64);
+
+        assert!(device.transmit(Instant::from_millis(0)).is_none());
+        assert_eq!(tx.borrow().pool.len(), 1);
+        assert_eq!(tx.borrow().queue.len(), 1);
+        assert_eq!(tx.borrow().stats.tx_backpressure, 1);
+    }
+
+    #[test]
+    fn unused_transmit_token_refunds_reservation() {
+        let tx = lane(64, 2);
+        let rx = lane(64, 2);
+        let mut device = device(&tx, &rx, 64);
+
+        let token = device.transmit(Instant::from_millis(0)).unwrap();
+        assert_eq!(tx.borrow().pool.len(), 1);
+
+        drop(token);
+        assert_eq!(tx.borrow().pool.len(), 2);
+        assert!(tx.borrow().queue.is_empty());
+    }
+
+    #[test]
+    fn transmit_consume_reuses_reserved_packet_and_queue_storage() {
+        let tx = lane(64, 2);
+        let rx = lane(64, 2);
+        let mut device = device(&tx, &rx, 64);
+        let token = device.transmit(Instant::from_millis(0)).unwrap();
+        let packet_buffer = token.packet.as_ref().unwrap().buf.as_ptr();
+        let packet_capacity = token.packet.as_ref().unwrap().buf.capacity();
+        let queue_capacity = tx.borrow().queue.capacity();
+
+        phy::TxToken::consume(token, 4, |buffer| buffer.copy_from_slice(&[1, 2, 3, 4]));
+
+        let tx = tx.borrow();
+        assert_eq!(tx.queue.capacity(), queue_capacity);
+        assert_eq!(tx.queue[0].buf.as_ptr(), packet_buffer);
+        assert_eq!(tx.queue[0].buf.capacity(), packet_capacity);
+        assert_eq!(&tx.queue[0].buf[..tx.queue[0].len], &[1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn paired_receive_backpressure_leaves_rx_queued() {
+        let tx = lane(64, 1);
+        let rx = lane(64, 1);
+        queue_packet(&rx, &[1, 2, 3]);
+        let reserved = tx.borrow_mut().try_take_packet().unwrap();
+        let mut device = device(&tx, &rx, 64);
+
+        assert!(device.receive(Instant::from_millis(0)).is_none());
+        assert_eq!(rx.borrow().queue.len(), 1);
+        assert_eq!(tx.borrow().stats.rx_backpressure, 1);
+
+        tx.borrow_mut().return_pkt(reserved);
+    }
+
+    #[test]
+    fn paired_receive_and_unused_tx_refund_both_packets() {
+        let tx = lane(64, 1);
+        let rx = lane(64, 1);
+        queue_packet(&rx, &[1, 2, 3]);
+        let mut device = device(&tx, &rx, 64);
+
+        let (rx_token, tx_token) = device.receive(Instant::from_millis(0)).unwrap();
+        assert!(tx.borrow().pool.is_empty());
+        assert!(rx.borrow().queue.is_empty());
+
+        phy::RxToken::consume(rx_token, |bytes| assert_eq!(bytes, [1, 2, 3]));
+        drop(tx_token);
+
+        assert_eq!(tx.borrow().pool.len(), 1);
+        assert_eq!(rx.borrow().pool.len(), 1);
+    }
+
+    #[test]
+    fn oversized_transmit_panics_and_refunds_reservation() {
+        use std::panic::{AssertUnwindSafe, catch_unwind};
+
+        let tx = lane(64, 2);
+        let rx = lane(64, 2);
+        let mut device = device(&tx, &rx, 64);
+        let token = device.transmit(Instant::from_millis(0)).unwrap();
+
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            phy::TxToken::consume(token, 65, |_| ());
+        }));
+
+        assert!(result.is_err());
+        assert_eq!(tx.borrow().pool.len(), 2);
+        assert!(tx.borrow().queue.is_empty());
+    }
+
+    #[test]
+    fn packet_ownership_is_conserved_across_live_token_and_queue() {
+        let tx = lane(64, 2);
+        let rx = lane(64, 2);
+        let mut device = device(&tx, &rx, 64);
+
+        let token = device.transmit(Instant::from_millis(0)).unwrap();
+        assert_eq!(tx.borrow().pool.len() + tx.borrow().queue.len() + 1, 2);
+
+        phy::TxToken::consume(token, 1, |buffer| buffer[0] = 1);
+        assert_eq!(tx.borrow().pool.len() + tx.borrow().queue.len(), 2);
+    }
+
+    #[test]
+    fn symmetrically_saturated_lanes_make_response_progress() {
+        let lane_a = lane(64, 2);
+        let lane_b = lane(64, 2);
+        queue_packet(&lane_a, &[1]);
+        queue_packet(&lane_b, &[2]);
+        let mut device_a = device(&lane_a, &lane_b, 64);
+        let mut device_b = device(&lane_b, &lane_a, 64);
+
+        assert!(device_a.transmit(Instant::from_millis(0)).is_none());
+        assert!(device_b.transmit(Instant::from_millis(0)).is_none());
+
+        let (rx_a, tx_a) = device_a.receive(Instant::from_millis(0)).unwrap();
+        assert_eq!(phy::RxToken::consume(rx_a, |bytes| bytes[0]), 2);
+        phy::TxToken::consume(tx_a, 1, |buffer| buffer[0] = 3);
+
+        let (rx_b, tx_b) = device_b.receive(Instant::from_millis(0)).unwrap();
+        assert_eq!(phy::RxToken::consume(rx_b, |bytes| bytes[0]), 1);
+        drop(tx_b);
+
+        assert_eq!(lane_a.borrow().pool.len(), 1);
+        assert_eq!(lane_b.borrow().pool.len(), 2);
+    }
+
     #[test]
     fn lane_stats_reports_reserved_packet_memory() {
-        let lane = Lane::new(1500, 3, RunMode::Bench);
+        let lane = Lane::new(1500, 3);
         let stats = lane.stats();
         let packet_slot_bytes =
             (lane.queue.capacity() + lane.pool.capacity()) * core::mem::size_of::<Packet>();
@@ -739,8 +870,8 @@ mod tests {
             stats.reserved_total_bytes(),
             stats.reserved_payload_bytes + stats.reserved_packet_slot_bytes
         );
-        assert_eq!(stats.fallback_allocs, 0);
-        assert_eq!(stats.pool_misses, 0);
+        assert_eq!(stats.tx_backpressure, 0);
+        assert_eq!(stats.rx_backpressure, 0);
     }
 
     #[cfg(feature = "socket-tcp-dynamic-buffer")]
@@ -885,14 +1016,34 @@ impl Device for PairedDevice {
     }
 
     fn receive(&mut self, _ts: Instant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
-        let pkt = self.rx.borrow_mut().queue.pop_front()?;
+        if self.rx.borrow().queue.is_empty() {
+            return None;
+        }
+
+        let tx_packet = {
+            let mut tx = self.tx.borrow_mut();
+            match tx.try_take_packet() {
+                Some(packet) => packet,
+                None => {
+                    tx.stats.rx_backpressure += 1;
+                    return None;
+                }
+            }
+        };
+        let rx_packet = self
+            .rx
+            .borrow_mut()
+            .queue
+            .pop_front()
+            .expect("RX queue changed while reserving paired TX packet");
         Some((
             PairedRx {
-                pkt: Some(pkt),
+                pkt: Some(rx_packet),
                 rx: &self.rx,
             },
             PairedTx {
                 tx: &self.tx,
+                packet: Some(tx_packet),
                 mtu: self.mtu,
                 tx_bytes: &mut self.tx_bytes,
                 tx_packets: &mut self.tx_packets,
@@ -901,8 +1052,18 @@ impl Device for PairedDevice {
     }
 
     fn transmit(&mut self, _ts: Instant) -> Option<Self::TxToken<'_>> {
+        let packet = {
+            let mut tx = self.tx.borrow_mut();
+            if tx.pool.len() <= 1 {
+                tx.stats.tx_backpressure += 1;
+                return None;
+            }
+            tx.try_take_packet()
+                .expect("standalone TX credit disappeared after availability check")
+        };
         Some(PairedTx {
             tx: &self.tx,
+            packet: Some(packet),
             mtu: self.mtu,
             tx_bytes: &mut self.tx_bytes,
             tx_packets: &mut self.tx_packets,
@@ -920,36 +1081,60 @@ impl<'a> phy::RxToken for PairedRx<'a> {
     where
         F: FnOnce(&[u8]) -> R,
     {
-        let pkt = self.pkt.take().unwrap();
-        let r = f(&pkt.buf[..pkt.len]);
-        self.rx.borrow_mut().return_pkt(pkt);
-        r
+        let result = {
+            let packet = self.pkt.as_ref().unwrap();
+            f(&packet.buf[..packet.len])
+        };
+        self.rx.borrow_mut().return_pkt(self.pkt.take().unwrap());
+        result
+    }
+}
+
+impl Drop for PairedRx<'_> {
+    fn drop(&mut self) {
+        if let Some(packet) = self.pkt.take() {
+            self.rx.borrow_mut().return_pkt(packet);
+        }
     }
 }
 
 struct PairedTx<'a> {
     tx: &'a LaneRc,
+    packet: Option<Packet>,
     mtu: usize,
     tx_bytes: &'a mut u64,
     tx_packets: &'a mut u64,
 }
 
 impl<'a> phy::TxToken for PairedTx<'a> {
-    fn consume<R, F>(self, len: usize, f: F) -> R
+    fn consume<R, F>(mut self, len: usize, f: F) -> R
     where
         F: FnOnce(&mut [u8]) -> R,
     {
-        let mut pkt = self.tx.borrow_mut().take_pkt(self.mtu);
-        // Grow on-demand only if a caller asks for more than MTU (shouldn't happen).
-        if pkt.buf.len() < len {
-            pkt.buf.resize(len, 0);
-        }
-        let r = f(&mut pkt.buf[..len]);
-        pkt.len = len;
+        assert!(
+            len <= self.mtu,
+            "transmit length {len} exceeds MTU {}",
+            self.mtu
+        );
+        let result = {
+            let packet = self.packet.as_mut().unwrap();
+            f(&mut packet.buf[..len])
+        };
+        let mut tx = self.tx.borrow_mut();
+        let mut packet = self.packet.take().unwrap();
+        packet.len = len;
         *self.tx_bytes += len as u64;
         *self.tx_packets += 1;
-        self.tx.borrow_mut().queue_pkt(pkt);
-        r
+        tx.queue_pkt(packet);
+        result
+    }
+}
+
+impl Drop for PairedTx<'_> {
+    fn drop(&mut self) {
+        if let Some(packet) = self.packet.take() {
+            self.tx.borrow_mut().return_pkt(packet);
+        }
     }
 }
 
@@ -982,18 +1167,18 @@ fn make_endpoint(
 
 /// Build a back-to-back server/client `Endpoint` pair joined by two
 /// `Lane`s, with the server at `base.0.0.1` and the client at
-/// `base.0.0.2`. The returned lane handles let callers report whether the
-/// harness packet pool had to allocate outside its prebuilt buffers.
+/// `base.0.0.2`. The returned lane handles let callers report packet-pool
+/// backpressure and fixed reservation size.
 #[cfg_attr(not(feature = "socket-tcp-dynamic-buffer"), allow(dead_code))]
 fn setup_paired_endpoints(
     base: u8,
     mtu: usize,
     queue_depth: usize,
     offload: bool,
-    mode: RunMode,
+    _mode: RunMode,
 ) -> (Endpoint<'static>, Endpoint<'static>, LaneRc, LaneRc) {
-    let lane_a: LaneRc = Rc::new(RefCell::new(Lane::new(mtu, queue_depth, mode)));
-    let lane_b: LaneRc = Rc::new(RefCell::new(Lane::new(mtu, queue_depth, mode)));
+    let lane_a: LaneRc = Rc::new(RefCell::new(Lane::new(mtu, queue_depth)));
+    let lane_b: LaneRc = Rc::new(RefCell::new(Lane::new(mtu, queue_depth)));
     let server = make_endpoint(
         IpAddress::v4(base, 0, 0, 1),
         mtu,
@@ -1348,10 +1533,10 @@ impl<'a> Report<'a> {
     }
 }
 
-fn shape_firehose(seconds: u64, offload: bool, mode: RunMode) {
+fn shape_firehose(seconds: u64, offload: bool, _mode: RunMode) {
     const BUF: usize = 256 * 1024;
-    let lane_a: LaneRc = Rc::new(RefCell::new(Lane::new(1500, 256, mode)));
-    let lane_b: LaneRc = Rc::new(RefCell::new(Lane::new(1500, 256, mode)));
+    let lane_a: LaneRc = Rc::new(RefCell::new(Lane::new(1500, 256)));
+    let lane_b: LaneRc = Rc::new(RefCell::new(Lane::new(1500, 256)));
 
     let mut server = make_endpoint(
         IpAddress::v4(10, 0, 0, 1),
@@ -1499,12 +1684,12 @@ fn shape_firehose(seconds: u64, offload: bool, mode: RunMode) {
     print_lane_stats("firehose", collect_lane_stats(&[&lane_a, &lane_b]));
 }
 
-fn shape_small(seconds: u64, offload: bool, mode: RunMode) {
+fn shape_small(seconds: u64, offload: bool, _mode: RunMode) {
     // Force tiny segments by limiting the socket buffer; with a 1500 MTU the
     // client never fills more than a single small write at a time.
     const BUF: usize = 4 * 1024;
-    let lane_a: LaneRc = Rc::new(RefCell::new(Lane::new(1500, 256, mode)));
-    let lane_b: LaneRc = Rc::new(RefCell::new(Lane::new(1500, 256, mode)));
+    let lane_a: LaneRc = Rc::new(RefCell::new(Lane::new(1500, 256)));
+    let lane_b: LaneRc = Rc::new(RefCell::new(Lane::new(1500, 256)));
 
     let mut server = make_endpoint(
         IpAddress::v4(10, 0, 0, 1),
@@ -1614,10 +1799,10 @@ fn shape_small(seconds: u64, offload: bool, mode: RunMode) {
     print_lane_stats("small", collect_lane_stats(&[&lane_a, &lane_b]));
 }
 
-fn shape_pingpong(seconds: u64, offload: bool, mode: RunMode) {
+fn shape_pingpong(seconds: u64, offload: bool, _mode: RunMode) {
     const BUF: usize = 16 * 1024;
-    let lane_a: LaneRc = Rc::new(RefCell::new(Lane::new(1500, 256, mode)));
-    let lane_b: LaneRc = Rc::new(RefCell::new(Lane::new(1500, 256, mode)));
+    let lane_a: LaneRc = Rc::new(RefCell::new(Lane::new(1500, 256)));
+    let lane_b: LaneRc = Rc::new(RefCell::new(Lane::new(1500, 256)));
 
     let mut server = make_endpoint(
         IpAddress::v4(10, 0, 0, 1),
@@ -1744,13 +1929,13 @@ fn shape_pingpong(seconds: u64, offload: bool, mode: RunMode) {
     print_lane_stats("pingpong", collect_lane_stats(&[&lane_a, &lane_b]));
 }
 
-fn shape_udp_firehose(seconds: u64, offload: bool, mode: RunMode) {
+fn shape_udp_firehose(seconds: u64, offload: bool, _mode: RunMode) {
     // Pure packet forwarding — no flow control, no cwnd. This is the closest
     // analogue to a packet tunnel forwarding fully-formed packets between peers.
     const PAYLOAD: usize = 1400;
     const META_SLOTS: usize = 256;
-    let lane_a: LaneRc = Rc::new(RefCell::new(Lane::new(1500, 256, mode)));
-    let lane_b: LaneRc = Rc::new(RefCell::new(Lane::new(1500, 256, mode)));
+    let lane_a: LaneRc = Rc::new(RefCell::new(Lane::new(1500, 256)));
+    let lane_b: LaneRc = Rc::new(RefCell::new(Lane::new(1500, 256)));
 
     let mut server = make_endpoint(
         IpAddress::v4(10, 0, 0, 1),
@@ -1875,8 +2060,8 @@ fn shape_many_tcp(seconds: u64, n: usize, offload: bool, mode: RunMode) {
     // iteration order get systematically starved.
     let qd = (n * 16).clamp(1024, 16384);
 
-    let lane_a: LaneRc = Rc::new(RefCell::new(Lane::new(1500, qd, mode)));
-    let lane_b: LaneRc = Rc::new(RefCell::new(Lane::new(1500, qd, mode)));
+    let lane_a: LaneRc = Rc::new(RefCell::new(Lane::new(1500, qd)));
+    let lane_b: LaneRc = Rc::new(RefCell::new(Lane::new(1500, qd)));
 
     let mut server = make_endpoint(
         IpAddress::v4(10, 0, 0, 1),
@@ -2143,8 +2328,8 @@ fn shape_many_tcp_fair(seconds: u64, n: usize, offload: bool, mode: RunMode) {
     const PAYLOAD: usize = 256;
     let qd = (n * 16).clamp(1024, 16384);
 
-    let lane_a: LaneRc = Rc::new(RefCell::new(Lane::new(1500, qd, mode)));
-    let lane_b: LaneRc = Rc::new(RefCell::new(Lane::new(1500, qd, mode)));
+    let lane_a: LaneRc = Rc::new(RefCell::new(Lane::new(1500, qd)));
+    let lane_b: LaneRc = Rc::new(RefCell::new(Lane::new(1500, qd)));
 
     let mut server = make_endpoint(
         IpAddress::v4(10, 0, 0, 1),
@@ -2383,8 +2568,8 @@ fn shape_many_udp(seconds: u64, n: usize, offload: bool, mode: RunMode) {
     const META_SLOTS: usize = 32;
     let qd = (n * 4).clamp(256, 8192);
 
-    let lane_a: LaneRc = Rc::new(RefCell::new(Lane::new(1500, qd, mode)));
-    let lane_b: LaneRc = Rc::new(RefCell::new(Lane::new(1500, qd, mode)));
+    let lane_a: LaneRc = Rc::new(RefCell::new(Lane::new(1500, qd)));
+    let lane_b: LaneRc = Rc::new(RefCell::new(Lane::new(1500, qd)));
 
     let mut server = make_endpoint(
         IpAddress::v4(10, 0, 0, 1),
