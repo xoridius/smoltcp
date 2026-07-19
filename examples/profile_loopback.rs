@@ -49,8 +49,10 @@ use std::num::{NonZeroU64, NonZeroUsize};
 use std::process::ExitCode;
 use std::rc::Rc;
 use std::str::FromStr;
+#[cfg(feature = "socket-tcp-dynamic-buffer")]
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Instant as StdInstant;
+use std::time::{Duration, Instant as StdInstant};
 
 mod process_memory;
 use process_memory::{process_memory_bytes, process_memory_label, signed_delta};
@@ -302,6 +304,82 @@ fn is_mode_option(value: &str) -> bool {
 
 const MODE_POSITION_ERROR: &str =
     "--mode must appear before the traffic shape and may be specified only once";
+
+const SERVER_PORT_BASE: u16 = 10_000;
+const CLIENT_PORT_BASE: u16 = 30_000;
+const MAX_UNIQUE_FLOWS: usize = (u16::MAX - CLIENT_PORT_BASE) as usize + 1;
+#[cfg(feature = "socket-tcp-dynamic-buffer")]
+const MAX_UNIQUE_WORKERS: usize = u16::MAX as usize + 1;
+
+fn checked_run_duration(shape: &str, seconds: u64) -> Result<Duration, String> {
+    let duration = Duration::from_secs(seconds);
+    StdInstant::now()
+        .checked_add(duration)
+        .ok_or_else(|| format!("{shape}: duration exceeds the platform timer range"))?;
+    Ok(duration)
+}
+
+fn checked_deadline(
+    shape: &str,
+    start: StdInstant,
+    duration: Duration,
+) -> Result<StdInstant, String> {
+    start
+        .checked_add(duration)
+        .ok_or_else(|| format!("{shape}: deadline exceeds the platform timer range"))
+}
+
+fn validate_unique_flow_count(shape: &str, flows: usize) -> Result<(), String> {
+    if flows > MAX_UNIQUE_FLOWS {
+        return Err(format!(
+            "{shape}: {flows} flows exceed the {MAX_UNIQUE_FLOWS} unique non-zero port pairs"
+        ));
+    }
+    Ok(())
+}
+
+fn flow_ports(shape: &str, index: usize) -> Result<(u16, u16), String> {
+    let offset = u16::try_from(index)
+        .map_err(|_| format!("{shape}: flow index {index} exceeds the port space"))?;
+    let server = SERVER_PORT_BASE
+        .checked_add(offset)
+        .ok_or_else(|| format!("{shape}: flow index {index} exhausted server ports"))?;
+    let client = CLIENT_PORT_BASE
+        .checked_add(offset)
+        .ok_or_else(|| format!("{shape}: flow index {index} exhausted client ports"))?;
+    Ok((server, client))
+}
+
+#[cfg(feature = "socket-tcp-dynamic-buffer")]
+fn validate_unique_worker_count(shape: &str, workers: usize) -> Result<(), String> {
+    if workers > MAX_UNIQUE_WORKERS {
+        return Err(format!(
+            "{shape}: {workers} workers exceed the {MAX_UNIQUE_WORKERS} unique address prefixes"
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(feature = "socket-tcp-dynamic-buffer")]
+fn worker_subnet(shape: &str, worker: usize) -> Result<[u8; 3], String> {
+    let subnet = u16::try_from(worker)
+        .map_err(|_| format!("{shape}: worker index {worker} exceeds the address space"))?;
+    Ok([10, (subnet >> 8) as u8, subnet as u8])
+}
+
+#[cfg(feature = "socket-tcp-dynamic-buffer")]
+fn churn_interval_us(rate: usize) -> Result<u64, String> {
+    const TIMER_TICKS_PER_SECOND: u64 = 1_000_000;
+    let rate = u64::try_from(rate)
+        .map_err(|_| format!("churn: rate {rate} exceeds the timer counter range"))?;
+    let interval = TIMER_TICKS_PER_SECOND
+        .checked_div(rate)
+        .and_then(NonZeroU64::new)
+        .ok_or_else(|| {
+            format!("churn: rate {rate} exceeds the {TIMER_TICKS_PER_SECOND} Hz timer resolution")
+        })?;
+    Ok(interval.get())
+}
 
 /// Tracks every allocation routed through the global allocator. We only count
 /// counter atomics (Relaxed), so the overhead is two adds per alloc/free.
@@ -1342,6 +1420,46 @@ mod tests {
     }
 
     #[test]
+    fn small_and_pingpong_finish_with_both_tcp_peers_established() {
+        assert_eq!(shape_small(1, false), Ok(()));
+        assert_eq!(shape_pingpong(1, false), Ok(()));
+    }
+
+    #[test]
+    fn all_cli_configuration_runs_every_real_shape_successfully() {
+        let config = args(&["all", "1"]).unwrap();
+        assert_eq!(run_config(config), Ok(()));
+    }
+
+    #[test]
+    fn extreme_static_workloads_return_errors_without_panicking() {
+        use std::panic::{AssertUnwindSafe, catch_unwind};
+
+        for outcome in [
+            catch_unwind(AssertUnwindSafe(|| shape_firehose(u64::MAX, false))),
+            catch_unwind(AssertUnwindSafe(|| shape_small(u64::MAX, false))),
+            catch_unwind(AssertUnwindSafe(|| shape_pingpong(u64::MAX, false))),
+            catch_unwind(AssertUnwindSafe(|| {
+                shape_many_tcp_fair(1, usize::MAX, false, RunMode::Bench)
+            })),
+            catch_unwind(AssertUnwindSafe(|| {
+                shape_many_udp(1, usize::MAX, false, RunMode::Bench)
+            })),
+            catch_unwind(AssertUnwindSafe(|| {
+                shape_many_tcp(1, usize::MAX, false, RunMode::Bench)
+            })),
+            catch_unwind(AssertUnwindSafe(|| shape_udp_firehose(u64::MAX, false))),
+            catch_unwind(AssertUnwindSafe(|| {
+                run_config(config(RunMode::Bench, u64::MAX, TrafficShape::All, false))
+            })),
+        ] {
+            assert!(matches!(outcome, Ok(Err(_))), "outcome: {outcome:?}");
+        }
+        assert!(validate_unique_flow_count("many_tcp", MAX_UNIQUE_FLOWS).is_ok());
+        assert!(validate_unique_flow_count("many_tcp", MAX_UNIQUE_FLOWS + 1).is_err());
+    }
+
+    #[test]
     fn udp_workload_validation_requires_bindings_and_work() {
         assert!(validate_udp_transfer("udp", true, true, 1, 1).is_ok());
         for result in [
@@ -1431,6 +1549,44 @@ mod tests {
         assert!(validate_pool_boundaries("churn", 100, 100, 0).is_ok());
         assert!(validate_pool_boundaries("churn", 101, 100, 0).is_err());
         assert!(validate_pool_boundaries("churn", 100, 100, 1).is_err());
+    }
+
+    #[cfg(feature = "socket-tcp-dynamic-buffer")]
+    #[test]
+    fn extreme_dynamic_workloads_return_errors_without_panicking() {
+        use std::panic::{AssertUnwindSafe, catch_unwind};
+
+        let outcomes = [
+            catch_unwind(AssertUnwindSafe(|| {
+                shape_multi_tcp(1, usize::MAX, 1, false)
+            })),
+            catch_unwind(AssertUnwindSafe(|| {
+                shape_multi_tcp_sink(1, 1, usize::MAX, false)
+            })),
+            catch_unwind(AssertUnwindSafe(|| {
+                shape_idle_hot(1, usize::MAX, 1, false, RunMode::Bench)
+            })),
+            catch_unwind(AssertUnwindSafe(|| {
+                shape_churn(1, usize::MAX, false, RunMode::Bench)
+            })),
+            catch_unwind(AssertUnwindSafe(|| shape_multi_tcp(u64::MAX, 1, 1, false))),
+            catch_unwind(AssertUnwindSafe(|| {
+                shape_churn(u64::MAX, 1, false, RunMode::Bench)
+            })),
+            catch_unwind(AssertUnwindSafe(|| {
+                shape_idle_hot(u64::MAX, 1, 0, false, RunMode::Bench)
+            })),
+        ];
+        for outcome in outcomes {
+            assert!(matches!(outcome, Ok(Err(_))), "outcome: {outcome:?}");
+        }
+        assert!(validate_unique_worker_count("multi_tcp", MAX_UNIQUE_WORKERS).is_ok());
+        assert!(validate_unique_worker_count("multi_tcp", MAX_UNIQUE_WORKERS + 1).is_err());
+        assert_eq!(worker_subnet("multi_tcp", 0), Ok([10, 0, 0]));
+        assert_eq!(
+            worker_subnet("multi_tcp", MAX_UNIQUE_WORKERS - 1),
+            Ok([10, 255, 255])
+        );
     }
 
     #[test]
@@ -1672,7 +1828,7 @@ mod tests {
                     if worker_id == 0 && fail_before_ready {
                         panic!("injected multi_tcp setup failure");
                     }
-                    if !phases.ready() {
+                    if !phases.ready(Ok(())) {
                         return;
                     }
                     if worker_id == 0 && !fail_before_ready {
@@ -1682,8 +1838,9 @@ mod tests {
                         thread::sleep(Duration::from_millis(50));
                     }
                     let _ = phases.finished(());
-                });
-                workers.wait_ready();
+                })
+                .unwrap();
+                workers.wait_ready().unwrap();
                 workers.start();
                 let _ = workers.wait_finished();
                 workers.release_and_join();
@@ -1716,6 +1873,107 @@ mod tests {
     #[test]
     fn multi_tcp_coordinator_propagates_work_panic_without_deadlock() {
         assert_multi_tcp_worker_panic_propagates(false);
+    }
+
+    #[cfg(feature = "socket-tcp-dynamic-buffer")]
+    #[test]
+    fn worker_panic_cancels_a_long_running_peer_promptly() {
+        use std::panic::{AssertUnwindSafe, catch_unwind};
+        use std::sync::mpsc;
+        use std::thread;
+        use std::time::{Duration, Instant};
+
+        let (completed_tx, completed_rx) = mpsc::channel();
+        let supervisor = thread::spawn(move || {
+            let started = Instant::now();
+            let outcome = catch_unwind(AssertUnwindSafe(|| {
+                let mut workers = MultiTcpWorkers::<()>::spawn(2, |worker_id, mut phases| {
+                    if !phases.ready(Ok(())) {
+                        return;
+                    }
+                    if worker_id == 0 {
+                        panic!("injected multi_tcp work failure");
+                    }
+                    let deadline = Instant::now() + Duration::from_secs(5);
+                    let mut iterations = 0u64;
+                    while Instant::now() < deadline {
+                        if iterations & 0xff == 0 && phases.is_cancelled() {
+                            break;
+                        }
+                        std::hint::spin_loop();
+                        iterations = iterations.wrapping_add(1);
+                    }
+                    let _ = phases.finished(());
+                })
+                .unwrap();
+                workers.wait_ready().unwrap();
+                workers.start();
+                let _ = workers.wait_finished();
+                workers.release_and_join();
+            }));
+            let _ = completed_tx.send((started.elapsed(), outcome));
+        });
+
+        let (elapsed, outcome) = completed_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("worker panic did not cancel its long-running peer promptly");
+        supervisor.join().unwrap();
+        assert!(outcome.is_err());
+        assert!(elapsed < Duration::from_secs(1), "elapsed: {elapsed:?}");
+    }
+
+    #[cfg(feature = "socket-tcp-dynamic-buffer")]
+    #[test]
+    fn setup_error_cancels_before_work_and_joins_every_worker() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+        struct DropCounter(Arc<AtomicUsize>);
+        impl Drop for DropCounter {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let work_started = Arc::new(AtomicBool::new(false));
+        let worker_dropped = dropped.clone();
+        let worker_started = work_started.clone();
+        let mut workers = MultiTcpWorkers::<()>::spawn(2, move |worker_id, mut phases| {
+            let _drop_counter = DropCounter(worker_dropped.clone());
+            let setup = if worker_id == 0 {
+                Err("injected setup failure".to_owned())
+            } else {
+                Ok(())
+            };
+            if !phases.ready(setup) {
+                return;
+            }
+            worker_started.store(true, Ordering::Relaxed);
+            let _ = phases.finished(());
+        })
+        .unwrap();
+
+        let error = workers.wait_ready().unwrap_err();
+        assert!(error.contains("worker 0: injected setup failure"));
+        assert!(!work_started.load(Ordering::Relaxed));
+        assert_eq!(dropped.load(Ordering::Relaxed), 2);
+    }
+
+    #[cfg(feature = "socket-tcp-dynamic-buffer")]
+    #[test]
+    fn worker_thread_creation_uses_a_fallible_result() {
+        let mut workers = MultiTcpWorkers::<()>::spawn(1, |_worker_id, mut phases| {
+            if !phases.ready(Ok(())) {
+                return;
+            }
+            let _ = phases.finished(());
+        })
+        .unwrap();
+        workers.wait_ready().unwrap();
+        workers.start();
+        assert_eq!(workers.wait_finished().len(), 1);
+        workers.release_and_join();
     }
 }
 
@@ -1914,12 +2172,12 @@ fn make_endpoint(
 }
 
 /// Build a back-to-back server/client `Endpoint` pair joined by two
-/// `Lane`s, with the server at `base.0.0.1` and the client at
-/// `base.0.0.2`. The returned lane handles let callers report packet-pool
+/// `Lane`s, with the server at `subnet.1` and the client at `subnet.2`. The
+/// returned lane handles let callers report packet-pool
 /// backpressure and fixed reservation size.
 #[cfg_attr(not(feature = "socket-tcp-dynamic-buffer"), allow(dead_code))]
 fn setup_paired_endpoints(
-    base: u8,
+    subnet: [u8; 3],
     mtu: usize,
     queue_depth: usize,
     offload: bool,
@@ -1927,14 +2185,14 @@ fn setup_paired_endpoints(
     let lane_a: LaneRc = Rc::new(RefCell::new(Lane::new(mtu, queue_depth)));
     let lane_b: LaneRc = Rc::new(RefCell::new(Lane::new(mtu, queue_depth)));
     let server = make_endpoint(
-        IpAddress::v4(base, 0, 0, 1),
+        IpAddress::v4(subnet[0], subnet[1], subnet[2], 1),
         mtu,
         lane_a.clone(),
         lane_b.clone(),
         offload,
     );
     let client = make_endpoint(
-        IpAddress::v4(base, 0, 0, 2),
+        IpAddress::v4(subnet[0], subnet[1], subnet[2], 2),
         mtu,
         lane_b.clone(),
         lane_a.clone(),
@@ -2297,6 +2555,7 @@ impl<'a> Report<'a> {
 
 fn shape_firehose(seconds: u64, offload: bool) -> Result<(), String> {
     const BUF: usize = 256 * 1024;
+    let duration = checked_run_duration("firehose", seconds)?;
     let lane_a: LaneRc = Rc::new(RefCell::new(Lane::new(1500, 256)));
     let lane_b: LaneRc = Rc::new(RefCell::new(Lane::new(1500, 256)));
 
@@ -2366,7 +2625,7 @@ fn shape_firehose(seconds: u64, offload: bool) -> Result<(), String> {
     );
 
     let payload = vec![0x42u8; 64 * 1024];
-    let deadline = StdInstant::now() + std::time::Duration::from_secs(seconds);
+    let deadline = checked_deadline("firehose", StdInstant::now(), duration)?;
     let start = StdInstant::now();
     let mut sent: u64 = 0;
     let mut recvd: u64 = 0;
@@ -2461,6 +2720,7 @@ fn shape_small(seconds: u64, offload: bool) -> Result<(), String> {
     // Force tiny segments by limiting the socket buffer; with a 1500 MTU the
     // client never fills more than a single small write at a time.
     const BUF: usize = 4 * 1024;
+    let duration = checked_run_duration("small", seconds)?;
     let lane_a: LaneRc = Rc::new(RefCell::new(Lane::new(1500, 256)));
     let lane_b: LaneRc = Rc::new(RefCell::new(Lane::new(1500, 256)));
 
@@ -2498,7 +2758,13 @@ fn shape_small(seconds: u64, offload: bool) -> Result<(), String> {
         client
             .iface
             .poll(n, &mut client.device, &mut client.sockets);
-        if client.sockets.get::<tcp::Socket>(cli_h).may_send() {
+        if matches!(
+            client.sockets.get::<tcp::Socket>(cli_h).state(),
+            tcp::State::Established
+        ) && matches!(
+            server.sockets.get::<tcp::Socket>(srv_h).state(),
+            tcp::State::Established
+        ) {
             break;
         }
         t_ms += 1;
@@ -2513,7 +2779,7 @@ fn shape_small(seconds: u64, offload: bool) -> Result<(), String> {
     );
 
     let payload = [0x42u8; 64];
-    let deadline = StdInstant::now() + std::time::Duration::from_secs(seconds);
+    let deadline = checked_deadline("small", StdInstant::now(), duration)?;
     let start = StdInstant::now();
     let mut sent: u64 = 0;
     let mut recvd: u64 = 0;
@@ -2575,6 +2841,7 @@ fn shape_small(seconds: u64, offload: bool) -> Result<(), String> {
 
 fn shape_pingpong(seconds: u64, offload: bool) -> Result<(), String> {
     const BUF: usize = 16 * 1024;
+    let duration = checked_run_duration("pingpong", seconds)?;
     let lane_a: LaneRc = Rc::new(RefCell::new(Lane::new(1500, 256)));
     let lane_b: LaneRc = Rc::new(RefCell::new(Lane::new(1500, 256)));
 
@@ -2612,7 +2879,13 @@ fn shape_pingpong(seconds: u64, offload: bool) -> Result<(), String> {
         client
             .iface
             .poll(n, &mut client.device, &mut client.sockets);
-        if client.sockets.get::<tcp::Socket>(cli_h).may_send() {
+        if matches!(
+            client.sockets.get::<tcp::Socket>(cli_h).state(),
+            tcp::State::Established
+        ) && matches!(
+            server.sockets.get::<tcp::Socket>(srv_h).state(),
+            tcp::State::Established
+        ) {
             break;
         }
         t_ms += 1;
@@ -2627,7 +2900,7 @@ fn shape_pingpong(seconds: u64, offload: bool) -> Result<(), String> {
     );
 
     let msg = [0x55u8; 128];
-    let deadline = StdInstant::now() + std::time::Duration::from_secs(seconds);
+    let deadline = checked_deadline("pingpong", StdInstant::now(), duration)?;
     let start = StdInstant::now();
     let mut roundtrips: u64 = 0;
     let mut poll_lat = SampledTimer::new();
@@ -2709,6 +2982,7 @@ fn shape_udp_firehose(seconds: u64, offload: bool) -> Result<(), String> {
     // analogue to a packet tunnel forwarding fully-formed packets between peers.
     const PAYLOAD: usize = 1400;
     const META_SLOTS: usize = 256;
+    let duration = checked_run_duration("udp", seconds)?;
     let lane_a: LaneRc = Rc::new(RefCell::new(Lane::new(1500, 256)));
     let lane_b: LaneRc = Rc::new(RefCell::new(Lane::new(1500, 256)));
 
@@ -2762,7 +3036,7 @@ fn shape_udp_firehose(seconds: u64, offload: bool) -> Result<(), String> {
     // per iteration (which showed up at ~10% of profile when sampled per-poll).
     let mut t_us: i64 = 0;
     let mut iters: u64 = 0;
-    let deadline = StdInstant::now() + std::time::Duration::from_secs(seconds);
+    let deadline = checked_deadline("udp", StdInstant::now(), duration)?;
     let start = StdInstant::now();
     let mut sent: u64 = 0;
     let mut recvd: u64 = 0;
@@ -2834,7 +3108,20 @@ fn shape_many_tcp(seconds: u64, n: usize, offload: bool, mode: RunMode) -> Resul
     // that a full round of egress packets never spills, otherwise
     // socket_egress short-circuits mid-walk and the late sockets in the
     // iteration order get systematically starved.
-    let qd = (n * 16).clamp(1024, 16384);
+    let duration = checked_run_duration("many_tcp", seconds)?;
+    validate_unique_flow_count("many_tcp", n)?;
+    let qd = n
+        .checked_mul(16)
+        .ok_or_else(|| "many_tcp: packet queue size overflowed".to_owned())?
+        .clamp(1024, 16384);
+    let tcp_socket_bytes = core::mem::size_of::<tcp::Socket>();
+    let per_flow_bytes = tcp_socket_bytes
+        .checked_add(2 * BUF)
+        .ok_or_else(|| "many_tcp: per-flow socket footprint overflowed".to_owned())?;
+    let total_bytes = n
+        .checked_mul(2)
+        .and_then(|sockets| sockets.checked_mul(per_flow_bytes))
+        .ok_or_else(|| "many_tcp: total socket footprint overflowed".to_owned())?;
 
     let lane_a: LaneRc = Rc::new(RefCell::new(Lane::new(1500, qd)));
     let lane_b: LaneRc = Rc::new(RefCell::new(Lane::new(1500, qd)));
@@ -2861,8 +3148,7 @@ fn shape_many_tcp(seconds: u64, n: usize, offload: bool, mode: RunMode) -> Resul
         let h_srv = add_tcp_socket(&mut server, BUF);
         let h_cli = add_tcp_socket(&mut client, BUF);
 
-        let dst_port: u16 = 10_000u16.wrapping_add(i as u16);
-        let src_port: u16 = 30_000u16.wrapping_add(i as u16);
+        let (dst_port, src_port) = flow_ports("many_tcp", i)?;
 
         {
             let s = server.sockets.get_mut::<tcp::Socket>(h_srv);
@@ -2893,7 +3179,11 @@ fn shape_many_tcp(seconds: u64, n: usize, offload: bool, mode: RunMode) -> Resul
     // the wall clock.
     let wall0 = StdInstant::now();
     let smol_now = || Instant::from_micros(wall0.elapsed().as_micros() as i64);
-    let connect_deadline = StdInstant::now() + std::time::Duration::from_secs(seconds.min(5));
+    let connect_deadline = checked_deadline(
+        "many_tcp",
+        StdInstant::now(),
+        Duration::from_secs(seconds.min(5)),
+    )?;
     loop {
         let now = smol_now();
         server
@@ -2906,8 +3196,13 @@ fn shape_many_tcp(seconds: u64, n: usize, offload: bool, mode: RunMode) -> Resul
             .iter()
             .zip(srv_handles.iter())
             .all(|(&hc, &hs)| {
-                client.sockets.get::<tcp::Socket>(hc).may_send()
-                    && server.sockets.get::<tcp::Socket>(hs).may_recv()
+                matches!(
+                    client.sockets.get::<tcp::Socket>(hc).state(),
+                    tcp::State::Established
+                ) && matches!(
+                    server.sockets.get::<tcp::Socket>(hs).state(),
+                    tcp::State::Established
+                )
             });
         if all_ready || StdInstant::now() >= connect_deadline {
             break;
@@ -2939,7 +3234,7 @@ fn shape_many_tcp(seconds: u64, n: usize, offload: bool, mode: RunMode) -> Resul
     let mut sent = vec![0u64; n];
     let mut recvd = vec![0u64; n];
 
-    let deadline = StdInstant::now() + std::time::Duration::from_secs(seconds);
+    let deadline = checked_deadline("many_tcp", StdInstant::now(), duration)?;
     let start = StdInstant::now();
     let alloc_before = AllocSnap::now();
     let mut poll_lat = SampledTimer::new();
@@ -3079,9 +3374,6 @@ fn shape_many_tcp(seconds: u64, n: usize, offload: bool, mode: RunMode) -> Resul
 
     // Per-flow socket footprint estimate. Useful for sizing per-flow
     // budgets in downstream consumers that admit many concurrent flows.
-    let tcp_socket_bytes = core::mem::size_of::<tcp::Socket>();
-    let per_flow_bytes = tcp_socket_bytes + 2 * BUF;
-    let total_bytes = 2 * n * per_flow_bytes; // both peers
     println!();
     println!("  socket-state footprint (without lane pool):");
     println!(
@@ -3104,7 +3396,20 @@ fn shape_many_tcp(seconds: u64, n: usize, offload: bool, mode: RunMode) -> Resul
 fn shape_many_tcp_fair(seconds: u64, n: usize, offload: bool, mode: RunMode) -> Result<(), String> {
     const BUF: usize = 4 * 1024;
     const PAYLOAD: usize = 256;
-    let qd = (n * 16).clamp(1024, 16384);
+    let duration = checked_run_duration("many_tcp_fair", seconds)?;
+    validate_unique_flow_count("many_tcp_fair", n)?;
+    let qd = n
+        .checked_mul(16)
+        .ok_or_else(|| "many_tcp_fair: packet queue size overflowed".to_owned())?
+        .clamp(1024, 16384);
+    let tcp_socket_bytes = core::mem::size_of::<tcp::Socket>();
+    let per_flow_bytes = tcp_socket_bytes
+        .checked_add(2 * BUF)
+        .ok_or_else(|| "many_tcp_fair: per-flow socket footprint overflowed".to_owned())?;
+    let total_bytes = n
+        .checked_mul(2)
+        .and_then(|sockets| sockets.checked_mul(per_flow_bytes))
+        .ok_or_else(|| "many_tcp_fair: total socket footprint overflowed".to_owned())?;
 
     let lane_a: LaneRc = Rc::new(RefCell::new(Lane::new(1500, qd)));
     let lane_b: LaneRc = Rc::new(RefCell::new(Lane::new(1500, qd)));
@@ -3129,8 +3434,7 @@ fn shape_many_tcp_fair(seconds: u64, n: usize, offload: bool, mode: RunMode) -> 
     for i in 0..n {
         let h_srv = add_tcp_socket(&mut server, BUF);
         let h_cli = add_tcp_socket(&mut client, BUF);
-        let dst_port: u16 = 10_000u16.wrapping_add(i as u16);
-        let src_port: u16 = 30_000u16.wrapping_add(i as u16);
+        let (dst_port, src_port) = flow_ports("many_tcp_fair", i)?;
 
         {
             let s = server.sockets.get_mut::<tcp::Socket>(h_srv);
@@ -3155,7 +3459,11 @@ fn shape_many_tcp_fair(seconds: u64, n: usize, offload: bool, mode: RunMode) -> 
 
     let wall0 = StdInstant::now();
     let smol_now = || Instant::from_micros(wall0.elapsed().as_micros() as i64);
-    let connect_deadline = StdInstant::now() + std::time::Duration::from_secs(seconds.min(5));
+    let connect_deadline = checked_deadline(
+        "many_tcp_fair",
+        StdInstant::now(),
+        Duration::from_secs(seconds.min(5)),
+    )?;
     loop {
         let now = smol_now();
         server
@@ -3168,8 +3476,13 @@ fn shape_many_tcp_fair(seconds: u64, n: usize, offload: bool, mode: RunMode) -> 
             .iter()
             .zip(srv_handles.iter())
             .all(|(&hc, &hs)| {
-                client.sockets.get::<tcp::Socket>(hc).may_send()
-                    && server.sockets.get::<tcp::Socket>(hs).may_recv()
+                matches!(
+                    client.sockets.get::<tcp::Socket>(hc).state(),
+                    tcp::State::Established
+                ) && matches!(
+                    server.sockets.get::<tcp::Socket>(hs).state(),
+                    tcp::State::Established
+                )
             });
         if all_ready || StdInstant::now() >= connect_deadline {
             break;
@@ -3201,7 +3514,7 @@ fn shape_many_tcp_fair(seconds: u64, n: usize, offload: bool, mode: RunMode) -> 
     let mut sent = vec![0u64; n];
     let mut recvd = vec![0u64; n];
 
-    let deadline = StdInstant::now() + std::time::Duration::from_secs(seconds);
+    let deadline = checked_deadline("many_tcp_fair", StdInstant::now(), duration)?;
     let start = StdInstant::now();
     let alloc_before = AllocSnap::now();
     let mut poll_lat = SampledTimer::new();
@@ -3319,9 +3632,6 @@ fn shape_many_tcp_fair(seconds: u64, n: usize, offload: bool, mode: RunMode) -> 
     mem_trace.print();
     print_lane_stats("many_tcp_fair", collect_lane_stats(&[&lane_a, &lane_b]));
 
-    let tcp_socket_bytes = core::mem::size_of::<tcp::Socket>();
-    let per_flow_bytes = tcp_socket_bytes + 2 * BUF;
-    let total_bytes = 2 * n * per_flow_bytes;
     println!();
     println!("  socket-state footprint (without lane pool):");
     println!(
@@ -3347,7 +3657,21 @@ fn shape_many_udp(seconds: u64, n: usize, offload: bool, mode: RunMode) -> Resul
     // Per-flow UDP socket buffer: a small ring with ~32 metadata slots is
     // enough to keep the pipe full without ballooning memory.
     const META_SLOTS: usize = 32;
-    let qd = (n * 4).clamp(256, 8192);
+    let duration = checked_run_duration("many_udp", seconds)?;
+    validate_unique_flow_count("many_udp", n)?;
+    let qd = n
+        .checked_mul(4)
+        .ok_or_else(|| "many_udp: packet queue size overflowed".to_owned())?
+        .clamp(256, 8192);
+    let udp_socket_bytes = core::mem::size_of::<udp::Socket>();
+    let per_flow_bytes = udp_socket_bytes
+        .checked_add(2 * (META_SLOTS * PAYLOAD))
+        .and_then(|bytes| bytes.checked_add(2 * META_SLOTS * 24))
+        .ok_or_else(|| "many_udp: per-flow socket footprint overflowed".to_owned())?;
+    let total_bytes = n
+        .checked_mul(2)
+        .and_then(|sockets| sockets.checked_mul(per_flow_bytes))
+        .ok_or_else(|| "many_udp: total socket footprint overflowed".to_owned())?;
 
     let lane_a: LaneRc = Rc::new(RefCell::new(Lane::new(1500, qd)));
     let lane_b: LaneRc = Rc::new(RefCell::new(Lane::new(1500, qd)));
@@ -3385,8 +3709,7 @@ fn shape_many_udp(seconds: u64, n: usize, offload: bool, mode: RunMode) -> Resul
     let mut client_bound = true;
 
     for i in 0..n {
-        let dst_port: u16 = 10_000u16.wrapping_add(i as u16);
-        let src_port: u16 = 30_000u16.wrapping_add(i as u16);
+        let (dst_port, src_port) = flow_ports("many_udp", i)?;
 
         let (rx, tx) = mk_udp();
         let h_srv = server.sockets.add(udp::Socket::new(rx, tx));
@@ -3419,7 +3742,7 @@ fn shape_many_udp(seconds: u64, n: usize, offload: bool, mode: RunMode) -> Resul
     let wall0 = StdInstant::now();
     let smol_now = || Instant::from_micros(wall0.elapsed().as_micros() as i64);
 
-    let deadline = StdInstant::now() + std::time::Duration::from_secs(seconds);
+    let deadline = checked_deadline("many_udp", StdInstant::now(), duration)?;
     let start = StdInstant::now();
     let alloc_before = AllocSnap::now();
     let mut poll_lat = SampledTimer::new();
@@ -3489,9 +3812,6 @@ fn shape_many_udp(seconds: u64, n: usize, offload: bool, mode: RunMode) -> Resul
     mem_trace.print();
     print_lane_stats("many_udp", collect_lane_stats(&[&lane_a, &lane_b]));
 
-    let udp_socket_bytes = core::mem::size_of::<udp::Socket>();
-    let per_flow_bytes = udp_socket_bytes + 2 * (META_SLOTS * PAYLOAD) + 2 * META_SLOTS * 24; // approx
-    let total_bytes = 2 * n * per_flow_bytes;
     println!();
     println!("  socket-state footprint (without lane pool):");
     println!(
@@ -3533,7 +3853,7 @@ fn set_multi_tcp_worker_state(gate: &MultiTcpWorkerGate, state: MultiTcpWorkerSt
 
 #[cfg(feature = "socket-tcp-dynamic-buffer")]
 enum MultiTcpWorkerEvent<R> {
-    Ready(usize),
+    Ready(usize, Result<(), String>),
     Finished(usize, R),
     Failed(usize, MultiTcpPanic),
 }
@@ -3542,20 +3862,25 @@ enum MultiTcpWorkerEvent<R> {
 struct MultiTcpWorkerPhases<R> {
     worker_id: usize,
     gate: MultiTcpWorkerGate,
+    cancelled: std::sync::Arc<AtomicBool>,
     events: std::sync::mpsc::Sender<MultiTcpWorkerEvent<R>>,
 }
 
 #[cfg(feature = "socket-tcp-dynamic-buffer")]
 impl<R> MultiTcpWorkerPhases<R> {
-    fn ready(&mut self) -> bool {
+    fn ready(&mut self, setup: Result<(), String>) -> bool {
         if self
             .events
-            .send(MultiTcpWorkerEvent::Ready(self.worker_id))
+            .send(MultiTcpWorkerEvent::Ready(self.worker_id, setup))
             .is_err()
         {
             return false;
         }
         self.wait_while(MultiTcpWorkerState::Setup, MultiTcpWorkerState::Running)
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Relaxed)
     }
 
     fn finished(&mut self, result: R) -> bool {
@@ -3585,13 +3910,14 @@ impl<R> MultiTcpWorkerPhases<R> {
 struct MultiTcpWorkers<R> {
     worker_count: usize,
     gate: MultiTcpWorkerGate,
+    cancelled: std::sync::Arc<AtomicBool>,
     events: std::sync::mpsc::Receiver<MultiTcpWorkerEvent<R>>,
     handles: Vec<std::thread::JoinHandle<()>>,
 }
 
 #[cfg(feature = "socket-tcp-dynamic-buffer")]
 impl<R> MultiTcpWorkers<R> {
-    fn spawn<F>(worker_count: usize, worker: F) -> Self
+    fn spawn<F>(worker_count: usize, worker: F) -> Result<Self, String>
     where
         R: Send + 'static,
         F: Fn(usize, MultiTcpWorkerPhases<R>) + Send + Sync + 'static,
@@ -3600,26 +3926,33 @@ impl<R> MultiTcpWorkers<R> {
             std::sync::Mutex::new(MultiTcpWorkerState::Setup),
             std::sync::Condvar::new(),
         ));
+        let cancelled = std::sync::Arc::new(AtomicBool::new(false));
         let (event_tx, events) = std::sync::mpsc::channel();
         let worker = std::sync::Arc::new(worker);
         let mut handles = Vec::with_capacity(worker_count);
 
         for worker_id in 0..worker_count {
             let worker_gate = gate.clone();
+            let worker_cancelled = cancelled.clone();
             let events = event_tx.clone();
             let worker = worker.clone();
             let spawn = std::thread::Builder::new()
                 .name(format!("multi-tcp-{worker_id}"))
                 .spawn(move || {
+                    let panic_gate = worker_gate.clone();
+                    let panic_cancelled = worker_cancelled.clone();
                     let phases = MultiTcpWorkerPhases {
                         worker_id,
                         gate: worker_gate,
+                        cancelled: worker_cancelled,
                         events: events.clone(),
                     };
                     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         worker(worker_id, phases);
                     }));
                     if let Err(panic) = outcome {
+                        panic_cancelled.store(true, Ordering::Relaxed);
+                        set_multi_tcp_worker_state(&panic_gate, MultiTcpWorkerState::Cancelled);
                         let _ = events.send(MultiTcpWorkerEvent::Failed(worker_id, panic));
                     }
                 });
@@ -3627,25 +3960,27 @@ impl<R> MultiTcpWorkers<R> {
             match spawn {
                 Ok(handle) => handles.push(handle),
                 Err(error) => {
+                    cancelled.store(true, Ordering::Relaxed);
                     set_multi_tcp_worker_state(&gate, MultiTcpWorkerState::Cancelled);
                     for handle in handles {
                         let _ = handle.join();
                     }
-                    panic!("failed to spawn multi_tcp worker {worker_id}: {error}");
+                    return Err(format!("failed to spawn worker {worker_id}: {error}"));
                 }
             }
         }
         drop(event_tx);
 
-        Self {
+        Ok(Self {
             worker_count,
             gate,
+            cancelled,
             events,
             handles,
-        }
+        })
     }
 
-    fn wait_ready(&mut self) {
+    fn wait_ready(&mut self) -> Result<(), String> {
         let mut ready = vec![false; self.worker_count];
         let mut ready_count = 0;
         while ready_count < self.worker_count {
@@ -3654,13 +3989,24 @@ impl<R> MultiTcpWorkers<R> {
                 Err(_) => self.abort_with_message("worker event channel closed before ready"),
             };
             match event {
-                MultiTcpWorkerEvent::Ready(worker_id)
+                MultiTcpWorkerEvent::Ready(worker_id, setup)
                     if worker_id < self.worker_count && !ready[worker_id] =>
                 {
                     ready[worker_id] = true;
                     ready_count += 1;
+                    if let Err(error) = setup {
+                        self.cancel();
+                        let join_panic = self.join_all();
+                        if let Some((_, panic)) = self.take_worker_panic() {
+                            std::panic::resume_unwind(panic);
+                        }
+                        if let Some(panic) = join_panic {
+                            std::panic::resume_unwind(panic);
+                        }
+                        return Err(format!("worker {worker_id}: {error}"));
+                    }
                 }
-                MultiTcpWorkerEvent::Ready(worker_id) => self.abort_with_message(&format!(
+                MultiTcpWorkerEvent::Ready(worker_id, _) => self.abort_with_message(&format!(
                     "invalid or duplicate ready event from worker {worker_id}"
                 )),
                 MultiTcpWorkerEvent::Finished(worker_id, _) => self.abort_with_message(&format!(
@@ -3671,6 +4017,7 @@ impl<R> MultiTcpWorkers<R> {
                 }
             }
         }
+        Ok(())
     }
 
     fn start(&self) {
@@ -3697,7 +4044,7 @@ impl<R> MultiTcpWorkers<R> {
                 MultiTcpWorkerEvent::Finished(worker_id, _) => self.abort_with_message(&format!(
                     "invalid or duplicate finish event from worker {worker_id}"
                 )),
-                MultiTcpWorkerEvent::Ready(worker_id) => self
+                MultiTcpWorkerEvent::Ready(worker_id, _) => self
                     .abort_with_message(&format!("duplicate ready event from worker {worker_id}")),
                 MultiTcpWorkerEvent::Failed(worker_id, panic) => {
                     self.abort_worker_panic(worker_id, panic)
@@ -3737,6 +4084,7 @@ impl<R> MultiTcpWorkers<R> {
     }
 
     fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Relaxed);
         set_multi_tcp_worker_state(&self.gate, MultiTcpWorkerState::Cancelled);
     }
 
@@ -3913,11 +4261,24 @@ fn shape_multi_tcp_impl(
 
     const MAX_BUF: u32 = 32 * 1024;
     const PAYLOAD: usize = 1024;
-    let total_flows = n_threads * flows_per_thread;
+    let shape_name = workload.shape_name();
+    let duration = checked_run_duration(shape_name, seconds)?;
+    validate_unique_worker_count(shape_name, n_threads)?;
+    validate_unique_flow_count(shape_name, flows_per_thread)?;
+    let total_flows = n_threads
+        .checked_mul(flows_per_thread)
+        .ok_or_else(|| format!("{shape_name}: total flow count overflowed"))?;
     // One full rx+tx budget per logical flow. The paired endpoints share the
     // pool, so this keeps the usual one-active-direction workload clear of
     // growth refusal while still exercising allocator contention.
-    let pool_bytes: usize = total_flows * 2 * MAX_BUF as usize;
+    let pool_bytes = total_flows
+        .checked_mul(2)
+        .and_then(|sockets| sockets.checked_mul(MAX_BUF as usize))
+        .ok_or_else(|| format!("{shape_name}: pool budget overflowed"))?;
+    let qd = flows_per_thread
+        .checked_mul(16)
+        .ok_or_else(|| format!("{shape_name}: packet queue size overflowed"))?
+        .clamp(1024, 16384);
     let pool = tcp::MemoryPool::new(pool_bytes);
 
     let (vol_before, nvol_before) = ctxsw_counts();
@@ -3925,21 +4286,34 @@ fn shape_multi_tcp_impl(
     let mut workers = MultiTcpWorkers::spawn(n_threads, move |tid, mut phases| {
         let pool = worker_pool.clone();
         {
-            let qd = (flows_per_thread * 16).clamp(1024, 16384);
             // Distinct base address per thread so server/client tuples don't
             // clash if anything inspects them (they won't — lanes are isolated).
-            let base = 10 + tid as u8;
+            let subnet = match worker_subnet(shape_name, tid) {
+                Ok(subnet) => subnet,
+                Err(error) => {
+                    let _ = phases.ready(Err(error));
+                    return;
+                }
+            };
             let (mut server, mut client, lane_a, lane_b) =
-                setup_paired_endpoints(base, 1500, qd, offload);
+                setup_paired_endpoints(subnet, 1500, qd, offload);
 
             let mut srv_handles = Vec::with_capacity(flows_per_thread);
             let mut cli_handles = Vec::with_capacity(flows_per_thread);
             let mut setup_error = None;
             for i in 0..flows_per_thread {
+                if i & 0xff == 0 && phases.is_cancelled() {
+                    break;
+                }
                 let h_srv = add_tcp_socket_dyn(&mut server, MAX_BUF, &pool);
                 let h_cli = add_tcp_socket_dyn(&mut client, MAX_BUF, &pool);
-                let dst_port: u16 = 10_000u16.wrapping_add(i as u16);
-                let src_port: u16 = 30_000u16.wrapping_add(i as u16);
+                let (dst_port, src_port) = match flow_ports(shape_name, i) {
+                    Ok(ports) => ports,
+                    Err(error) => {
+                        setup_error.get_or_insert(error);
+                        break;
+                    }
+                };
                 {
                     let s = server.sockets.get_mut::<tcp::Socket>(h_srv);
                     s.set_ack_delay(None);
@@ -3957,7 +4331,7 @@ fn shape_multi_tcp_impl(
                 }
                 if let Err(error) = client.sockets.get_mut::<tcp::Socket>(h_cli).connect(
                     client.iface.context(),
-                    (IpAddress::v4(base, 0, 0, 1), dst_port),
+                    (IpAddress::v4(subnet[0], subnet[1], subnet[2], 1), dst_port),
                     src_port,
                 ) {
                     setup_error
@@ -3965,29 +4339,46 @@ fn shape_multi_tcp_impl(
                 }
                 srv_handles.push(h_srv);
                 cli_handles.push(h_cli);
+                if setup_error.is_some() {
+                    break;
+                }
             }
 
             // Drive until ESTABLISHED on every flow.
             let smol_now = |w0: StdInstant| Instant::from_micros(w0.elapsed().as_micros() as i64);
             let w0 = StdInstant::now();
-            let connect_deadline = w0 + std::time::Duration::from_secs(seconds.min(5));
-            loop {
-                let now = smol_now(w0);
-                server
-                    .iface
-                    .poll(now, &mut server.device, &mut server.sockets);
-                client
-                    .iface
-                    .poll(now, &mut client.device, &mut client.sockets);
-                let all_ready = cli_handles
-                    .iter()
-                    .zip(srv_handles.iter())
-                    .all(|(&hc, &hs)| {
-                        client.sockets.get::<tcp::Socket>(hc).may_send()
-                            && server.sockets.get::<tcp::Socket>(hs).may_recv()
-                    });
-                if all_ready || StdInstant::now() >= connect_deadline {
-                    break;
+            let connect_deadline =
+                match checked_deadline(shape_name, w0, Duration::from_secs(seconds.min(5))) {
+                    Ok(deadline) => Some(deadline),
+                    Err(error) => {
+                        setup_error.get_or_insert(error);
+                        None
+                    }
+                };
+            if let Some(connect_deadline) = connect_deadline {
+                loop {
+                    let now = smol_now(w0);
+                    server
+                        .iface
+                        .poll(now, &mut server.device, &mut server.sockets);
+                    client
+                        .iface
+                        .poll(now, &mut client.device, &mut client.sockets);
+                    let all_ready = cli_handles
+                        .iter()
+                        .zip(srv_handles.iter())
+                        .all(|(&hc, &hs)| {
+                            matches!(
+                                client.sockets.get::<tcp::Socket>(hc).state(),
+                                tcp::State::Established
+                            ) && matches!(
+                                server.sockets.get::<tcp::Socket>(hs).state(),
+                                tcp::State::Established
+                            )
+                        });
+                    if all_ready || phases.is_cancelled() || StdInstant::now() >= connect_deadline {
+                        break;
+                    }
                 }
             }
             let established = cli_handles
@@ -4003,9 +4394,18 @@ fn shape_multi_tcp_impl(
                     )
                 })
                 .count();
+            if established != flows_per_thread {
+                setup_error.get_or_insert_with(|| {
+                    format!("established {established}/{flows_per_thread} flows")
+                });
+            }
 
             // Setup and start coordination stays outside the timed traffic loop.
-            if !phases.ready() {
+            let setup = match setup_error {
+                Some(error) => Err(error),
+                None => Ok(()),
+            };
+            if !phases.ready(setup) {
                 return;
             }
             let steady_start = StdInstant::now();
@@ -4014,10 +4414,21 @@ fn shape_multi_tcp_impl(
             let mut recvd: u64 = 0;
             let payload = vec![0xa5u8; PAYLOAD];
             let mut sink = vec![0u8; PAYLOAD];
-            let deadline = steady_start + std::time::Duration::from_secs(seconds);
+            let deadline = match checked_deadline(shape_name, steady_start, duration) {
+                Ok(deadline) => deadline,
+                Err(error) => {
+                    let _ = phases.finished(Err(error));
+                    return;
+                }
+            };
+            let mut iterations = 0u64;
             match workload {
                 MultiTcpWorkload::Echo => {
                     while StdInstant::now() < deadline {
+                        if iterations & 0xff == 0 && phases.is_cancelled() {
+                            break;
+                        }
+                        iterations = iterations.wrapping_add(1);
                         let now = smol_now(w0);
                         for &h in &cli_handles {
                             let s = client.sockets.get_mut::<tcp::Socket>(h);
@@ -4066,6 +4477,10 @@ fn shape_multi_tcp_impl(
                 }
                 MultiTcpWorkload::Sink => {
                     while StdInstant::now() < deadline {
+                        if iterations & 0xff == 0 && phases.is_cancelled() {
+                            break;
+                        }
+                        iterations = iterations.wrapping_add(1);
                         let now = smol_now(w0);
                         for &h in &cli_handles {
                             let s = client.sockets.get_mut::<tcp::Socket>(h);
@@ -4111,24 +4526,29 @@ fn shape_multi_tcp_impl(
             let lane_stats = collect_lane_stats(&[&lane_a, &lane_b]);
             // Keep every worker's sockets alive until the main thread samples
             // the active-end memory and pool boundaries.
-            let result = match setup_error {
-                Some(error) => Err(error),
-                None => Ok(MultiTcpWorkerStats {
-                    established,
-                    expected_flows: flows_per_thread,
-                    sent,
-                    received: recvd,
-                    elapsed_us,
-                    lane_stats,
-                }),
-            };
-            let _ = phases.finished(result);
+            let _ = phases.finished(Ok(MultiTcpWorkerStats {
+                established,
+                expected_flows: flows_per_thread,
+                sent,
+                received: recvd,
+                elapsed_us,
+                lane_stats,
+            }));
         }
-    });
+    })
+    .map_err(|error| format!("{shape_name}: {error}"))?;
 
     // Wait until every worker has connected its sockets, then bracket only the
     // steady phase. Workers remain blocked before start and after finish.
-    workers.wait_ready();
+    if let Err(error) = workers.wait_ready() {
+        let pool_after_teardown = pool.used();
+        if pool_after_teardown != 0 {
+            return Err(format!(
+                "{shape_name}: {error}; pool use after setup teardown was {pool_after_teardown}, expected 0"
+            ));
+        }
+        return Err(format!("{shape_name}: {error}"));
+    }
     let memory_start = process_memory_bytes();
     let alloc_before = alloc_counters_with_memory(memory_start);
     workers.start();
@@ -4205,7 +4625,6 @@ fn shape_multi_tcp_impl(
         0.0
     };
 
-    let shape_name = workload.shape_name();
     println!("\n========== shape: {shape_name} ==========");
     println!(
         "  threads:                {n_threads}   flows/thread: {flows_per_thread}   total flows: {total_flows}"
@@ -4275,11 +4694,14 @@ fn shape_churn(
     const SLOTS: usize = 256;
     const PAYLOAD: usize = 128;
 
+    let duration = checked_run_duration("churn", seconds)?;
+    let interval_us = churn_interval_us(target_conn_per_sec)?;
     let qd = (SLOTS * 16).clamp(1024, 16384);
     let pool_bytes: usize = SLOTS * 2 * MAX_BUF as usize;
     let pool = tcp::MemoryPool::new(pool_bytes);
 
-    let (mut server, mut client, lane_a, lane_b) = setup_paired_endpoints(10, 1500, qd, offload);
+    let (mut server, mut client, lane_a, lane_b) =
+        setup_paired_endpoints([10, 0, 0], 1500, qd, offload);
 
     // Pre-allocate a ring of socket handles. Each "churn slot" is a pair
     // we cycle through; once a pair is fully torn down we recycle the slot.
@@ -4306,13 +4728,8 @@ fn shape_churn(
     let mut setup_error = None;
     let payload = vec![0xc5u8; PAYLOAD];
     let mut scratch = vec![0u8; PAYLOAD];
-    let interval_us = if target_conn_per_sec > 0 {
-        1_000_000 / target_conn_per_sec as u64
-    } else {
-        100
-    };
     let mut next_open_us: u64 = 0;
-    let deadline = start + std::time::Duration::from_secs(seconds);
+    let deadline = checked_deadline("churn", start, duration)?;
 
     while StdInstant::now() < deadline {
         let elapsed_us = start.elapsed().as_micros() as u64;
@@ -4331,8 +4748,7 @@ fn shape_churn(
             if matches!(cs.state(), tcp::State::Closed)
                 && matches!(ss.state(), tcp::State::Closed | tcp::State::Listen)
             {
-                let dst_port: u16 = 10_000u16.wrapping_add(base_port);
-                let src_port: u16 = 30_000u16.wrapping_add(opened as u16);
+                let (dst_port, src_port) = flow_ports("churn", base_port as usize)?;
                 ss.set_ack_delay(None);
                 ss.set_nagle_enabled(false);
                 let listen_ok = match ss.listen(dst_port) {
@@ -4369,7 +4785,9 @@ fn shape_churn(
                     ss.abort();
                     cs.abort();
                 }
-                next_open_us += interval_us;
+                next_open_us = next_open_us
+                    .checked_add(interval_us)
+                    .ok_or_else(|| "churn: connection schedule overflowed".to_owned())?;
             }
             next_slot += 1;
             if next_slot.is_multiple_of(SLOTS) {
@@ -4506,16 +4924,30 @@ fn shape_idle_hot(
 
     const MAX_BUF: u32 = 32 * 1024;
     const PAYLOAD: usize = 1024;
-    let total = n_idle + n_active;
-    let qd = (total * 16).clamp(1024, 16384);
-    let active_socket_count = n_active * 2; // client + server
-    let expected_steady_bytes = active_socket_count * 2 * MAX_BUF as usize; // rx + tx per socket
+    let duration = checked_run_duration("idle_hot", seconds)?;
+    let total = n_idle
+        .checked_add(n_active)
+        .ok_or_else(|| "idle_hot: total flow count overflowed".to_owned())?;
+    validate_unique_flow_count("idle_hot", total)?;
+    let qd = total
+        .checked_mul(16)
+        .ok_or_else(|| "idle_hot: packet queue size overflowed".to_owned())?
+        .clamp(1024, 16384);
+    let active_socket_count = n_active
+        .checked_mul(2)
+        .ok_or_else(|| "idle_hot: active socket count overflowed".to_owned())?;
+    let expected_steady_bytes = active_socket_count
+        .checked_mul(2)
+        .and_then(|buffers| buffers.checked_mul(MAX_BUF as usize))
+        .ok_or_else(|| "idle_hot: steady pool budget overflowed".to_owned())?;
     let pool_bytes: usize = expected_steady_bytes
-        .saturating_add(2 * MAX_BUF as usize)
+        .checked_add(2 * MAX_BUF as usize)
+        .ok_or_else(|| "idle_hot: pool budget overflowed".to_owned())?
         .max(2 * MAX_BUF as usize);
     let pool = tcp::MemoryPool::new(pool_bytes);
 
-    let (mut server, mut client, lane_a, lane_b) = setup_paired_endpoints(10, 1500, qd, offload);
+    let (mut server, mut client, lane_a, lane_b) =
+        setup_paired_endpoints([10, 0, 0], 1500, qd, offload);
 
     // Active flows: open & connect.
     let mut srv_active: Vec<smoltcp::iface::SocketHandle> = Vec::with_capacity(n_active);
@@ -4524,8 +4956,7 @@ fn shape_idle_hot(
     for i in 0..n_active {
         let h_srv = add_tcp_socket_dyn(&mut server, MAX_BUF, &pool);
         let h_cli = add_tcp_socket_dyn(&mut client, MAX_BUF, &pool);
-        let dst_port: u16 = 10_000u16.wrapping_add(i as u16);
-        let src_port: u16 = 30_000u16.wrapping_add(i as u16);
+        let (dst_port, src_port) = flow_ports("idle_hot", i)?;
         {
             let s = server.sockets.get_mut::<tcp::Socket>(h_srv);
             s.set_ack_delay(None);
@@ -4564,7 +4995,8 @@ fn shape_idle_hot(
     let smol_now = |w0: StdInstant| Instant::from_micros(w0.elapsed().as_micros() as i64);
 
     // Establish active flows.
-    let connect_deadline = clock_start + std::time::Duration::from_secs(seconds.min(5));
+    let connect_deadline =
+        checked_deadline("idle_hot", clock_start, Duration::from_secs(seconds.min(5)))?;
     loop {
         let now = smol_now(clock_start);
         server
@@ -4574,8 +5006,13 @@ fn shape_idle_hot(
             .iface
             .poll(now, &mut client.device, &mut client.sockets);
         let ready = cli_active.iter().zip(srv_active.iter()).all(|(&hc, &hs)| {
-            client.sockets.get::<tcp::Socket>(hc).may_send()
-                && server.sockets.get::<tcp::Socket>(hs).may_recv()
+            matches!(
+                client.sockets.get::<tcp::Socket>(hc).state(),
+                tcp::State::Established
+            ) && matches!(
+                server.sockets.get::<tcp::Socket>(hs).state(),
+                tcp::State::Established
+            )
         });
         if ready || StdInstant::now() >= connect_deadline {
             if !ready && n_active > 0 {
@@ -4620,7 +5057,7 @@ fn shape_idle_hot(
     let payload = vec![0xa5u8; PAYLOAD];
     let mut sink = vec![0u8; PAYLOAD];
     let steady_start = StdInstant::now();
-    let deadline = steady_start + std::time::Duration::from_secs(seconds);
+    let deadline = checked_deadline("idle_hot", steady_start, duration)?;
     let alloc_before = AllocSnap::now();
     let mut mem_trace = MemTrace::start();
     while StdInstant::now() < deadline {
@@ -4791,19 +5228,7 @@ Shapes without extra parameters: udp, firehose, pingpong, small, all
 Dynamic shapes require --features socket-tcp-dynamic-buffer.
 The optional final offload value is exactly one of: offload, 1, true.";
 
-fn main() -> ExitCode {
-    #[cfg(feature = "dhat-heap")]
-    let _profiler = dhat::Profiler::builder()
-        .file_name("dhat-heap.json")
-        .build();
-    let config = match parse_args(env::args().skip(1)) {
-        Ok(config) => config,
-        Err(error) => {
-            eprintln!("error: {error}\n\n{USAGE}");
-            return ExitCode::from(2);
-        }
-    };
-
+fn run_config(config: Config) -> Result<(), String> {
     println!(
         "config: mode={} | {} checksums ({}{})",
         config.mode.label(),
@@ -4827,7 +5252,7 @@ fn main() -> ExitCode {
     let seconds = config.seconds.get();
     let offload = config.offload_checksums;
     let mode = config.mode;
-    let result = match config.shape {
+    match config.shape {
         TrafficShape::Firehose => shape_firehose(seconds, offload),
         TrafficShape::PingPong => shape_pingpong(seconds, offload),
         TrafficShape::Small => shape_small(seconds, offload),
@@ -4859,9 +5284,23 @@ fn main() -> ExitCode {
         TrafficShape::IdleHot { idle, active } => {
             shape_idle_hot(seconds, idle, active, offload, mode)
         }
+    }
+}
+
+fn main() -> ExitCode {
+    #[cfg(feature = "dhat-heap")]
+    let _profiler = dhat::Profiler::builder()
+        .file_name("dhat-heap.json")
+        .build();
+    let config = match parse_args(env::args().skip(1)) {
+        Ok(config) => config,
+        Err(error) => {
+            eprintln!("error: {error}\n\n{USAGE}");
+            return ExitCode::from(2);
+        }
     };
 
-    match result {
+    match run_config(config) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("error: {error}");
