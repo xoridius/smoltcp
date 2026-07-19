@@ -1014,13 +1014,6 @@ impl<'a> Socket<'a> {
         }
     }
 
-    #[cfg(feature = "socket-tcp-dynamic-buffer")]
-    #[cold]
-    fn release_dyn_buffers_to_initial(&mut self) {
-        self.release_dyn_buffers();
-        self.restore_dyn_initial_buffers();
-    }
-
     /// Release for the connection-is-gone case (RST received, abort RST
     /// emitted, final ACK in LastAck): no segment can ever be emitted or
     /// accepted again, so the tx side is released immediately — its
@@ -1451,6 +1444,17 @@ impl<'a> Socket<'a> {
         }
     }
 
+    fn rearm_listener(&mut self) {
+        let listen_endpoint = self.listen_endpoint;
+        debug_assert_ne!(listen_endpoint.port, 0);
+
+        self.reset();
+        #[cfg(feature = "socket-tcp-dynamic-buffer")]
+        self.restore_dyn_initial_buffers();
+        self.listen_endpoint = listen_endpoint;
+        self.set_state(State::Listen);
+    }
+
     /// Start listening on the given endpoint.
     ///
     /// This function returns `Err(Error::InvalidState)` if the socket was already open
@@ -1481,12 +1485,8 @@ impl<'a> Socket<'a> {
             }
         }
 
-        self.reset();
-        #[cfg(feature = "socket-tcp-dynamic-buffer")]
-        self.restore_dyn_initial_buffers();
         self.listen_endpoint = local_endpoint;
-        self.tuple = None;
-        self.set_state(State::Listen);
+        self.rearm_listener();
         Ok(())
     }
 
@@ -1980,18 +1980,6 @@ impl<'a> Socket<'a> {
             self.cancel_no_control_retry();
         }
 
-        // Dynamic-buffer: keep the state setter from eagerly clearing
-        // buffers in `Closed`. Some callers still need the queued lengths
-        // after the transition, e.g. to build an outbound RST ACK or to
-        // dequeue a final ACK in LAST-ACK. The one safe transition here is
-        // a failed passive handshake returning SynReceived -> Listen: no
-        // packet will be emitted for that peer, and the listen socket must
-        // return to its configured idle footprint.
-        #[cfg(feature = "socket-tcp-dynamic-buffer")]
-        if state == State::Listen && old_state == State::SynReceived {
-            self.release_dyn_buffers_to_initial();
-        }
-
         #[cfg(feature = "async")]
         {
             // Wake all tasks waiting. Even if we haven't received/sent data, this
@@ -2478,9 +2466,7 @@ impl<'a> Socket<'a> {
             // reason is TCP simultaneous open).
             (State::SynReceived, TcpControl::Rst) if self.listen_endpoint.port != 0 => {
                 tcp_trace!("received RST");
-                self.tuple = None;
-                self.reset_congestion_controller();
-                self.set_state(State::Listen);
+                self.rearm_listener();
                 return None;
             }
 
@@ -3085,7 +3071,7 @@ impl<'a> Socket<'a> {
         // right edge after scheduling. Any positive window still permits an
         // ACK-soliciting SND.UNA retransmission; zero windows cancel the retry
         // during ingress and are also excluded by dispatch eligibility.
-        if offset >= tx_len || offset >= self.remote_win_len as usize {
+        if offset >= tx_len || offset >= congestion::window_to_usize(self.remote_win_len) {
             offset = 0;
         }
         self.local_seq_no + offset
@@ -3211,8 +3197,11 @@ impl<'a> Socket<'a> {
         }
 
         // max sequence number we can send.
-        let max_send_seq =
-            self.local_seq_no + core::cmp::min(self.remote_win_len as usize, self.tx_buffer.len());
+        let max_send_seq = self.local_seq_no
+            + core::cmp::min(
+                congestion::window_to_usize(self.remote_win_len),
+                self.tx_buffer.len(),
+            );
 
         // Max amount of octets we can send, limited by the remote window.
         let capped_send_seq = if max_send_seq >= self.remote_last_seq {
@@ -3689,7 +3678,8 @@ impl<'a> Socket<'a> {
                 // from the transmit buffer.
 
                 // Right edge of window, ie the max sequence number we're allowed to send.
-                let win_right_edge = self.local_seq_no + self.remote_win_len as usize;
+                let win_right_edge =
+                    self.local_seq_no + congestion::window_to_usize(self.remote_win_len);
 
                 // Max amount of octets we're allowed to send according to the remote window.
                 let mut win_limit = if win_right_edge >= self.remote_last_seq {
@@ -12303,55 +12293,148 @@ mod test {
     #[test]
     fn passive_rst_resets_controller_before_next_no_mss_syn() {
         for controller in managed_controllers() {
-            let mut s = socket();
+            let mut s = socket_with_buffer_sizes(64, 1 << 16);
             s.set_congestion_control(controller);
+            s.set_timeout(Some(Duration::from_secs(30)));
+            s.set_keep_alive(Some(Duration::from_secs(10)));
+            s.set_hop_limit(Some(42));
+            s.set_ack_delay(Some(Duration::from_millis(7)));
+            s.set_nagle_enabled(false);
+            s.set_tsval_generator(Some(|| 100));
             s.listen(LISTEN_END).unwrap();
+            assert_eq!(s.remote_win_shift, 1);
+
             send!(
                 s,
+                time 0,
                 TcpRepr {
                     control: TcpControl::Syn,
                     seq_number: REMOTE_SEQ,
                     ack_number: None,
                     max_seg_size: Some(1_460),
+                    sack_permitted: true,
+                    timestamp: Some(TcpTimestampRepr::new(500, 0)),
                     ..SEND_TEMPL
                 }
             );
+            let first_local_seq = s.local_seq_no;
+            assert_eq!(s.state(), State::SynReceived);
+            assert_eq!(s.remote_win_shift, 0);
+            assert_eq!(s.last_remote_tsval, 500);
             recv!(
                 s,
+                time 0,
                 [TcpRepr {
                     control: TcpControl::Syn,
-                    seq_number: LOCAL_SEQ,
+                    seq_number: first_local_seq,
                     ack_number: Some(REMOTE_SEQ + 1),
+                    window_len: u16::MAX,
                     max_seg_size: Some(BASE_MSS),
+                    sack_permitted: true,
+                    timestamp: Some(TcpTimestampRepr::new(100, 500)),
                     ..RECV_TEMPL
                 }]
             );
             poison_congestion_history(&mut s);
+            s.rtte.sample(250);
+            let _ = s.assembler.add(0, 1);
+            let _ = s.sack_scoreboard.add(0, 1);
+            s.local_rx_last_ack = Some(first_local_seq);
+            s.local_rx_last_seq = Some(REMOTE_SEQ);
+            s.local_rx_dup_acks = 2;
+            let recovery_point = s.local_seq_next;
+            s.set_recovery_point(Some(recovery_point));
+            s.flags.insert(Flags::SACK_REDUNDANT_PASS);
+            s.flags.insert(Flags::NO_CONTROL_RETRY);
+            s.flags.insert(Flags::RECOVERY_AFTER_RTO);
 
             send!(
                 s,
+                time 1,
                 TcpRepr {
                     control: TcpControl::Rst,
                     seq_number: REMOTE_SEQ + 1,
-                    ack_number: Some(LOCAL_SEQ),
+                    ack_number: Some(first_local_seq),
                     ..SEND_TEMPL
                 }
             );
             assert_eq!(s.state(), State::Listen);
+            assert_eq!(s.listen_endpoint(), LISTEN_END);
+            assert_eq!(s.tuple, None);
             assert_fresh_default_controller(&s, controller);
+            assert_eq!(s.last_remote_tsval, 0, "PAWS history must be reset");
+            assert_eq!(s.remote_last_ts, None);
+            assert_eq!(s.local_seq_no, TcpSeqNumber::default());
+            assert_eq!(s.local_seq_next, TcpSeqNumber::default());
+            assert_eq!(s.remote_seq_no, TcpSeqNumber::default());
+            assert_eq!(s.remote_last_seq, TcpSeqNumber::default());
+            assert_eq!(s.remote_last_ack, None);
+            assert_eq!(s.remote_last_win, 0);
+            assert_eq!(s.remote_win_len, 0);
+            assert_eq!(s.remote_win_scale, None);
+            assert_eq!(s.remote_win_shift, 1);
+            assert!(s.assembler.is_empty());
+            assert!(s.sack_scoreboard.is_empty());
+            assert!(!s.flags.contains(Flags::REMOTE_HAS_SACK));
+            assert!(!s.flags.contains(Flags::LOCAL_HAS_SACK));
+            assert!(!s.flags.contains(Flags::SACK_REDUNDANT_PASS));
+            assert!(!s.flags.contains(Flags::NO_CONTROL_RETRY));
+            assert!(!s.flags.contains(Flags::RECOVERY_AFTER_RTO));
+            assert_eq!(s.recovery_point(), None);
+            assert_eq!(s.local_rx_last_ack, None);
+            assert_eq!(s.local_rx_last_seq, None);
+            assert_eq!(s.local_rx_dup_acks, 0);
+            assert!(!s.rtte.have_measurement);
+            assert_eq!(s.rtte.timestamp, None);
+            assert_eq!(s.timeout(), Some(Duration::from_secs(30)));
+            assert_eq!(s.keep_alive(), Some(Duration::from_secs(10)));
+            assert_eq!(s.hop_limit(), Some(42));
+            assert_eq!(s.ack_delay(), Some(Duration::from_millis(7)));
+            assert!(!s.nagle_enabled());
+            assert!(s.timestamp_enabled());
 
-            send!(
-                s,
-                TcpRepr {
+            let second_syn_reply = send(
+                &mut s,
+                Instant::from_millis(1_100),
+                &TcpRepr {
                     control: TcpControl::Syn,
                     seq_number: REMOTE_SEQ,
                     ack_number: None,
                     max_seg_size: None,
+                    window_scale: Some(7),
+                    sack_permitted: true,
+                    timestamp: Some(TcpTimestampRepr::new(100, 0)),
                     ..SEND_TEMPL
-                }
+                },
+            );
+            assert_eq!(
+                second_syn_reply, None,
+                "fresh listener must accept lower TSval"
             );
             assert_eq!(s.state(), State::SynReceived);
             assert_fresh_default_controller(&s, controller);
+            assert_eq!(s.remote_win_shift, 1);
+            assert_eq!(s.remote_win_scale, Some(7));
+            assert!(s.flags.contains(Flags::REMOTE_HAS_SACK));
+            assert!(s.flags.contains(Flags::LOCAL_HAS_SACK));
+            assert_eq!(s.last_remote_tsval, 100);
+
+            let second_local_seq = s.local_seq_no;
+            recv!(
+                s,
+                time 1_100,
+                [TcpRepr {
+                    control: TcpControl::Syn,
+                    seq_number: second_local_seq,
+                    ack_number: Some(REMOTE_SEQ + 1),
+                    window_len: u16::MAX,
+                    window_scale: Some(1),
+                    max_seg_size: Some(BASE_MSS),
+                    sack_permitted: true,
+                    timestamp: Some(TcpTimestampRepr::new(100, 100)),
+                    ..RECV_TEMPL
+                }]
+            );
         }
     }
 

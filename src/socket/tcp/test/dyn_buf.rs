@@ -1146,17 +1146,13 @@ fn syn_received_rst_to_listen_releases_pool_charge() {
     s.remote_seq_no = REMOTE_SEQ + 1;
     s.remote_last_seq = LOCAL_SEQ;
     assert!(s.try_grow_rx());
+    assert!(s.try_grow_tx());
     let charged = pool.used();
-    assert!(charged > 0, "rx grow should have charged the pool");
+    assert!(charged > 0, "buffer growth should have charged the pool");
 
-    // Now simulate the smoltcp handler's response to RST in
-    // SynReceived for a listen socket: return to Listen.
-    s.tuple = None;
-    s.set_state(State::Listen);
+    // Exercise the same full-TCB listener rearm used by the RST handler.
+    s.rearm_listener();
 
-    // The fix: this transition now releases the dynamic buffers
-    // so the listen socket goes back to the zero-charge state
-    // it had before the SYN arrived.
     assert_eq!(
         pool.used(),
         0,
@@ -1165,6 +1161,8 @@ fn syn_received_rst_to_listen_releases_pool_charge() {
     assert_eq!(s.rx_buffer.capacity(), 0);
     assert_eq!(s.tx_buffer.capacity(), 0);
     assert_eq!(s.state, State::Listen);
+    assert_eq!(s.listen_endpoint, LISTEN_END);
+    assert_eq!(s.tuple, None);
 }
 
 #[test]
@@ -1189,12 +1187,14 @@ fn syn_received_rst_to_listen_restores_nonzero_initial_capacity() {
     s.remote_seq_no = REMOTE_SEQ + 1;
     s.remote_last_seq = LOCAL_SEQ;
     assert!(s.try_grow_rx());
+    assert!(s.try_grow_tx());
     assert!(pool.used() > 6 * 1024);
 
-    s.tuple = None;
-    s.set_state(State::Listen);
+    s.rearm_listener();
 
     assert_eq!(s.state, State::Listen);
+    assert_eq!(s.listen_endpoint, LISTEN_END);
+    assert_eq!(s.tuple, None);
     assert_eq!(pool.used(), 6 * 1024);
     assert_eq!(s.rx_buffer.capacity(), 4 * 1024);
     assert_eq!(s.tx_buffer.capacity(), 2 * 1024);
