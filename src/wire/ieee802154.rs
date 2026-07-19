@@ -332,12 +332,15 @@ impl<T: AsRef<[u8]>> Frame<T> {
             };
 
         if self.security_enabled() {
-            // First check that we can access the security header control bits.
-            if offset + 1 > self.buffer.as_ref().len() {
+            if offset.checked_add(1).ok_or(Error)? > self.buffer.as_ref().len() {
                 return Err(Error);
             }
 
-            offset += self.security_header_len();
+            let control = self.security_control().ok_or(Error)?;
+            offset = offset
+                .checked_add(self.security_header_len())
+                .and_then(|offset| offset.checked_add(Self::mic_len(Some(control))))
+                .ok_or(Error)?;
         }
 
         if offset > self.buffer.as_ref().len() {
@@ -577,6 +580,18 @@ impl<T: AsRef<[u8]>> Frame<T> {
         index
     }
 
+    /// Return the auxiliary security control field when security is enabled.
+    fn security_control(&self) -> Option<u8> {
+        if !self.security_enabled() {
+            return None;
+        }
+
+        self.buffer
+            .as_ref()
+            .get(self.aux_security_header_start())
+            .copied()
+    }
+
     /// Return the size of the security header.
     fn security_header_len(&self) -> usize {
         let mut size = 1;
@@ -615,48 +630,59 @@ impl<T: AsRef<[u8]>> Frame<T> {
         })
     }
 
+    fn mic_len(control: Option<u8>) -> usize {
+        match control.map(|control| control & 0b111) {
+            Some(1 | 5) => 4,
+            Some(2 | 6) => 8,
+            Some(3 | 7) => 16,
+            _ => 0,
+        }
+    }
+
     /// Return the security level of the auxiliary security header.
     pub fn security_level(&self) -> u8 {
-        let index = self.aux_security_header_start();
-        let b = self.buffer.as_ref()[index..][0];
-        b & 0b111
+        self.security_control().map_or(0, |control| control & 0b111)
     }
 
     /// Return the key identifier mode used by the auxiliary security header.
     pub fn key_identifier_mode(&self) -> u8 {
-        let index = self.aux_security_header_start();
-        let b = self.buffer.as_ref()[index..][0];
-        (b >> 3) & 0b11
+        self.security_control()
+            .map_or(0, |control| (control >> 3) & 0b11)
     }
 
     /// Return `true` when the frame counter in the security header is suppressed.
     pub fn frame_counter_suppressed(&self) -> bool {
-        let index = self.aux_security_header_start();
-        let b = self.buffer.as_ref()[index..][0];
-        ((b >> 5) & 0b1) == 0b1
+        self.security_control()
+            .is_some_and(|control| control & (1 << 5) != 0)
     }
 
     /// Return the frame counter field.
     pub fn frame_counter(&self) -> Option<u32> {
-        if self.frame_counter_suppressed() {
-            None
-        } else {
-            let index = self.aux_security_header_start();
-            let b = &self.buffer.as_ref()[index..];
-            Some(LittleEndian::read_u32(&b[1..1 + 4]))
+        let control = self.security_control()?;
+        if control & (1 << 5) != 0 {
+            return None;
         }
+
+        let index = self.aux_security_header_start();
+        Some(LittleEndian::read_u32(
+            &self.buffer.as_ref()[index + 1..index + 5],
+        ))
     }
 
     /// Return the Key Identifier field.
     fn key_identifier(&self) -> &[u8] {
-        let index = self.aux_security_header_start();
-        let b = &self.buffer.as_ref()[index..];
+        let Some(control) = self.security_control() else {
+            return &[];
+        };
+
         let length = if let Some(len) = self.key_identifier_length() {
             len as usize
         } else {
             0
         };
-        &b[5..][..length]
+        let frame_counter_len = if control & (1 << 5) == 0 { 4 } else { 0 };
+        let index = self.aux_security_header_start() + 1 + frame_counter_len;
+        &self.buffer.as_ref()[index..index + length]
     }
 
     /// Return the Key Source field.
@@ -676,15 +702,12 @@ impl<T: AsRef<[u8]>> Frame<T> {
 
     /// Return the Message Integrity Code (MIC).
     pub fn message_integrity_code(&self) -> Option<&[u8]> {
-        let mic_len = match self.security_level() {
-            0 | 4 => return None,
-            1 | 5 => 4,
-            2 | 6 => 8,
-            3 | 7 => 16,
-            _ => panic!(),
-        };
+        let mic_len = Self::mic_len(self.security_control());
+        if mic_len == 0 {
+            return None;
+        }
 
-        let data = &self.buffer.as_ref();
+        let data = self.buffer.as_ref();
         let len = data.len();
 
         Some(&data[len - mic_len..])
@@ -1172,5 +1195,72 @@ mod test {
             0x05, // security control field
             0x31,0x01,0x00,0x00, // frame counter
         ][..],
+    }
+
+    #[test]
+    fn security_mic_lengths() {
+        for (level, mic_len) in [0, 4, 8, 16, 0, 4, 8, 16].into_iter().enumerate() {
+            let mut bytes = vec![0x09, 0x20, 0x00, 0x20 | level as u8];
+            bytes.resize(bytes.len() + mic_len, 0xa5);
+
+            let frame = Frame::new_checked(&bytes).unwrap();
+            assert_eq!(
+                frame.message_integrity_code().map(<[u8]>::len),
+                (mic_len != 0).then_some(mic_len),
+                "security level {level}"
+            );
+        }
+    }
+
+    #[test]
+    fn truncated_security_mic_is_rejected() {
+        for (level, mic_len) in [(1, 4), (2, 8), (3, 16), (5, 4), (6, 8), (7, 16)] {
+            let mut bytes = vec![0x09, 0x20, 0x00, 0x20 | level];
+            bytes.resize(bytes.len() + mic_len - 1, 0xa5);
+
+            assert_eq!(
+                Frame::new_checked(&bytes).unwrap_err(),
+                Error,
+                "security level {level}"
+            );
+        }
+    }
+
+    #[test]
+    fn unsecured_security_accessors_are_absent() {
+        let bytes = [0x01, 0x20, 0x00];
+        let frame = Frame::new_checked(&bytes).unwrap();
+
+        assert_eq!(frame.security_level(), 0);
+        assert_eq!(frame.key_identifier_mode(), 0);
+        assert!(!frame.frame_counter_suppressed());
+        assert_eq!(frame.frame_counter(), None);
+        assert_eq!(frame.key_source(), None);
+        assert_eq!(frame.key_index(), None);
+        assert_eq!(frame.message_integrity_code(), None);
+    }
+
+    #[test]
+    fn missing_security_control_is_rejected() {
+        for bytes in [[0x09, 0x20, 0x00], [0x08, 0x00, 0x94]] {
+            assert_eq!(Frame::new_checked(&bytes).unwrap_err(), Error);
+        }
+    }
+
+    #[test]
+    fn counter_suppressed_key_identifier() {
+        let bytes = [
+            0x09, 0x20, 0x00, 0x29, // header and security control
+            0x2a, // key index
+            0x99, // payload
+            0xa1, 0xa2, 0xa3, 0xa4, // MIC
+        ];
+        let frame = Frame::new_checked(&bytes).unwrap();
+
+        assert_eq!(frame.frame_counter(), None);
+        assert_eq!(frame.key_source(), None);
+        assert_eq!(frame.key_index(), Some(0x2a));
+        assert_eq!(frame.message_integrity_code(), Some(&bytes[6..]));
+        assert_eq!(frame.payload(), Some(&bytes[5..]));
     }
 }
