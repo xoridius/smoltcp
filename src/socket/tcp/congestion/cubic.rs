@@ -1,6 +1,6 @@
 use crate::{socket::tcp::RttEstimator, time::Instant};
 
-use super::Controller;
+use super::{Controller, initial_window, window_to_usize};
 
 // Constants for the Cubic congestion control algorithm.
 // See RFC 9438.
@@ -113,7 +113,7 @@ fn cubic_increment(target: usize, cwnd: usize, segment: usize) -> usize {
 
 impl Controller for Cubic {
     fn window(&self) -> usize {
-        self.cwnd as usize
+        window_to_usize(self.cwnd)
     }
 
     fn on_ack(&mut self, now: Instant, len: usize, in_flight: usize, rtt: &RttEstimator) {
@@ -208,7 +208,8 @@ impl Controller for Cubic {
 
         // TODO: clamps to 0 on small w_cubic_target (i.e. close to plateau)
         // add additional counter (linux `cwnd_cnt`?) to track "lost" bytes
-        let increment = cubic_increment(w_cubic_target as usize, self.cwnd as usize, segment);
+        let increment =
+            cubic_increment(w_cubic_target as usize, window_to_usize(self.cwnd), segment);
         self.cwnd = self
             .cwnd
             .saturating_add(window_to_u32(increment))
@@ -287,10 +288,11 @@ impl Controller for Cubic {
         // min(10*MSS, max(2*MSS, 14600)) — when the peer's MSS is learned on
         // the SYN, rather than upstream's flat 2*MSS. Faster first-RTT ramp for
         // short flows.
-        self.cwnd = self.cwnd.max(
-            mss.saturating_mul(10)
-                .min(mss.saturating_mul(2).max(14_600)),
-        );
+        let initial_window = initial_window(mss);
+        self.cwnd = initial_window;
+        self.w_max = initial_window;
+        self.w_est = initial_window as f64;
+        self.cwnd_prior = initial_window;
         self.recompute_k();
     }
 
@@ -366,6 +368,7 @@ fn cube_root(a: f64) -> f64 {
 
 #[cfg(test)]
 mod test {
+    use crate::socket::tcp::congestion::AnyController;
     use crate::{socket::tcp::RttEstimator, time::Instant};
 
     use super::*;
@@ -736,10 +739,90 @@ mod test {
     // = min(10*MSS, max(2*MSS, 14600)).
     #[test]
     fn cubic_iw10_on_set_mss() {
+        for (mss, expected) in [(48, 480), (536, 5_360), (1_460, 14_600)] {
+            let mut cubic = Cubic::new();
+            cubic.set_mss(mss);
+            assert_eq!(cubic.window(), expected, "MSS {mss}");
+        }
+    }
+
+    #[test]
+    fn cubic_set_mss_reinitializes_iw_history() {
         let mut cubic = Cubic::new();
-        cubic.set_remote_window(64 * 1024);
-        cubic.set_mss(1460);
-        assert_eq!(cubic.window(), 14_600);
+        cubic.cwnd = 100_000;
+        cubic.w_max = 90_000;
+        cubic.w_est = 80_000.0;
+        cubic.cwnd_prior = 70_000;
+
+        cubic.set_mss(536);
+
+        assert_eq!(cubic.cwnd, 5_360);
+        assert_eq!(cubic.w_max, 5_360);
+        assert_eq!(cubic.w_est, 5_360.0);
+        assert_eq!(cubic.cwnd_prior, 5_360);
+        assert_eq!(
+            cubic.k,
+            cube_root(5_360.0 * (1.0 - BETA_CUBIC) / (C * 536.0))
+        );
+    }
+
+    #[test]
+    fn cubic_any_controller_reset_preserves_variant_and_clears_all_fields() {
+        let mut controller = AnyController::Cubic(Cubic {
+            k: 1.0,
+            w_est: 2.0,
+            recovery_start: Some(Instant::from_millis(3)),
+            idle_start: Some(Instant::from_millis(4)),
+            w_max: 5,
+            cwnd: 6,
+            mss: 7,
+            ssthresh: 8,
+            rwnd: 9,
+            cwnd_prior: 10,
+            in_fast_recovery: true,
+            in_rto_recovery: true,
+        });
+
+        controller.reset();
+
+        let fresh = Cubic::new();
+        let cubic = match &controller {
+            AnyController::Cubic(cubic) => cubic,
+            _ => panic!("reset changed CUBIC variant"),
+        };
+        assert_eq!(cubic.k, fresh.k);
+        assert_eq!(cubic.w_est, fresh.w_est);
+        assert_eq!(cubic.recovery_start, fresh.recovery_start);
+        assert_eq!(cubic.idle_start, fresh.idle_start);
+        assert_eq!(cubic.w_max, fresh.w_max);
+        assert_eq!(cubic.cwnd, fresh.cwnd);
+        assert_eq!(cubic.mss, fresh.mss);
+        assert_eq!(cubic.ssthresh, fresh.ssthresh);
+        assert_eq!(cubic.rwnd, fresh.rwnd);
+        assert_eq!(cubic.cwnd_prior, fresh.cwnd_prior);
+        assert_eq!(cubic.in_fast_recovery, fresh.in_fast_recovery);
+        assert_eq!(cubic.in_rto_recovery, fresh.in_rto_recovery);
+
+        controller.set_mss(536);
+        let cubic = match &controller {
+            AnyController::Cubic(cubic) => cubic,
+            _ => panic!("set_mss changed CUBIC variant"),
+        };
+        assert_eq!(cubic.cwnd, 5_360);
+        assert_eq!(cubic.mss, 536);
+        assert_eq!(cubic.w_max, 5_360);
+        assert_eq!(cubic.w_est, 5_360.0);
+        assert_eq!(cubic.cwnd_prior, 5_360);
+        assert_eq!(cubic.ssthresh, u32::MAX);
+        assert_eq!(cubic.rwnd, 64 * DEFAULT_MSS);
+        assert_eq!(cubic.recovery_start, None);
+        assert_eq!(cubic.idle_start, None);
+        assert!(!cubic.in_fast_recovery);
+        assert!(!cubic.in_rto_recovery);
+        assert_eq!(
+            cubic.k,
+            cube_root(5_360.0 * (1.0 - BETA_CUBIC) / (C * 536.0))
+        );
     }
 
     // The controller's rwnd is a grow-only high-water mark bounding cwnd; the

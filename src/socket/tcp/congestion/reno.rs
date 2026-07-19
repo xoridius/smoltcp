@@ -1,6 +1,6 @@
 use crate::{socket::tcp::RttEstimator, time::Instant};
 
-use super::Controller;
+use super::{Controller, initial_window, window_to_usize};
 
 const DEFAULT_MSS: u32 = 1024;
 
@@ -44,7 +44,7 @@ impl Reno {
 
 impl Controller for Reno {
     fn window(&self) -> usize {
-        self.cwnd as usize
+        window_to_usize(self.cwnd)
     }
 
     fn on_ack(&mut self, _now: Instant, len: usize, _in_flight: usize, _rtt: &RttEstimator) {
@@ -129,10 +129,7 @@ impl Controller for Reno {
         // min(10*MSS, max(2*MSS, 14600)) — when the peer's MSS is learned on
         // the SYN, rather than upstream's flat 2*MSS. Faster first-RTT ramp for
         // short flows.
-        self.cwnd = self.cwnd.max(
-            mss.saturating_mul(10)
-                .min(mss.saturating_mul(2).max(14_600)),
-        );
+        self.cwnd = initial_window(mss);
     }
 
     fn set_remote_window(&mut self, remote_window: usize) {
@@ -145,6 +142,7 @@ impl Controller for Reno {
 
 #[cfg(test)]
 mod test {
+    use crate::socket::tcp::congestion::AnyController;
     use crate::time::Instant;
 
     use super::*;
@@ -500,15 +498,59 @@ mod test {
     // = min(10*MSS, max(2*MSS, 14600)).
     #[test]
     fn reno_iw10_on_set_mss() {
-        let mut reno = Reno::new();
-        reno.set_remote_window(64 * 1024);
-        reno.set_mss(1460);
-        assert_eq!(reno.window(), 14_600);
+        for (mss, expected) in [(48, 480), (536, 5_360), (1_460, 14_600)] {
+            let mut reno = Reno::new();
+            reno.set_mss(mss);
+            assert_eq!(reno.window(), expected, "MSS {mss}");
+        }
+    }
 
+    #[test]
+    fn reno_set_mss_replaces_stale_cwnd() {
         let mut reno = Reno::new();
-        reno.set_remote_window(64 * 1024);
+        reno.cwnd = 100_000;
+
         reno.set_mss(536);
+
         assert_eq!(reno.window(), 5_360);
+    }
+
+    #[test]
+    fn reno_any_controller_reset_preserves_variant_and_clears_all_fields() {
+        let mut controller = AnyController::Reno(Reno {
+            cwnd: 10,
+            mss: 11,
+            ssthresh: 12,
+            rwnd: 13,
+            in_fast_recovery: true,
+            in_rto_recovery: true,
+        });
+
+        controller.reset();
+
+        let fresh = Reno::new();
+        let reno = match &controller {
+            AnyController::Reno(reno) => reno,
+            _ => panic!("reset changed Reno variant"),
+        };
+        assert_eq!(reno.cwnd, fresh.cwnd);
+        assert_eq!(reno.mss, fresh.mss);
+        assert_eq!(reno.ssthresh, fresh.ssthresh);
+        assert_eq!(reno.rwnd, fresh.rwnd);
+        assert_eq!(reno.in_fast_recovery, fresh.in_fast_recovery);
+        assert_eq!(reno.in_rto_recovery, fresh.in_rto_recovery);
+
+        controller.set_mss(536);
+        let reno = match &controller {
+            AnyController::Reno(reno) => reno,
+            _ => panic!("set_mss changed Reno variant"),
+        };
+        assert_eq!(reno.cwnd, 5_360);
+        assert_eq!(reno.mss, 536);
+        assert_eq!(reno.ssthresh, u32::MAX);
+        assert_eq!(reno.rwnd, 64 * DEFAULT_MSS);
+        assert!(!reno.in_fast_recovery);
+        assert!(!reno.in_rto_recovery);
     }
 
     // The controller's rwnd is a grow-only high-water mark bounding cwnd; the

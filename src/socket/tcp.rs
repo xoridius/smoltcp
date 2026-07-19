@@ -688,6 +688,9 @@ impl<'a> Socket<'a> {
             panic!("receiving buffer too large, cannot exceed 1 GiB")
         }
 
+        let mut congestion_controller = congestion::AnyController::new();
+        congestion_controller.set_mss(DEFAULT_MSS);
+
         Socket {
             state: State::Closed,
             timer: Timer::new(),
@@ -723,7 +726,7 @@ impl<'a> Socket<'a> {
             challenge_ack_timer: Instant::from_secs(0),
             tsval_generator: None,
             last_remote_tsval: 0,
-            congestion_controller: congestion::AnyController::new(),
+            congestion_controller,
 
             #[cfg(feature = "async")]
             rx_waker: WakerRegistration::new(),
@@ -1096,6 +1099,11 @@ impl<'a> Socket<'a> {
             CongestionControl::Cubic => AnyController::Cubic(cubic::Cubic::new()),
         };
 
+        self.congestion_controller
+            .set_mss(congestion::window_to_usize(self.remote_mss));
+        self.congestion_controller
+            .set_remote_window(congestion::window_to_usize(self.remote_win_len));
+
         if self.congestion_controller.manages_window() {
             self.cancel_no_control_retry();
         }
@@ -1372,6 +1380,13 @@ impl<'a> Socket<'a> {
         self.flags.set(Flags::RECOVERY_ACTIVE, point.is_some());
     }
 
+    fn reset_congestion_controller(&mut self) {
+        self.remote_mss = DEFAULT_MSS as u32;
+        self.congestion_controller.reset();
+        self.congestion_controller
+            .set_mss(congestion::window_to_usize(self.remote_mss));
+    }
+
     fn reset(&mut self) {
         // For dynamic-buffer sockets, the window-scale must be sized for the
         // per-flow maximum, not the (post-release, possibly zero) current
@@ -1415,12 +1430,15 @@ impl<'a> Socket<'a> {
         self.remote_seq_no = TcpSeqNumber::default();
         self.remote_last_seq = TcpSeqNumber::default();
         self.remote_last_ack = None;
+        self.local_rx_last_ack = None;
+        self.local_rx_last_seq = None;
+        self.local_rx_dup_acks = 0;
         self.remote_last_win = 0;
         self.flags.set(Flags::REMOTE_LAST_WIN_UNSCALED, false);
         self.remote_win_len = 0;
         self.remote_win_scale = None;
         self.remote_win_shift = new_win_shift;
-        self.remote_mss = DEFAULT_MSS as u32;
+        self.reset_congestion_controller();
         self.remote_last_ts = None;
         self.last_remote_tsval = 0;
         self.ack_delay_timer = AckDelayTimer::Idle;
@@ -2461,6 +2479,7 @@ impl<'a> Socket<'a> {
             (State::SynReceived, TcpControl::Rst) if self.listen_endpoint.port != 0 => {
                 tcp_trace!("received RST");
                 self.tuple = None;
+                self.reset_congestion_controller();
                 self.set_state(State::Listen);
                 return None;
             }
@@ -2655,7 +2674,7 @@ impl<'a> Socket<'a> {
         }
 
         self.congestion_controller
-            .set_remote_window(new_remote_win_len as usize);
+            .set_remote_window(congestion::window_to_usize(new_remote_win_len));
 
         if ack_len > 0 {
             // Dequeue acknowledged octets.
@@ -12184,6 +12203,206 @@ mod test {
 
         s.set_congestion_control(CongestionControl::None);
         assert_eq!(s.congestion_control(), CongestionControl::None);
+    }
+
+    #[cfg(any(feature = "socket-tcp-reno", feature = "socket-tcp-cubic"))]
+    fn managed_controllers() -> Vec<CongestionControl> {
+        vec![
+            #[cfg(feature = "socket-tcp-reno")]
+            CongestionControl::Reno,
+            #[cfg(feature = "socket-tcp-cubic")]
+            CongestionControl::Cubic,
+        ]
+    }
+
+    #[cfg(any(feature = "socket-tcp-reno", feature = "socket-tcp-cubic"))]
+    fn poison_congestion_history(s: &mut TestSocket) {
+        s.remote_mss = 1_460;
+        s.remote_win_len = 100_000;
+        s.congestion_controller.set_mss(1_460);
+        s.congestion_controller.set_remote_window(100_000);
+        s.congestion_controller
+            .on_loss(Instant::from_millis(1), 14_600);
+    }
+
+    #[cfg(any(feature = "socket-tcp-reno", feature = "socket-tcp-cubic"))]
+    fn assert_fresh_default_controller(s: &TestSocket, expected: CongestionControl) {
+        assert_eq!(s.congestion_control(), expected);
+        assert_eq!(s.remote_mss, DEFAULT_MSS as u32);
+        assert_eq!(s.congestion_controller.window(), 5_360);
+    }
+
+    #[cfg(any(feature = "socket-tcp-reno", feature = "socket-tcp-cubic"))]
+    #[test]
+    fn new_controller_uses_default_mss_iw() {
+        let s = socket();
+
+        assert_eq!(s.remote_mss, DEFAULT_MSS as u32);
+        assert_eq!(s.congestion_controller.window(), 5_360);
+    }
+
+    #[cfg(any(feature = "socket-tcp-reno", feature = "socket-tcp-cubic"))]
+    #[test]
+    fn peer_without_mss_uses_default_mss_iw() {
+        for controller in managed_controllers() {
+            let mut s = socket();
+            s.set_congestion_control(controller);
+            s.listen(LISTEN_END).unwrap();
+
+            send!(
+                s,
+                TcpRepr {
+                    control: TcpControl::Syn,
+                    seq_number: REMOTE_SEQ,
+                    ack_number: None,
+                    max_seg_size: None,
+                    ..SEND_TEMPL
+                }
+            );
+
+            assert_fresh_default_controller(&s, controller);
+        }
+    }
+
+    #[cfg(any(feature = "socket-tcp-reno", feature = "socket-tcp-cubic"))]
+    #[test]
+    fn reconnect_and_relisten_reset_controller_history() {
+        for controller in managed_controllers() {
+            let mut s = socket_established();
+            s.set_congestion_control(controller);
+            poison_congestion_history(&mut s);
+            s.local_rx_last_ack = Some(LOCAL_SEQ);
+            s.local_rx_last_seq = Some(REMOTE_SEQ);
+            s.local_rx_dup_acks = 2;
+
+            s.abort();
+            s.socket
+                .connect(&mut s.cx, REMOTE_END, LOCAL_END.port)
+                .unwrap();
+
+            assert_fresh_default_controller(&s, controller);
+            assert_eq!(s.local_rx_last_ack, None);
+            assert_eq!(s.local_rx_last_seq, None);
+            assert_eq!(s.local_rx_dup_acks, 0);
+
+            poison_congestion_history(&mut s);
+            s.local_rx_last_ack = Some(LOCAL_SEQ);
+            s.local_rx_last_seq = Some(REMOTE_SEQ);
+            s.local_rx_dup_acks = 2;
+            s.abort();
+            s.listen(LISTEN_END).unwrap();
+
+            assert_fresh_default_controller(&s, controller);
+            assert_eq!(s.local_rx_last_ack, None);
+            assert_eq!(s.local_rx_last_seq, None);
+            assert_eq!(s.local_rx_dup_acks, 0);
+        }
+    }
+
+    #[cfg(any(feature = "socket-tcp-reno", feature = "socket-tcp-cubic"))]
+    #[test]
+    fn passive_rst_resets_controller_before_next_no_mss_syn() {
+        for controller in managed_controllers() {
+            let mut s = socket();
+            s.set_congestion_control(controller);
+            s.listen(LISTEN_END).unwrap();
+            send!(
+                s,
+                TcpRepr {
+                    control: TcpControl::Syn,
+                    seq_number: REMOTE_SEQ,
+                    ack_number: None,
+                    max_seg_size: Some(1_460),
+                    ..SEND_TEMPL
+                }
+            );
+            recv!(
+                s,
+                [TcpRepr {
+                    control: TcpControl::Syn,
+                    seq_number: LOCAL_SEQ,
+                    ack_number: Some(REMOTE_SEQ + 1),
+                    max_seg_size: Some(BASE_MSS),
+                    ..RECV_TEMPL
+                }]
+            );
+            poison_congestion_history(&mut s);
+
+            send!(
+                s,
+                TcpRepr {
+                    control: TcpControl::Rst,
+                    seq_number: REMOTE_SEQ + 1,
+                    ack_number: Some(LOCAL_SEQ),
+                    ..SEND_TEMPL
+                }
+            );
+            assert_eq!(s.state(), State::Listen);
+            assert_fresh_default_controller(&s, controller);
+
+            send!(
+                s,
+                TcpRepr {
+                    control: TcpControl::Syn,
+                    seq_number: REMOTE_SEQ,
+                    ack_number: None,
+                    max_seg_size: None,
+                    ..SEND_TEMPL
+                }
+            );
+            assert_eq!(s.state(), State::SynReceived);
+            assert_fresh_default_controller(&s, controller);
+        }
+    }
+
+    #[cfg(any(feature = "socket-tcp-reno", feature = "socket-tcp-cubic"))]
+    #[test]
+    fn set_congestion_control_applies_current_mss() {
+        for controller in managed_controllers() {
+            let mut s = socket();
+            s.remote_mss = 48;
+
+            s.set_congestion_control(controller);
+
+            assert_eq!(s.congestion_controller.window(), 480);
+        }
+    }
+
+    #[cfg(any(feature = "socket-tcp-reno", feature = "socket-tcp-cubic"))]
+    #[test]
+    fn set_congestion_control_applies_current_remote_window() {
+        for controller in managed_controllers() {
+            let mut s = socket();
+            s.remote_mss = 1_460;
+            s.remote_win_len = 100_000;
+            s.set_congestion_control(controller);
+
+            for i in 0..60 {
+                let in_flight = s.congestion_controller.window();
+                s.congestion_controller.on_ack(
+                    Instant::from_millis(i),
+                    1_460,
+                    in_flight,
+                    &RttEstimator::default(),
+                );
+            }
+
+            assert!(s.congestion_controller.window() > 64 * 1_024);
+        }
+    }
+
+    #[test]
+    fn socket_reset_clears_duplicate_ack_evidence() {
+        let mut s = socket();
+        s.local_rx_last_ack = Some(LOCAL_SEQ);
+        s.local_rx_last_seq = Some(REMOTE_SEQ);
+        s.local_rx_dup_acks = 2;
+
+        s.listen(LISTEN_END).unwrap();
+
+        assert_eq!(s.local_rx_last_ack, None);
+        assert_eq!(s.local_rx_last_seq, None);
+        assert_eq!(s.local_rx_dup_acks, 0);
     }
 
     // =========================================================================================//

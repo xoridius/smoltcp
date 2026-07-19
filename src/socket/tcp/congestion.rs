@@ -37,6 +37,18 @@ pub(super) trait Controller {
     fn set_mss(&mut self, mss: usize) {}
 }
 
+#[cfg(any(test, feature = "socket-tcp-reno", feature = "socket-tcp-cubic"))]
+#[inline]
+pub(super) fn initial_window(mss: u32) -> u32 {
+    mss.saturating_mul(10)
+        .min(mss.saturating_mul(2).max(14_600))
+}
+
+#[inline]
+pub(super) fn window_to_usize(window: u32) -> usize {
+    usize::try_from(window).unwrap_or(usize::MAX)
+}
+
 #[derive(Debug)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub(super) enum AnyController {
@@ -79,6 +91,17 @@ impl AnyController {
         }
 
         AnyController::None(no_control::NoControl)
+    }
+
+    /// Reset the selected controller for a new TCP control block.
+    pub fn reset(&mut self) {
+        match self {
+            AnyController::None(_) => *self = AnyController::None(no_control::NoControl),
+            #[cfg(feature = "socket-tcp-reno")]
+            AnyController::Reno(_) => *self = AnyController::Reno(reno::Reno::new()),
+            #[cfg(feature = "socket-tcp-cubic")]
+            AnyController::Cubic(_) => *self = AnyController::Cubic(cubic::Cubic::new()),
+        }
     }
 
     // Static-dispatch wrappers for the hot-path `Controller` methods.
@@ -196,5 +219,43 @@ impl AnyController {
             #[cfg(feature = "socket-tcp-cubic")]
             AnyController::Cubic(c) => c.set_mss(mss),
         }
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[test]
+    fn initial_window_matches_rfc_6928_and_saturates() {
+        for (mss, expected) in [
+            (0, 0),
+            (48, 480),
+            (536, 5_360),
+            (1_460, 14_600),
+            (8_960, 17_920),
+            (u32::MAX, u32::MAX),
+        ] {
+            assert_eq!(initial_window(mss), expected, "MSS {mss}");
+        }
+    }
+
+    #[test]
+    fn managed_window_conversion_saturates_to_usize() {
+        #[cfg(target_pointer_width = "16")]
+        assert_eq!(window_to_usize(u32::MAX), usize::MAX);
+
+        #[cfg(not(target_pointer_width = "16"))]
+        assert_eq!(window_to_usize(u32::MAX), u32::MAX as usize);
+    }
+
+    #[test]
+    fn no_control_reset_preserves_variant() {
+        let mut controller = AnyController::None(no_control::NoControl);
+
+        controller.reset();
+
+        assert!(matches!(controller, AnyController::None(_)));
+        assert_eq!(controller.window(), usize::MAX);
     }
 }
