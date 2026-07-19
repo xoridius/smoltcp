@@ -786,6 +786,7 @@ fn decompress_udp(
     decompressed_len: &mut usize,
 ) -> Result<()> {
     let udp_packet = SixlowpanUdpNhcPacket::new_checked(data)?;
+    let checksum = udp_packet.checksum().ok_or(Error)?;
     let payload = udp_packet.payload();
     let udp_repr = SixlowpanUdpNhcRepr::parse(
         &udp_packet,
@@ -807,6 +808,7 @@ fn decompress_udp(
     *decompressed_len += udp_repr.0.header_len() + payload.len();
     let mut udp = UdpPacket::new_unchecked(&mut buffer[..payload.len() + 8]);
     udp_repr.0.emit_header(&mut udp, udp_payload_len);
+    udp.set_checksum(checksum);
     buffer[8..][..payload.len()].copy_from_slice(payload);
     Ok(())
 }
@@ -814,6 +816,20 @@ fn decompress_udp(
 #[cfg(test)]
 mod safety_tests {
     use super::*;
+    #[cfg(feature = "socket-udp")]
+    use crate::tests::setup;
+
+    #[cfg(feature = "socket-udp")]
+    const UDP_TEST_PAYLOAD: &[u8] = b"checksum";
+
+    #[cfg(feature = "socket-udp")]
+    #[derive(Clone, Copy)]
+    enum TestUdpChecksum {
+        Valid,
+        Bad,
+        Zero,
+        Elided,
+    }
 
     fn ieee_repr() -> Ieee802154Repr {
         Ieee802154Repr {
@@ -829,6 +845,194 @@ mod safety_tests {
             src_pan_id: Some(Ieee802154Pan(0xbeef)),
             src_addr: Some(Ieee802154Address::default()),
         }
+    }
+
+    #[cfg(feature = "socket-udp")]
+    fn compressed_udp_packet(checksum: TestUdpChecksum) -> std::vec::Vec<u8> {
+        let ieee802154_repr = ieee_repr();
+        let packet = PacketV6 {
+            header: Ipv6Repr {
+                src_addr: Ipv6Address::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1),
+                dst_addr: Ipv6Address::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 2),
+                next_header: IpProtocol::Udp,
+                payload_len: 8 + UDP_TEST_PAYLOAD.len(),
+                hop_limit: 64,
+            },
+            #[cfg(feature = "proto-ipv6-hbh")]
+            hop_by_hop: None,
+            #[cfg(feature = "proto-ipv6-fragmentation")]
+            fragment: None,
+            #[cfg(feature = "proto-ipv6-routing")]
+            routing: None,
+            payload: IpPayload::Udp(
+                UdpRepr {
+                    src_port: 1234,
+                    dst_port: 6969,
+                },
+                UDP_TEST_PAYLOAD,
+            ),
+        };
+        let (compressed_len, _, _) =
+            InterfaceInner::compressed_packet_size(&packet, &ieee802154_repr);
+        let mut compressed = vec![0u8; compressed_len];
+        InterfaceInner::ipv6_to_sixlowpan(
+            &ChecksumCapabilities::default(),
+            packet,
+            &ieee802154_repr,
+            &mut compressed,
+        );
+
+        if !matches!(checksum, TestUdpChecksum::Valid) {
+            let iphc = SixlowpanIphcPacket::new_checked(&compressed[..]).unwrap();
+            let nhc_offset = compressed.len() - iphc.payload().len();
+            let udp = SixlowpanUdpNhcPacket::new_checked(iphc.payload()).unwrap();
+            let checksum_offset = nhc_offset + 1 + udp.ports_size();
+
+            match checksum {
+                TestUdpChecksum::Bad => compressed[checksum_offset] ^= 1,
+                TestUdpChecksum::Zero => compressed[checksum_offset..checksum_offset + 2].fill(0),
+                TestUdpChecksum::Elided => {
+                    compressed[nhc_offset] |= 0x04;
+                    compressed.drain(checksum_offset..checksum_offset + 2);
+                }
+                TestUdpChecksum::Valid => unreachable!(),
+            }
+        }
+
+        compressed
+    }
+
+    #[cfg(all(feature = "socket-udp", feature = "proto-sixlowpan-fragmentation"))]
+    fn fragmented_uncompressed_udp_zero_checksum_packet() -> std::vec::Vec<u8> {
+        let ieee802154_repr = ieee_repr();
+        let iphc_repr = SixlowpanIphcRepr {
+            src_addr: Ipv6Address::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1),
+            ll_src_addr: ieee802154_repr.src_addr,
+            dst_addr: Ipv6Address::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 2),
+            ll_dst_addr: ieee802154_repr.dst_addr,
+            next_header: SixlowpanNextHeader::Uncompressed(IpProtocol::Udp),
+            hop_limit: 64,
+            ecn: None,
+            dscp: None,
+            flow_label: None,
+        };
+        let udp_len = 8 + UDP_TEST_PAYLOAD.len();
+        let frag_repr = SixlowpanFragRepr::FirstFragment {
+            size: (40 + udp_len) as u16,
+            tag: 1,
+        };
+        let mut packet = vec![0u8; frag_repr.buffer_len() + iphc_repr.buffer_len() + udp_len];
+        frag_repr.emit(&mut SixlowpanFragPacket::new_unchecked(
+            &mut packet[..frag_repr.buffer_len()],
+        ));
+        let iphc_start = frag_repr.buffer_len();
+        iphc_repr.emit(&mut SixlowpanIphcPacket::new_unchecked(
+            &mut packet[iphc_start..iphc_start + iphc_repr.buffer_len()],
+        ));
+        let udp_start = iphc_start + iphc_repr.buffer_len();
+        let mut udp = UdpPacket::new_unchecked(&mut packet[udp_start..]);
+        udp.set_src_port(1234);
+        udp.set_dst_port(6969);
+        udp.set_len(udp_len as u16);
+        udp.set_checksum(0);
+        udp.payload_mut().copy_from_slice(UDP_TEST_PAYLOAD);
+        packet
+    }
+
+    #[cfg(feature = "socket-udp")]
+    fn deliver_udp(packet: &[u8]) -> Option<std::vec::Vec<u8>> {
+        use crate::socket::udp;
+
+        let (mut iface, mut sockets, _device) = setup(Medium::Ieee802154);
+        iface.update_ip_addrs(|ips| {
+            ips.push(IpCidr::Ipv6(Ipv6Cidr::new(
+                Ipv6Address::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 2),
+                128,
+            )))
+            .unwrap();
+        });
+
+        let rx_buffer = udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY], vec![0; 32]);
+        let tx_buffer = udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY], vec![0; 32]);
+        let handle = sockets.add(udp::Socket::new(rx_buffer, tx_buffer));
+        sockets.get_mut::<udp::Socket>(handle).bind(6969).unwrap();
+
+        assert_eq!(
+            iface.inner.process_sixlowpan(
+                &mut sockets,
+                PacketMeta::default(),
+                &ieee_repr(),
+                packet,
+                &mut iface.fragments,
+            ),
+            None
+        );
+
+        let socket = sockets.get_mut::<udp::Socket>(handle);
+        socket.can_recv().then(|| socket.recv().unwrap().0.to_vec())
+    }
+
+    #[test]
+    #[cfg(feature = "socket-udp")]
+    fn sixlowpan_udp_inline_checksum_is_delivered() {
+        assert_eq!(
+            deliver_udp(&compressed_udp_packet(TestUdpChecksum::Valid)),
+            Some(UDP_TEST_PAYLOAD.to_vec())
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "socket-udp")]
+    fn sixlowpan_udp_bad_nonzero_checksum_is_dropped() {
+        assert_eq!(
+            deliver_udp(&compressed_udp_packet(TestUdpChecksum::Bad)),
+            None
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "socket-udp")]
+    fn sixlowpan_udp_zero_checksum_is_dropped() {
+        assert_eq!(
+            deliver_udp(&compressed_udp_packet(TestUdpChecksum::Zero)),
+            None
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "socket-udp")]
+    fn sixlowpan_udp_elided_checksum_is_dropped() {
+        assert_eq!(
+            deliver_udp(&compressed_udp_packet(TestUdpChecksum::Elided)),
+            None
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "socket-udp")]
+    fn sixlowpan_udp_elided_checksum_is_rejected_by_decompression() {
+        let compressed = compressed_udp_packet(TestUdpChecksum::Elided);
+        let mut decompressed = [0u8; 128];
+
+        assert!(
+            InterfaceInner::sixlowpan_to_ipv6(
+                &[],
+                &ieee_repr(),
+                &compressed,
+                None,
+                &mut decompressed,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    #[cfg(all(feature = "socket-udp", feature = "proto-sixlowpan-fragmentation"))]
+    fn fragmented_sixlowpan_uncompressed_udp_zero_checksum_is_dropped() {
+        assert_eq!(
+            deliver_udp(&fragmented_uncompressed_udp_zero_checksum_packet()),
+            None
+        );
     }
 
     #[test]
