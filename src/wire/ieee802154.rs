@@ -310,7 +310,7 @@ impl<T: AsRef<[u8]>> Frame<T> {
             return Err(Error);
         }
 
-        // We don't handle frames with a payload larger than 127 bytes.
+        // We don't handle frames larger than 127 octets.
         if self.buffer.as_ref().len() > 127 {
             return Err(Error);
         }
@@ -338,7 +338,7 @@ impl<T: AsRef<[u8]>> Frame<T> {
 
             let control = self.security_control().ok_or(Error)?;
             offset = offset
-                .checked_add(self.security_header_len())
+                .checked_add(Self::security_header_len(control))
                 .and_then(|offset| offset.checked_add(Self::mic_len(Some(control))))
                 .ok_or(Error)?;
         }
@@ -593,41 +593,31 @@ impl<T: AsRef<[u8]>> Frame<T> {
     }
 
     /// Return the size of the security header.
-    fn security_header_len(&self) -> usize {
-        let mut size = 1;
-        size += if self.frame_counter_suppressed() {
-            0
-        } else {
-            4
-        };
-        size += if let Some(len) = self.key_identifier_length() {
-            len as usize
-        } else {
-            0
-        };
-        size
+    fn security_header_len(control: u8) -> usize {
+        let frame_counter_len = if control & (1 << 5) == 0 { 4 } else { 0 };
+        1 + frame_counter_len + Self::key_identifier_len(control)
     }
 
     /// Return the index where the payload starts.
     fn payload_start(&self) -> usize {
         let mut index = self.aux_security_header_start();
 
-        if self.security_enabled() {
-            index += self.security_header_len();
+        if let Some(control) = self.security_control() {
+            index += Self::security_header_len(control);
         }
 
         index
     }
 
     /// Return the length of the key identifier field.
-    fn key_identifier_length(&self) -> Option<u8> {
-        Some(match self.key_identifier_mode() {
+    fn key_identifier_len(control: u8) -> usize {
+        match (control >> 3) & 0b11 {
             0 => 0,
             1 => 1,
             2 => 5,
             3 => 9,
-            _ => return None,
-        })
+            _ => unreachable!(),
+        }
     }
 
     fn mic_len(control: Option<u8>) -> usize {
@@ -640,23 +630,27 @@ impl<T: AsRef<[u8]>> Frame<T> {
     }
 
     /// Return the security level of the auxiliary security header.
+    /// Returns zero when security is disabled.
     pub fn security_level(&self) -> u8 {
         self.security_control().map_or(0, |control| control & 0b111)
     }
 
     /// Return the key identifier mode used by the auxiliary security header.
+    /// Returns zero when security is disabled.
     pub fn key_identifier_mode(&self) -> u8 {
         self.security_control()
             .map_or(0, |control| (control >> 3) & 0b11)
     }
 
     /// Return `true` when the frame counter in the security header is suppressed.
+    /// Returns `false` when security is disabled.
     pub fn frame_counter_suppressed(&self) -> bool {
         self.security_control()
             .is_some_and(|control| control & (1 << 5) != 0)
     }
 
     /// Return the frame counter field.
+    /// Returns `None` when security is disabled or the counter is suppressed.
     pub fn frame_counter(&self) -> Option<u32> {
         let control = self.security_control()?;
         if control & (1 << 5) != 0 {
@@ -675,17 +669,14 @@ impl<T: AsRef<[u8]>> Frame<T> {
             return &[];
         };
 
-        let length = if let Some(len) = self.key_identifier_length() {
-            len as usize
-        } else {
-            0
-        };
+        let length = Self::key_identifier_len(control);
         let frame_counter_len = if control & (1 << 5) == 0 { 4 } else { 0 };
         let index = self.aux_security_header_start() + 1 + frame_counter_len;
         &self.buffer.as_ref()[index..index + length]
     }
 
     /// Return the Key Source field.
+    /// Returns `None` when security is disabled or no key source is present.
     pub fn key_source(&self) -> Option<&[u8]> {
         let ki = self.key_identifier();
         let len = ki.len();
@@ -693,6 +684,7 @@ impl<T: AsRef<[u8]>> Frame<T> {
     }
 
     /// Return the Key Index field.
+    /// Returns `None` when security is disabled or no key index is present.
     pub fn key_index(&self) -> Option<u8> {
         let ki = self.key_identifier();
         let len = ki.len();
@@ -701,6 +693,7 @@ impl<T: AsRef<[u8]>> Frame<T> {
     }
 
     /// Return the Message Integrity Code (MIC).
+    /// Returns `None` when security is disabled or no MIC is present.
     pub fn message_integrity_code(&self) -> Option<&[u8]> {
         let mic_len = Self::mic_len(self.security_control());
         if mic_len == 0 {
@@ -722,6 +715,8 @@ impl<T: AsRef<[u8]>> Frame<T> {
 
 impl<'a, T: AsRef<[u8]> + ?Sized> Frame<&'a T> {
     /// Return a pointer to the payload.
+    ///
+    /// The payload includes any trailing Message Integrity Code (MIC).
     #[inline]
     pub fn payload(&self) -> Option<&'a [u8]> {
         match self.frame_type() {
@@ -868,6 +863,8 @@ impl<T: AsRef<[u8]> + AsMut<[u8]>> Frame<T> {
     }
 
     /// Return a mutable pointer to the payload.
+    ///
+    /// The payload includes any trailing Message Integrity Code (MIC).
     #[inline]
     pub fn payload_mut(&mut self) -> Option<&mut [u8]> {
         match self.frame_type() {
