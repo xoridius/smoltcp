@@ -2,13 +2,19 @@ use super::*;
 
 use crate::iface::Route;
 
+struct HopByHopContinuation<'frame> {
+    next_header: IpProtocol,
+    payload: &'frame [u8],
+    mld_router_alert: bool,
+}
+
 /// Enum used for the process_hopbyhop function. In some cases, when discarding a packet, an ICMP
 /// parameter problem message needs to be transmitted to the source of the address. In other cases,
 /// the processing of the IP packet can continue.
 #[allow(clippy::large_enum_variant)]
 enum HopByHopResponse<'frame> {
     /// Continue processing the IPv6 packet.
-    Continue((IpProtocol, &'frame [u8])),
+    Continue(HopByHopContinuation<'frame>),
     /// Discard the packet and maybe send back an ICMPv6 packet.
     Discard(Option<Packet<'frame>>),
 }
@@ -206,13 +212,17 @@ impl InterfaceInner {
             return None;
         }
 
-        let (next_header, ip_payload) = if ipv6_repr.next_header == IpProtocol::HopByHop {
+        let next = if ipv6_repr.next_header == IpProtocol::HopByHop {
             match self.process_hopbyhop(ipv6_repr, ipv6_packet.payload()) {
                 HopByHopResponse::Discard(e) => return e,
                 HopByHopResponse::Continue(next) => next,
             }
         } else {
-            (ipv6_repr.next_header, ipv6_packet.payload())
+            HopByHopContinuation {
+                next_header: ipv6_repr.next_header,
+                payload: ipv6_packet.payload(),
+                mld_router_alert: false,
+            }
         };
 
         // The packet is for us if the destination is one of our unicast
@@ -244,7 +254,8 @@ impl InterfaceInner {
         }
 
         #[cfg(feature = "socket-raw")]
-        let handled_by_raw_socket = self.raw_socket_filter(sockets, &ipv6_repr.into(), ip_payload);
+        let handled_by_raw_socket =
+            self.raw_socket_filter(sockets, &ipv6_repr.into(), next.payload);
         #[cfg(not(feature = "socket-raw"))]
         let handled_by_raw_socket = false;
 
@@ -257,14 +268,7 @@ impl InterfaceInner {
             );
         }
 
-        self.process_nxt_hdr(
-            sockets,
-            meta,
-            ipv6_repr,
-            next_header,
-            handled_by_raw_socket,
-            ip_payload,
-        )
+        self.process_nxt_hdr(sockets, meta, ipv6_repr, handled_by_raw_socket, next)
     }
 
     #[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
@@ -347,9 +351,14 @@ impl InterfaceInner {
         let hbh_hdr = check!(Ipv6HopByHopHeader::new_checked(ext_repr.data));
         let hbh_repr = check!(Ipv6HopByHopRepr::parse(&hbh_hdr));
 
+        let mut router_alert_count = 0;
+        let mut mld_router_alert = false;
         for opt_repr in &hbh_repr.options {
             match opt_repr {
-                Ipv6OptionRepr::Pad1 | Ipv6OptionRepr::PadN(_) | Ipv6OptionRepr::RouterAlert(_) => {
+                Ipv6OptionRepr::Pad1 | Ipv6OptionRepr::PadN(_) => {}
+                Ipv6OptionRepr::RouterAlert(alert) => {
+                    router_alert_count += 1;
+                    mld_router_alert = *alert == Ipv6OptionRouterAlert::MulticastListenerDiscovery;
                 }
                 #[cfg(feature = "proto-rpl")]
                 Ipv6OptionRepr::Rpl(_) => {}
@@ -375,10 +384,13 @@ impl InterfaceInner {
             }
         }
 
-        HopByHopResponse::Continue((
-            ext_repr.next_header,
-            &ip_payload[ext_repr.header_len() + ext_repr.data.len()..],
-        ))
+        HopByHopResponse::Continue(HopByHopContinuation {
+            next_header: ext_repr.next_header,
+            payload: &ip_payload[ext_repr.header_len() + ext_repr.data.len()..],
+            mld_router_alert: hbh_repr.buffer_len() == ext_repr.data.len()
+                && router_alert_count == 1
+                && mld_router_alert,
+        })
     }
 
     /// Given the next header value forward the payload onto the correct process
@@ -388,12 +400,13 @@ impl InterfaceInner {
         sockets: &mut SocketSet,
         meta: PacketMeta,
         ipv6_repr: Ipv6Repr,
-        nxt_hdr: IpProtocol,
         handled_by_raw_socket: bool,
-        ip_payload: &'frame [u8],
+        next: HopByHopContinuation<'frame>,
     ) -> Option<Packet<'frame>> {
-        match nxt_hdr {
-            IpProtocol::Icmpv6 => self.process_icmpv6(sockets, ipv6_repr, ip_payload),
+        match next.next_header {
+            IpProtocol::Icmpv6 => {
+                self.process_icmpv6(sockets, ipv6_repr, next.mld_router_alert, next.payload)
+            }
 
             #[cfg(any(feature = "socket-udp", feature = "socket-dns"))]
             IpProtocol::Udp => self.process_udp(
@@ -401,27 +414,33 @@ impl InterfaceInner {
                 meta,
                 handled_by_raw_socket,
                 ipv6_repr.into(),
-                ip_payload,
+                next.payload,
             ),
 
             #[cfg(feature = "socket-tcp")]
-            IpProtocol::Tcp => {
-                self.process_tcp(sockets, handled_by_raw_socket, ipv6_repr.into(), ip_payload)
-            }
+            IpProtocol::Tcp => self.process_tcp(
+                sockets,
+                handled_by_raw_socket,
+                ipv6_repr.into(),
+                next.payload,
+            ),
 
             #[cfg(feature = "socket-raw")]
             _ if handled_by_raw_socket => None,
 
             _ => {
                 // Send back as much of the original payload as we can.
-                let payload_len =
-                    icmp_reply_payload_len(ip_payload.len(), IPV6_MIN_MTU, ipv6_repr.buffer_len());
+                let payload_len = icmp_reply_payload_len(
+                    next.payload.len(),
+                    IPV6_MIN_MTU,
+                    ipv6_repr.buffer_len(),
+                );
                 let icmp_reply_repr = Icmpv6Repr::ParamProblem {
                     reason: Icmpv6ParamProblem::UnrecognizedNxtHdr,
                     // The offending packet is after the IPv6 header.
                     pointer: ipv6_repr.buffer_len() as u32,
                     header: ipv6_repr,
-                    data: &ip_payload[0..payload_len],
+                    data: &next.payload[0..payload_len],
                 };
                 self.icmpv6_reply(ipv6_repr, icmp_reply_repr)
             }
@@ -432,6 +451,7 @@ impl InterfaceInner {
         &mut self,
         _sockets: &mut SocketSet,
         ip_repr: Ipv6Repr,
+        _mld_router_alert: bool,
         ip_payload: &'frame [u8],
     ) -> Option<Packet<'frame>> {
         let icmp_packet = check!(Icmpv6Packet::new_checked(ip_payload));
@@ -492,7 +512,9 @@ impl InterfaceInner {
             Icmpv6Repr::Mld(repr) => match repr {
                 // [RFC 3810 § 6.2], reception checks
                 MldRepr::Query { .. }
-                    if ip_repr.hop_limit == 1 && ip_repr.src_addr.is_link_local() =>
+                    if ip_repr.hop_limit == 1
+                        && ip_repr.src_addr.is_link_local()
+                        && _mld_router_alert =>
                 {
                     self.process_mldv2(ip_repr, repr)
                 }

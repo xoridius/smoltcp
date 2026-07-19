@@ -53,6 +53,40 @@ fn emit_icmpv6(
     bytes
 }
 
+fn emit_hop_by_hop_icmpv6(
+    src_addr: Ipv6Address,
+    dst_addr: Ipv6Address,
+    hop_limit: u8,
+    options: &[u8],
+    icmp_repr: Icmpv6Repr<'_>,
+) -> Vec<u8> {
+    let hop_by_hop_len = 2 + options.len();
+    assert_eq!(hop_by_hop_len % 8, 0);
+
+    let ipv6_repr = Ipv6Repr {
+        src_addr,
+        dst_addr,
+        next_header: IpProtocol::HopByHop,
+        hop_limit,
+        payload_len: hop_by_hop_len + icmp_repr.buffer_len(),
+    };
+    let mut bytes = vec![0; ipv6_repr.buffer_len() + ipv6_repr.payload_len];
+    ipv6_repr.emit(&mut Ipv6Packet::new_unchecked(&mut bytes));
+
+    let payload = &mut bytes[ipv6_repr.buffer_len()..];
+    let mut ext_header = Ipv6ExtHeader::new_unchecked(&mut payload[..hop_by_hop_len]);
+    ext_header.set_next_header(IpProtocol::Icmpv6);
+    ext_header.set_header_len((hop_by_hop_len / 8 - 1) as u8);
+    ext_header.payload_mut().copy_from_slice(options);
+    icmp_repr.emit(
+        &src_addr,
+        &dst_addr,
+        &mut Icmpv6Packet::new_unchecked(&mut payload[hop_by_hop_len..]),
+        &ChecksumCapabilities::default(),
+    );
+    bytes
+}
+
 #[cfg(feature = "socket-raw")]
 fn add_ipv6_raw_socket(sockets: &mut SocketSet<'_>) -> crate::iface::SocketHandle {
     let rx_buffer = raw::PacketBuffer::new(vec![raw::PacketMetadata::EMPTY], vec![0; IPV6_MIN_MTU]);
@@ -2161,6 +2195,168 @@ fn test_join_ipv6_multicast_group(#[case] medium: Medium) {
     }
 }
 
+#[cfg(all(feature = "multicast", feature = "medium-ethernet"))]
+const MLD_ROUTER_ALERT_OPTIONS: &[u8] = &[0x05, 0x02, 0x00, 0x00, 0x01, 0x00];
+
+#[cfg(all(feature = "multicast", feature = "medium-ethernet"))]
+fn emit_mld_query(
+    options: Option<&[u8]>,
+    mcast_addr: Ipv6Address,
+    dst_addr: Ipv6Address,
+) -> Vec<u8> {
+    let src_addr = Ipv6Address::new(0xfe80, 0, 0, 0, 0, 0, 0, 100);
+    let query = Icmpv6Repr::Mld(MldRepr::Query {
+        max_resp_code: 0,
+        mcast_addr,
+        s_flag: false,
+        qrv: 1,
+        qqic: 60,
+        num_srcs: 0,
+        data: &[0, 0, 0, 0],
+    });
+
+    match options {
+        Some(options) => emit_hop_by_hop_icmpv6(src_addr, dst_addr, 1, options, query),
+        None => emit_icmpv6(src_addr, dst_addr, 1, query),
+    }
+}
+
+#[test]
+#[cfg(all(feature = "multicast", feature = "medium-ethernet"))]
+fn mld_query_requires_exactly_one_mld_router_alert() {
+    const PADDING_ONLY: &[u8] = &[0x01, 0x04, 0, 0, 0, 0];
+    const RSVP: &[u8] = &[0x05, 0x02, 0x00, 0x01, 0x01, 0x00];
+    const UNKNOWN: &[u8] = &[0x05, 0x02, 0xbe, 0xef, 0x01, 0x00];
+    const DUPLICATE_MLD: &[u8] = &[
+        0x05, 0x02, 0x00, 0x00, 0x05, 0x02, 0x00, 0x00, 0x01, 0x04, 0, 0, 0, 0,
+    ];
+    const MLD_AND_RSVP: &[u8] = &[
+        0x05, 0x02, 0x00, 0x00, 0x05, 0x02, 0x00, 0x01, 0x01, 0x04, 0, 0, 0, 0,
+    ];
+    const DUPLICATE_AFTER_CAPACITY: &[u8] = &[
+        0x05, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x05, 0x02, 0x00, 0x00, 0x01, 0x01, 0,
+    ];
+
+    let mut scheduled = Vec::new();
+    for (name, options) in [
+        ("direct", None),
+        ("padding only", Some(PADDING_ONLY)),
+        ("RSVP", Some(RSVP)),
+        ("unknown", Some(UNKNOWN)),
+        ("duplicate MLD", Some(DUPLICATE_MLD)),
+        ("MLD and RSVP", Some(MLD_AND_RSVP)),
+        (
+            "duplicate after option capacity",
+            Some(DUPLICATE_AFTER_CAPACITY),
+        ),
+    ] {
+        let (mut iface, mut sockets, mut device) = setup(Medium::Ethernet);
+        iface.poll(Instant::ZERO, &mut device, &mut sockets);
+        recv_all(&mut device, Instant::ZERO);
+        assert_eq!(iface.inner.multicast.poll_at(), None, "{name}");
+
+        let bytes = emit_mld_query(options, Ipv6Address::UNSPECIFIED, IPV6_LINK_LOCAL_ALL_NODES);
+        assert_eq!(
+            iface.inner.process_ipv6(
+                &mut sockets,
+                PacketMeta::default(),
+                HardwareAddress::default(),
+                &Ipv6Packet::new_checked(&bytes[..]).unwrap(),
+            ),
+            None,
+            "{name}",
+        );
+        scheduled.push((name, iface.inner.multicast.poll_at()));
+    }
+    assert_eq!(
+        scheduled,
+        vec![
+            ("direct", None),
+            ("padding only", None),
+            ("RSVP", None),
+            ("unknown", None),
+            ("duplicate MLD", None),
+            ("MLD and RSVP", None),
+            ("duplicate after option capacity", None),
+        ]
+    );
+}
+
+#[test]
+#[cfg(all(
+    feature = "multicast",
+    feature = "medium-ethernet",
+    feature = "socket-raw"
+))]
+fn direct_mld_query_is_visible_to_raw_socket_without_scheduling() {
+    let (mut iface, mut sockets, mut device) = setup(Medium::Ethernet);
+    iface.poll(Instant::ZERO, &mut device, &mut sockets);
+    recv_all(&mut device, Instant::ZERO);
+    assert_eq!(iface.inner.multicast.poll_at(), None);
+
+    let raw_handle = add_ipv6_raw_socket(&mut sockets);
+    let bytes = emit_mld_query(None, Ipv6Address::UNSPECIFIED, IPV6_LINK_LOCAL_ALL_NODES);
+    assert_eq!(
+        iface.inner.process_ipv6(
+            &mut sockets,
+            PacketMeta::default(),
+            HardwareAddress::default(),
+            &Ipv6Packet::new_checked(&bytes[..]).unwrap(),
+        ),
+        None,
+    );
+    assert!(sockets.get_mut::<raw::Socket>(raw_handle).can_recv());
+    assert_eq!(iface.inner.multicast.poll_at(), None);
+}
+
+#[test]
+#[cfg(all(
+    feature = "multicast",
+    feature = "medium-ethernet",
+    feature = "auto-icmp-echo-reply"
+))]
+fn invalid_mld_router_alerts_do_not_change_echo_handling() {
+    const RSVP: &[u8] = &[0x05, 0x02, 0x00, 0x01, 0x01, 0x00];
+    const DUPLICATE_MLD: &[u8] = &[
+        0x05, 0x02, 0x00, 0x00, 0x05, 0x02, 0x00, 0x00, 0x01, 0x04, 0, 0, 0, 0,
+    ];
+    let src_addr = Ipv6Address::new(0xfe80, 0, 0, 0, 0, 0, 0, 100);
+    let dst_addr = Ipv6Address::new(0xfe80, 0, 0, 0, 0, 0, 0, 1);
+    let echo = Icmpv6Repr::EchoRequest {
+        ident: 7,
+        seq_no: 11,
+        data: b"echo",
+    };
+    let expected = Some(Packet::new_ipv6(
+        Ipv6Repr {
+            src_addr: dst_addr,
+            dst_addr: src_addr,
+            next_header: IpProtocol::Icmpv6,
+            hop_limit: 64,
+            payload_len: echo.buffer_len(),
+        },
+        IpPayload::Icmpv6(Icmpv6Repr::EchoReply {
+            ident: 7,
+            seq_no: 11,
+            data: b"echo",
+        }),
+    ));
+
+    for options in [RSVP, DUPLICATE_MLD] {
+        let bytes = emit_hop_by_hop_icmpv6(src_addr, dst_addr, 1, options, echo);
+        let (mut iface, mut sockets, _device) = setup(Medium::Ethernet);
+        assert_eq!(
+            iface.inner.process_ipv6(
+                &mut sockets,
+                PacketMeta::default(),
+                HardwareAddress::default(),
+                &Ipv6Packet::new_checked(&bytes[..]).unwrap(),
+            ),
+            expected,
+        );
+    }
+}
+
 #[rstest]
 #[case(Medium::Ethernet)]
 #[cfg(all(feature = "multicast", feature = "medium-ethernet"))]
@@ -2194,10 +2390,7 @@ fn test_handle_valid_multicast_query(#[case] medium: Medium) {
 
     let mut timestamp = Instant::ZERO;
 
-    let mut eth_bytes = vec![0u8; 86];
-
     let local_ip_addr = Ipv6Address::new(0xfe80, 0, 0, 0, 0, 0, 0, 1);
-    let remote_ip_addr = Ipv6Address::new(0xfe80, 0, 0, 0, 0, 0, 0, 100);
     let remote_hw_addr = EthernetAddress([0x52, 0x54, 0x00, 0x00, 0x00, 0x00]);
     let query_ip_addr = Ipv6Address::new(0xff02, 0, 0, 0, 0, 0, 0, 0x1234);
 
@@ -2219,35 +2412,13 @@ fn test_handle_valid_multicast_query(#[case] medium: Medium) {
     ];
 
     for (mcast_query, address, _results) in queries.iter() {
-        let query = Icmpv6Repr::Mld(MldRepr::Query {
-            max_resp_code: 1000,
-            mcast_addr: *mcast_query,
-            s_flag: false,
-            qrv: 1,
-            qqic: 60,
-            num_srcs: 0,
-            data: &[0, 0, 0, 0],
-        });
-
-        let ip_repr = IpRepr::Ipv6(Ipv6Repr {
-            src_addr: remote_ip_addr,
-            dst_addr: *address,
-            next_header: IpProtocol::Icmpv6,
-            hop_limit: 1,
-            payload_len: query.buffer_len(),
-        });
-
+        let query = emit_mld_query(Some(MLD_ROUTER_ALERT_OPTIONS), *mcast_query, *address);
+        let mut eth_bytes = vec![0u8; EthernetFrame::<&[u8]>::header_len() + query.len()];
         let mut frame = EthernetFrame::new_unchecked(&mut eth_bytes);
         frame.set_dst_addr(EthernetAddress([0x33, 0x33, 0x00, 0x00, 0x00, 0x00]));
         frame.set_src_addr(remote_hw_addr);
         frame.set_ethertype(EthernetProtocol::Ipv6);
-        ip_repr.emit(frame.payload_mut(), &ChecksumCapabilities::default());
-        query.emit(
-            &remote_ip_addr,
-            address,
-            &mut Icmpv6Packet::new_unchecked(&mut frame.payload_mut()[ip_repr.header_len()..]),
-            &ChecksumCapabilities::default(),
-        );
+        frame.payload_mut().copy_from_slice(&query);
 
         iface.inner.process_ethernet(
             &mut sockets,
