@@ -60,15 +60,14 @@ struct TaskVmInfo {
 
 #[cfg(target_vendor = "apple")]
 fn apple_phys_footprint_bytes() -> Option<u64> {
-    const KERN_SUCCESS: libc::kern_return_t = 0;
     const TASK_VM_INFO: libc::task_flavor_t = 22;
     // Mach reports the buffer length in `natural_t` words through the last field read.
-    const TASK_VM_INFO_COUNT: libc::mach_msg_type_number_t =
+    const TASK_VM_INFO_REV1_COUNT: libc::mach_msg_type_number_t =
         ((core::mem::offset_of!(TaskVmInfo, phys_footprint) + core::mem::size_of::<u64>())
             / core::mem::size_of::<libc::natural_t>()) as libc::mach_msg_type_number_t;
 
     let mut info = TaskVmInfo::default();
-    let mut count = TASK_VM_INFO_COUNT;
+    let mut count = TASK_VM_INFO_REV1_COUNT;
     // SAFETY: reading the current task port has no preconditions.
     #[allow(deprecated)]
     let task = unsafe { libc::mach_task_self() };
@@ -81,7 +80,10 @@ fn apple_phys_footprint_bytes() -> Option<u64> {
             &mut count,
         )
     };
-    (result == KERN_SUCCESS).then_some(info.phys_footprint)
+    if result != libc::KERN_SUCCESS || count < TASK_VM_INFO_REV1_COUNT {
+        return None;
+    }
+    Some(info.phys_footprint)
 }
 
 #[cfg(target_os = "linux")]

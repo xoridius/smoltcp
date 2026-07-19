@@ -247,7 +247,7 @@ Report fields to read:
 | `verdict` | Single-line pass/fail style summary for fairness + starvation. |
 | `<metric> verdict` | `bounded` or `GROWTH`. GROWTH means the median process-memory sample is materially smaller than the final sample — leak suspect. |
 | `net heap delta` | Should be a small constant. Non-constant values mean smoltcp itself allocated on the hot path → bug. |
-| `lane stats` | Harness packet-pool health. Trace-mode performance claims require `fallback allocs == 0`. |
+| `lane stats` | Fixed packet ownership plus TX/RX backpressure and reserved-capacity diagnostics. No mode has a fallback allocation path. |
 
 ### 4.2.1 Dynamic-buffer / multi-thread shapes
 
@@ -279,15 +279,15 @@ What each catches:
 
 | Shape | What's measured | What a regression looks like |
 |---|---|---|
-| `multi_tcp` | copy-heavy dynamic-buffer TCP echo throughput, per-thread Jain across `MemoryPool` contention | `Jain < 0.95`, nonzero lane fallback allocations in trace mode, or a large host-local throughput drop versus the previous isolated baseline |
-| `multi_tcp_sink` | one-way dynamic-buffer TCP throughput with direct send/recv closures | nonzero lane fallback allocations in trace mode, lower throughput than `multi_tcp` without a trace-backed explanation, or no reduction in copy/memmove pressure |
+| `multi_tcp` | copy-heavy dynamic-buffer TCP echo throughput, per-thread Jain across `MemoryPool` contention | `Jain < 0.95`, incomplete work, nonzero teardown pool charge, or a large host-local throughput drop versus the previous isolated baseline |
+| `multi_tcp_sink` | one-way dynamic-buffer TCP throughput with direct send/recv closures | incomplete work, nonzero teardown pool charge, lower throughput than `multi_tcp` without a trace-backed explanation, or no reduction in copy/memmove pressure |
 | `churn` | open+close rate sustained, post-teardown `pool used (end)` returns to 0, `net heap delta` bounded | post-teardown `pool used (end) > 0` (leaked reservations); `net heap delta` growing with rate (allocator-on-hot-path). The separate `pool used at deadline` line is diagnostic: in-flight connections plus aborted-with-unread-rx sockets (readable until the slot recycles, per the `may_recv`-after-Closed contract) legitimately hold a small bounded charge at cutoff |
 | `idle_hot` | `pool used post-create == 0` for idle flows; steady-state pool = N_active × 2 sockets × MAX_BUF | non-zero charge from idle sockets (lazy alloc broken); active flows can't reach max (grow policy broken) |
 
-In `--mode trace`, the lane packet pool is strict: if a shape exhausts its
-prebuilt lane packets the run fails instead of silently allocating fallback
-packets. Treat trace evidence as usable only when the printed lane stats show
-`fallback allocs: 0`.
+The lane device owns a fixed packet set in every mode and has no fallback
+allocation path. Exhaustion increments TX/RX backpressure and defers progress;
+backpressure is diagnostic, while incomplete work or broken ownership is a
+failure.
 
 ### 4.3 Configuration variants worth measuring
 
@@ -738,9 +738,9 @@ regular use. Add to a "deep" CI lane, not the default one.
 Use Tree Borrows (`-Zmiri-tree-borrows`) for audit proofs; it is the less
 false-positive-prone aliasing model for the sort of safe wrapper and buffer
 borrowing code smoltcp uses. Miri cannot model most host syscalls or C FFI, so
-it is not the right verifier for `phy::sys`, raw sockets, BPF, or the Mach RSS
-helpers in the profiling examples. For those, use ASan/LSan/TSan-capable fuzz
-or integration repros where practical.
+it is not the right verifier for `phy::sys`, raw sockets, BPF, or the Apple
+physical-footprint FFI in the profiling examples. For those, use
+ASan/LSan/TSan-capable fuzz or integration repros where practical.
 
 Smoltcp uses very little `unsafe`, so MIRI's value here is mostly
 catching slice-arithmetic mistakes in the wire parsers and TCP option
@@ -918,21 +918,21 @@ Use separate shapes for separate claims:
 | Shape | Evidence role | Gate |
 |---|---|---|
 | `many_tcp` | High-throughput TCP stress, memory growth, and starvation discovery. | zero-flow count must stay 0; the process-memory verdict should be `bounded`; Jain is diagnostic because the hot loop intentionally favors throughput. |
-| `many_tcp_fair` | Deterministic TCP fairness. One flow gets one bounded send/drain opportunity per round, and the start flow rotates each round. | Jain >= 0.95, zero-flow count 0, process memory bounded, lane fallback allocs 0 in trace mode. |
+| `many_tcp_fair` | Deterministic TCP fairness. One flow gets one bounded send/drain opportunity per round, and the start flow rotates each round. | Jain >= 0.95, zero-flow count 0, process memory bounded, fixed lane ownership. |
 | `many_udp` | UDP control shape without TCP flow-control or cwnd effects. | Jain should be 1.00 or close to it; process memory bounded. |
 
 A process-memory verdict other than `bounded` is a leak or unbounded buffer-growth signal.
-Nonzero lane fallback allocations in trace mode mean the harness pool, not
-smoltcp, polluted the trace; do not quote that run as performance evidence.
+Lane TX/RX backpressure is diagnostic; incomplete work fails in every mode,
+and fixed ownership is covered by the lane harness tests.
 
 ### 13.4 Dynamic-buffer / multi-thread shapes
 
-Do not keep fixed Gbps or RSS headline numbers here unless they come from
+Do not keep fixed Gbps or process-memory headline numbers here unless they come from
 current isolated runs on the same host and revision. The durable gates are:
 
 | Shape | Durable gate |
 |---|---|
-| `multi_tcp` | per-thread Jain >= 0.95, bounded pool CAS retries, `pool used (end)` returns to 0, trace-mode lane fallback allocs 0. |
+| `multi_tcp` | per-thread Jain >= 0.95, bounded pool CAS retries, `pool used (end)` returns to 0; TX/RX backpressure remains diagnostic. |
 | `multi_tcp_sink` | same pool and lane gates as `multi_tcp`; compare Time/CPU Profiler hotspots against `multi_tcp` for lower app-side copy pressure before claiming a copy win. |
 | `churn` | achieved close rate tracks target rate, post-teardown `pool used (end) == 0` (the at-deadline reading may be small and bounded), net heap delta does not grow with connection rate. |
 | `idle_hot` | `pool used post-create == 0`; steady pool charge is proportional only to active client/server sockets; lane `reserved total` is harness-only and must be kept separate from iOS socket-budget claims; `n_active=0` is valid and should keep steady pool use at 0. |
