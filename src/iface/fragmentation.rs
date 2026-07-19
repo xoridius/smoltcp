@@ -44,6 +44,13 @@ impl fmt::Display for AssemblerFullError {
 #[cfg(feature = "std")]
 impl std::error::Error for AssemblerFullError {}
 
+pub(super) fn checked_fragment_end(offset: usize, len: usize) -> Result<usize, AssemblerError> {
+    offset
+        .checked_add(len)
+        .filter(|&end| end <= usize::from(u16::MAX))
+        .ok_or(AssemblerError)
+}
+
 /// Holds different fragments of one packet, used for assembling fragmented packets.
 ///
 /// The buffer used for the `PacketAssembler` should either be dynamically sized (ex: Vec<u8>)
@@ -85,6 +92,8 @@ impl<K> PacketAssembler<K> {
 
     /// Set the total size of the packet assembler.
     pub(crate) fn set_total_size(&mut self, size: usize) -> Result<(), AssemblerError> {
+        let size = checked_fragment_end(0, size)?;
+
         if let Some(old_size) = self.total_size
             && old_size != size
         {
@@ -115,12 +124,17 @@ impl<K> PacketAssembler<K> {
         offset: usize,
         f: impl Fn(&mut [u8]) -> Result<usize, AssemblerError>,
     ) -> Result<(), AssemblerError> {
+        checked_fragment_end(offset, 0)?;
+
         if self.buffer.len() < offset {
             return Err(AssemblerError);
         }
 
         let len = f(&mut self.buffer[offset..])?;
-        assert!(offset + len <= self.buffer.len());
+        let end = checked_fragment_end(offset, len)?;
+        if self.buffer.len() < end {
+            return Err(AssemblerError);
+        }
 
         net_debug!(
             "frag assembler: receiving {} octets at offset {}",
@@ -139,18 +153,20 @@ impl<K> PacketAssembler<K> {
     /// - Returns [`Error::PacketAssemblerBufferTooSmall`] when trying to add data into the buffer at a non-existing
     ///   place.
     pub(crate) fn add(&mut self, data: &[u8], offset: usize) -> Result<(), AssemblerError> {
+        let end = checked_fragment_end(offset, data.len())?;
+
         #[cfg(not(feature = "alloc"))]
-        if self.buffer.len() < offset + data.len() {
+        if self.buffer.len() < end {
             return Err(AssemblerError);
         }
 
         #[cfg(feature = "alloc")]
-        if self.buffer.len() < offset + data.len() {
-            self.buffer.resize(offset + data.len(), 0);
+        if self.buffer.len() < end {
+            self.buffer.resize(end, 0);
         }
 
         let len = data.len();
-        self.buffer[offset..][..len].copy_from_slice(data);
+        self.buffer[offset..end].copy_from_slice(data);
 
         net_debug!(
             "frag assembler: receiving {} octets at offset {}",
@@ -416,6 +432,55 @@ mod tests {
         p_assembler.add(&data[..], 1);
 
         assert_eq!(p_assembler.assemble(), Some(&b"RRust"[..]))
+    }
+
+    #[test]
+    fn packet_assembler_checked_fragment_end() {
+        assert_eq!(checked_fragment_end(65_528, 7), Ok(usize::from(u16::MAX)));
+        assert_eq!(checked_fragment_end(65_528, 8), Err(AssemblerError));
+        assert_eq!(checked_fragment_end(usize::MAX, 1), Err(AssemblerError));
+    }
+
+    #[test]
+    fn packet_assembler_rejects_total_size_above_u16_max_before_growth() {
+        let mut p_assembler = PacketAssembler::<Key>::new();
+        let initial_buffer_len = p_assembler.buffer.len();
+
+        assert_eq!(
+            p_assembler.set_total_size(usize::from(u16::MAX) + 1),
+            Err(AssemblerError)
+        );
+        assert_eq!(p_assembler.buffer.len(), initial_buffer_len);
+        assert_eq!(p_assembler.total_size, None);
+    }
+
+    #[test]
+    fn packet_assembler_rejects_fragment_end_above_u16_max_before_growth() {
+        let mut p_assembler = PacketAssembler::<Key>::new();
+        let initial_buffer_len = p_assembler.buffer.len();
+
+        assert_eq!(p_assembler.add(&[0; 8], 65_528), Err(AssemblerError));
+        assert_eq!(p_assembler.buffer.len(), initial_buffer_len);
+        assert!(p_assembler.assembler.is_empty());
+    }
+
+    #[test]
+    fn packet_assembler_rejects_fragment_end_overflow_before_growth() {
+        let mut p_assembler = PacketAssembler::<Key>::new();
+        let initial_buffer_len = p_assembler.buffer.len();
+
+        assert_eq!(p_assembler.add(&[0], usize::MAX), Err(AssemblerError));
+        assert_eq!(p_assembler.buffer.len(), initial_buffer_len);
+        assert!(p_assembler.assembler.is_empty());
+    }
+
+    #[test]
+    fn packet_assembler_rejects_excessive_add_with_length() {
+        let mut p_assembler = PacketAssembler::<Key>::new();
+        p_assembler.set_total_size(1).unwrap();
+
+        assert_eq!(p_assembler.add_with(0, |_| Ok(2)), Err(AssemblerError));
+        assert!(p_assembler.assembler.is_empty());
     }
 
     #[test]

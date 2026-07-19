@@ -1,5 +1,8 @@
 use super::*;
 
+#[cfg(feature = "proto-ipv4-fragmentation")]
+use crate::iface::fragmentation::checked_fragment_end;
+
 impl Interface {
     /// Process fragments that still need to be sent for IPv4 packets.
     ///
@@ -110,6 +113,13 @@ impl InterfaceInner {
         #[cfg(feature = "proto-ipv4-fragmentation")]
         let ip_payload = {
             if ipv4_packet.more_frags() || ipv4_packet.frag_offset() != 0 {
+                let payload = ipv4_packet.payload();
+                let frag_offset = usize::from(ipv4_packet.frag_offset());
+                let payload_end = check!(checked_fragment_end(frag_offset, payload.len()));
+                check!(checked_fragment_end(
+                    usize::from(ipv4_packet.header_len()),
+                    payload_end,
+                ));
                 let key = FragKey::Ipv4(ipv4_packet.get_key());
 
                 let f = match frag.assembler.get(&key, self.now + frag.reassembly_timeout) {
@@ -122,13 +132,10 @@ impl InterfaceInner {
 
                 if !ipv4_packet.more_frags() {
                     // This is the last fragment, so we know the total size
-                    check!(f.set_total_size(
-                        ipv4_packet.total_len() as usize - ipv4_packet.header_len() as usize
-                            + ipv4_packet.frag_offset() as usize,
-                    ));
+                    check!(f.set_total_size(payload_end));
                 }
 
-                if let Err(e) = f.add(ipv4_packet.payload(), ipv4_packet.frag_offset() as usize) {
+                if let Err(e) = f.add(payload, frag_offset) {
                     net_debug!("fragmentation error: {:?}", e);
                     return None;
                 }

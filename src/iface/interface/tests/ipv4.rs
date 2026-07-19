@@ -1382,6 +1382,111 @@ fn test_raw_socket_rx_fragmentation(#[case] medium: Medium) {
 }
 
 #[rstest]
+#[case::last(false, 7)]
+#[case::non_last(true, 8)]
+#[cfg(all(
+    feature = "socket-raw",
+    feature = "proto-ipv4-fragmentation",
+    feature = "medium-ip"
+))]
+fn test_ipv4_reassembly_drops_fragment_exceeding_total_length(
+    #[case] more_frags: bool,
+    #[case] invalid_payload_len: usize,
+) {
+    use crate::config::REASSEMBLY_BUFFER_COUNT;
+    use crate::wire::{IpProtocol, IpVersion, Ipv4Address, Ipv4Packet, Ipv4Repr};
+
+    let (mut iface, mut sockets, _device) = setup(Medium::Ip);
+
+    let rx_buffer = raw::PacketBuffer::new(vec![raw::PacketMetadata::EMPTY], vec![0; 64]);
+    let tx_buffer = raw::PacketBuffer::new(vec![raw::PacketMetadata::EMPTY], vec![0; 64]);
+    let raw_socket = raw::Socket::new(
+        Some(IpVersion::Ipv4),
+        Some(IpProtocol::Unknown(99)),
+        rx_buffer,
+        tx_buffer,
+    );
+    let handle = sockets.add(raw_socket);
+
+    let src_addr = Ipv4Address::new(127, 0, 0, 2);
+    let dst_addr = Ipv4Address::new(127, 0, 0, 1);
+    let proto = IpProtocol::Unknown(99);
+
+    let build_fragment = |ident: u16,
+                          payload_len: usize,
+                          more_frags: bool,
+                          frag_offset: u16,
+                          payload_byte: u8|
+     -> Vec<u8> {
+        let repr = Ipv4Repr {
+            src_addr,
+            dst_addr,
+            next_header: proto,
+            hop_limit: 64,
+            payload_len,
+        };
+        let header_len = repr.buffer_len();
+        let mut bytes = vec![0; header_len + payload_len];
+        let mut packet = Ipv4Packet::new_unchecked(&mut bytes[..]);
+        repr.emit(&mut packet, &ChecksumCapabilities::default());
+        packet.set_ident(ident);
+        packet.set_more_frags(more_frags);
+        packet.set_frag_offset(frag_offset);
+        packet.fill_checksum();
+        bytes[header_len..].fill(payload_byte);
+        bytes
+    };
+
+    for ident in 0..REASSEMBLY_BUFFER_COUNT {
+        let bytes = build_fragment(ident as u16, invalid_payload_len, more_frags, 65_528, 0xcc);
+        let packet = Ipv4Packet::new_unchecked(&bytes[..]);
+        assert_eq!(
+            iface.inner.process_ipv4(
+                &mut sockets,
+                PacketMeta::default(),
+                HardwareAddress::default(),
+                &packet,
+                &mut iface.fragments,
+            ),
+            None
+        );
+        assert!(!sockets.get_mut::<raw::Socket>(handle).can_recv());
+    }
+
+    let valid_ident = u16::MAX;
+    for (payload_len, more_frags, frag_offset, payload_byte) in
+        [(24, true, 0, 0xaa), (6, false, 24, 0xbb)]
+    {
+        let bytes = build_fragment(
+            valid_ident,
+            payload_len,
+            more_frags,
+            frag_offset,
+            payload_byte,
+        );
+        let packet = Ipv4Packet::new_unchecked(&bytes[..]);
+        assert_eq!(
+            iface.inner.process_ipv4(
+                &mut sockets,
+                PacketMeta::default(),
+                HardwareAddress::default(),
+                &packet,
+                &mut iface.fragments,
+            ),
+            None
+        );
+    }
+
+    let socket = sockets.get_mut::<raw::Socket>(handle);
+    assert!(socket.can_recv());
+    let data = socket.recv().expect("valid fragments should be delivered");
+    let packet = Ipv4Packet::new_unchecked(data);
+    assert_eq!(packet.payload().len(), 30);
+    assert!(packet.payload()[..24].iter().all(|&byte| byte == 0xaa));
+    assert!(packet.payload()[24..].iter().all(|&byte| byte == 0xbb));
+}
+
+#[rstest]
 #[case(Medium::Ip)]
 #[cfg(all(feature = "socket-udp", feature = "medium-ip"))]
 #[case(Medium::Ethernet)]
