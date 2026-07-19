@@ -895,6 +895,11 @@ impl InterfaceInner {
         }
     }
 
+    fn has_assigned_ip_addr<T: Into<IpAddress>>(&self, addr: T) -> bool {
+        let addr = addr.into();
+        self.ip_addrs.iter().any(|probe| probe.address() == addr)
+    }
+
     /// Check whether the interface has the given IP address assigned.
     ///
     /// Always returns true if [`InterfaceInner::any_ip`].
@@ -904,8 +909,7 @@ impl InterfaceInner {
             return true;
         }
 
-        let addr = addr.into();
-        self.ip_addrs.iter().any(|probe| probe.address() == addr)
+        self.has_assigned_ip_addr(addr)
     }
 
     /// Check whether the interface listens to given destination multicast IP address.

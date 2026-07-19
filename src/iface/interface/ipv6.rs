@@ -149,7 +149,9 @@ impl InterfaceInner {
     /// [RFC 4291 § 2.7.1]: https://tools.ietf.org/html/rfc4291#section-2.7.1
     pub fn has_solicited_node(&self, addr: Ipv6Address) -> bool {
         self.ip_addrs.iter().any(|cidr| match *cidr {
-            IpCidr::Ipv6(cidr) if cidr.address() != Ipv6Address::LOCALHOST => {
+            IpCidr::Ipv6(cidr)
+                if cidr.address().x_is_unicast() && cidr.address() != Ipv6Address::LOCALHOST =>
+            {
                 addr == cidr.address().solicited_node()
             }
             _ => false,
@@ -267,7 +269,7 @@ impl InterfaceInner {
 
     #[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
     fn process_dad_neighbor_solicitation<'frame>(
-        &mut self,
+        &self,
         ip_repr: Ipv6Repr,
         ip_payload: &'frame [u8],
     ) -> Option<Packet<'frame>> {
@@ -299,12 +301,8 @@ impl InterfaceInner {
             return None;
         };
 
-        let target_is_assigned = self
-            .ip_addrs
-            .iter()
-            .any(|cidr| cidr.address() == IpAddress::Ipv6(target_addr));
         if !target_addr.x_is_unicast()
-            || !target_is_assigned
+            || !self.has_assigned_ip_addr(target_addr)
             || ip_repr.dst_addr != target_addr.solicited_node()
         {
             return None;
@@ -550,12 +548,8 @@ impl InterfaceInner {
                 lladdr,
                 ..
             } => {
-                let target_is_assigned = self
-                    .ip_addrs
-                    .iter()
-                    .any(|cidr| cidr.address() == IpAddress::Ipv6(target_addr));
                 if !target_addr.x_is_unicast()
-                    || !target_is_assigned
+                    || !self.has_assigned_ip_addr(target_addr)
                     || ip_repr.dst_addr != target_addr
                         && ip_repr.dst_addr != target_addr.solicited_node()
                 {

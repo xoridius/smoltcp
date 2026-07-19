@@ -174,7 +174,10 @@ impl Interface {
         let cidrs: Vec<IpCidr, IFACE_MAX_ADDR_COUNT> = Vec::from_slice(self.ip_addrs()).unwrap();
         for cidr in cidrs {
             if let IpCidr::Ipv6(cidr) = cidr {
-                let _ = self.join_multicast_group(cidr.address().solicited_node());
+                let addr = cidr.address();
+                if addr.x_is_unicast() && addr != Ipv6Address::LOCALHOST {
+                    let _ = self.join_multicast_group(addr.solicited_node());
+                }
             }
         }
     }

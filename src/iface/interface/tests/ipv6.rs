@@ -1609,6 +1609,9 @@ fn test_solicited_node_addrs(#[case] medium: Medium) {
             64,
         ))
         .unwrap();
+    new_addrs
+        .push(IpCidr::new(Ipv6Address::UNSPECIFIED.into(), 128))
+        .unwrap();
     iface.update_ip_addrs(|addrs| {
         new_addrs.extend(addrs.to_vec());
         *addrs = new_addrs;
@@ -2375,4 +2378,15 @@ fn test_solicited_node_multicast_autojoin(#[case] medium: Medium) {
     });
     assert!(!iface.has_multicast_group(addr1.solicited_node()));
     assert!(!iface.has_multicast_group(addr2.solicited_node()));
+
+    iface.update_ip_addrs(|ip_addrs| {
+        ip_addrs
+            .push(IpCidr::new(Ipv6Address::UNSPECIFIED.into(), 128))
+            .unwrap();
+        ip_addrs
+            .push(IpCidr::new(Ipv6Address::LOCALHOST.into(), 128))
+            .unwrap();
+    });
+    assert!(!iface.has_multicast_group(Ipv6Address::new(0xff02, 0, 0, 0, 0, 1, 0xff00, 0)));
+    assert!(!iface.has_multicast_group(Ipv6Address::LOCALHOST.solicited_node()));
 }
