@@ -64,16 +64,18 @@ Core commands:
   clippy                        Clippy on tests/examples.
   build_16bit                   Nightly build-std check for 16-bit pointers.
   coverage                      cargo-llvm-cov matrix.
-  netsim                        Stable NoControl loss-recovery netsim sweep.
+  netsim                        Stable NoControl, CUBIC, and Reno netsim sweeps.
+  apple-check                   Cross-check macOS and iOS targets on stable.
   all                           Core matrix above.
 
 Local fork evidence:
   quick                         Fast local smoke: fmt, iOS check, host phy check, iOS sizecheck.
   sizecheck                     Print default and iOS-shaped footprint numbers.
   ios-gate                      iOS Network Extension memory-shape proofs.
+  ios-full-gate                 Complete constrained-memory and traffic gate.
   profile-smoke [seconds]       Short throughput/fairness/RSS harness smoke.
   fuzz-build                    Build all fuzz targets on nightly.
-  fuzz-smoke [seconds] [target] Short ASan fuzz smoke, default wire_parsers.
+  fuzz-smoke [seconds] [target] Short deterministic ASan smoke, default all targets.
 
 Set TRACE=0 for quieter local output.
 USAGE
@@ -90,7 +92,23 @@ test() {
 
 netsim() {
     # Serialized: the test uses a global CLOCK and the process-wide logger.
-    cargo test --release --features _netsim netsim -- --test-threads=1
+    cargo test --release --features "_netsim socket-tcp-cubic socket-tcp-reno" --test netsim -- --test-threads=1
+}
+
+apple_check() {
+    rustup target add --toolchain stable \
+        x86_64-apple-darwin \
+        aarch64-apple-ios \
+        aarch64-apple-ios-sim
+
+    cargo +stable check --target x86_64-apple-darwin \
+        --lib --tests --examples \
+        --features "socket-tcp-dynamic-buffer,socket-tcp-cubic,socket-tcp-reno"
+
+    for target in aarch64-apple-ios aarch64-apple-ios-sim; do
+        cargo +stable check --target "$target" --lib \
+            --no-default-features --features "$IOS_FEATURES"
+    done
 }
 
 check() {
@@ -180,6 +198,77 @@ ios_gate() {
     cargo run --release --example dynbuf_memcompare --features socket-tcp-dynamic-buffer -- dynamic 300
 }
 
+run_profile_commands() {
+    local command
+    local -a argv
+
+    for command in "$@"; do
+        read -r -a argv <<< "$command"
+        target/release/examples/profile_loopback --mode bench "${argv[@]}"
+    done
+}
+
+ios_full_gate() {
+    local -a static_commands=(
+        "udp 3"
+        "udp 3 offload"
+        "firehose 3"
+        "firehose 3 offload"
+        "pingpong 3"
+        "pingpong 3 offload"
+        "small 3"
+        "small 3 offload"
+        "many_tcp 3 8"
+        "many_tcp 3 8 offload"
+        "many_tcp_fair 3 8"
+        "many_tcp_fair 3 8 offload"
+        "many_udp 3 8"
+        "many_udp 3 8 offload"
+        "many_tcp 3 50"
+        "many_tcp 3 50 offload"
+        "many_tcp_fair 3 50"
+        "many_tcp_fair 3 50 offload"
+        "many_udp 3 50"
+        "many_udp 3 50 offload"
+        "many_tcp 3 100"
+        "many_tcp 3 100 offload"
+        "many_tcp_fair 3 100"
+        "many_tcp_fair 3 100 offload"
+        "many_udp 3 100"
+        "many_udp 3 100 offload"
+    )
+    local -a dynamic_commands=(
+        "multi_tcp 3 2 50"
+        "multi_tcp 3 2 50 offload"
+        "multi_tcp_sink 3 2 50"
+        "multi_tcp_sink 3 2 50 offload"
+        "churn 3 500"
+        "churn 3 500 offload"
+        "idle_hot 3 1000 0"
+        "idle_hot 3 1000 0 offload"
+        "idle_hot 3 1000 10"
+        "idle_hot 3 1000 10 offload"
+    )
+
+    cargo test --release --lib --no-default-features --features "std,$IOS_FEATURES" dyn_buf -- --test-threads=1
+    sizecheck
+    apple_check
+
+    cargo build --release --example dynbuf_memcompare --features socket-tcp-dynamic-buffer
+    for flows in 300 1000; do
+        target/release/examples/dynbuf_memcompare legacy "$flows"
+        target/release/examples/dynbuf_memcompare dynamic "$flows"
+    done
+
+    cargo build --release --example profile_loopback
+    run_profile_commands "${static_commands[@]}"
+
+    cargo build --release --example profile_loopback --features socket-tcp-dynamic-buffer
+    run_profile_commands "${dynamic_commands[@]}"
+
+    netsim
+}
+
 profile_smoke() {
     local seconds="${1:-1}"
     cargo run --release --example profile_loopback -- --mode bench udp "$seconds"
@@ -194,8 +283,21 @@ fuzz_build() {
 
 fuzz_smoke() {
     local seconds="${1:-30}"
-    local target="${2:-wire_parsers}"
-    cargo +nightly fuzz run -s address "$target" -- -max_len=1536 -max_total_time="$seconds"
+    local selected="${2:-all}"
+    local targets
+    local target
+
+    if [[ "$selected" == "all" ]]; then
+        targets="$(cargo +nightly fuzz list)"
+    else
+        targets="$selected"
+    fi
+
+    while IFS= read -r target; do
+        [[ -z "$target" ]] && continue
+        cargo +nightly fuzz run --sanitizer address "$target" -- \
+            -seed=1 -max_len=1536 -timeout=5 -max_total_time="$seconds"
+    done <<< "$targets"
 }
 
 run_all() {
@@ -233,6 +335,9 @@ case "$cmd" in
     netsim)
         netsim
         ;;
+    apple-check)
+        apple_check
+        ;;
     all)
         run_all
         ;;
@@ -244,6 +349,9 @@ case "$cmd" in
         ;;
     ios-gate)
         ios_gate
+        ;;
+    ios-full-gate)
+        ios_full_gate
         ;;
     profile-smoke)
         profile_smoke "$@"

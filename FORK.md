@@ -124,13 +124,13 @@ notes, not as standing values in this file.
 | Question | First evidence to collect |
 |---|---|
 | Did the ordinary library matrix regress? | §3 test matrix. |
-| Did loss recovery or congestion control regress? | `./ci.sh netsim` for the stable NoControl sweep (§15), plus targeted TCP tests. Run `netsim_cubic`/`netsim_reno` manually when touching congestion controllers. |
+| Did loss recovery or congestion control regress? | `./ci.sh netsim` for the serialized NoControl, CUBIC, and Reno sweeps (§15), plus targeted TCP tests. |
 | What is tunnel-like throughput? | `./ci.sh profile-smoke` first, then `profile_loopback --mode bench udp <seconds>` and the same run with `offload` (§4.2, §4.3). |
 | Are many flows fair and bounded? | `./ci.sh profile-smoke` first, then `many_tcp_fair`, `many_tcp`, and `many_udp` (§4.2). |
-| Are dynamic TCP buffers safe for packet-tunnel memory budgets? | `./ci.sh ios-gate`, then `dynbuf_memcompare` plus `idle_hot` and `churn` (§4.2.1, §14.6). Compare raw process memory; report lane `reserved total` separately. |
+| Are dynamic TCP buffers safe for packet-tunnel memory budgets? | `./ci.sh ios-gate` for a quick check or `./ci.sh ios-full-gate` for the complete constrained-memory matrix (§4.2.1, §14.6). Compare raw process memory; report lane `reserved total` separately. |
 | Where is CPU time going? | `perf record` / `perf report`, `cargo flamegraph`, or `samply` (§5). |
 | Where is heap growth coming from? | Built-in process-memory/allocator fields first, then `heaptrack`, Massif, or `dhat-heap` (§6). |
-| Is parser hardening still covered? | `./ci.sh fuzz-build`, `./ci.sh fuzz-smoke`, and Miri proof lanes (§7). `fuzz-smoke` defaults to the broad `wire_parsers` target. |
+| Is parser hardening still covered? | `./ci.sh fuzz-build`, `./ci.sh fuzz-smoke`, and Miri proof lanes (§7). `fuzz-smoke` defaults to every registered target and also accepts one target name. |
 | Did socket footprints change? | `./ci.sh sizecheck` (§4.4). |
 | Did codegen for checksum paths change? | Cross-target assembly checks (§5.3). |
 
@@ -1178,11 +1178,12 @@ controller keeps loss recovery (§15) strictly selective — the cwnd budget
 goes to reassembly holes — where `NoControl` deliberately falls back to a
 redundant in-order pass after the holes.
 
-Validate a configuration change with `./ci.sh ios-gate`, then run longer
-`dynbuf_memcompare`, `churn`, and `idle_hot` shapes (§4.2.1) when changing pool
-or buffer sizing. Keep the printed lane `reserved total` beside the raw process
-metric as a separate harness-capacity diagnostic; allocated capacity cannot be
-subtracted from resident memory or physical footprint.
+Validate a configuration change with `./ci.sh ios-gate`; use
+`./ci.sh ios-full-gate` when changing pool or buffer sizing. The full gate runs
+the separate-process idle-memory comparison and the `churn` and `idle_hot`
+shapes. Keep the printed lane `reserved total` beside the raw process metric as
+a separate harness-capacity diagnostic; allocated capacity cannot be subtracted
+from resident memory or physical footprint.
 
 ## 15. SACK-based selective retransmission
 
@@ -1231,15 +1232,14 @@ unchanged. RACK-TLP and pacing remain out of scope (§11) until profile
 evidence demands them.
 
 In-tree regression coverage: `tests/netsim.rs` runs the buffer×loss sweep.
-`./ci.sh netsim` runs the stable NoControl snapshot, which exercises the SACK
-repair path without controller back-off. When changing congestion controllers,
-also run the feature-gated controller snapshots directly:
+`./ci.sh netsim` runs the NoControl snapshot, which exercises the SACK repair
+path without controller back-off, followed by the feature-gated CUBIC and Reno
+snapshots. The test target is serialized because it shares a global clock and
+process-wide logger:
 
 ```
 cargo test --release --features "_netsim socket-tcp-cubic socket-tcp-reno" \
-    --test netsim netsim_cubic -- --test-threads=1
-cargo test --release --features "_netsim socket-tcp-cubic socket-tcp-reno" \
-    --test netsim netsim_reno -- --test-threads=1
+    --test netsim -- --test-threads=1
 ```
 
 The controller snapshots should show Cubic/Reno throttling on loss as real
