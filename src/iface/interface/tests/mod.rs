@@ -59,6 +59,32 @@ fn test_new_panic() {
     Interface::new(config, &mut device, Instant::ZERO);
 }
 
+#[test]
+#[cfg(all(feature = "proto-ipv6-slaac", feature = "socket-dhcpv4"))]
+fn poll_at_keeps_socket_deadline_without_slaac_deadline() {
+    let (mut iface, mut sockets, _) = setup(Medium::Ethernet);
+    iface.inner.slaac_enabled = true;
+    iface.inner.slaac.rs_sent(Instant::ZERO);
+    iface.inner.slaac.process_advertisement(
+        &Ipv6Address::new(0xfe80, 0, 0, 0, 0, 0, 0, 2),
+        Duration::ZERO,
+        None,
+        Instant::ZERO,
+    );
+    assert_eq!(iface.inner.slaac.poll_at(Instant::ZERO), None);
+
+    #[cfg(feature = "multicast")]
+    {
+        iface.inner.multicast = super::multicast::State::new();
+    }
+    sockets.add(crate::socket::dhcpv4::Socket::new());
+
+    assert_eq!(
+        iface.poll_at(Instant::from_millis(1), &sockets),
+        Some(Instant::ZERO)
+    );
+}
+
 #[cfg(feature = "socket-udp")]
 #[rstest]
 #[case::ip(Medium::Ip)]

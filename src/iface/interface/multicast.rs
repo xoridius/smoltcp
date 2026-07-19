@@ -565,8 +565,7 @@ impl InterfaceInner {
     /// Host duties of the **MLDv2** protocol.
     ///
     /// Sets up `mld_report_state` for responding to MLD general/specific membership queries.
-    /// Membership must not be reported immediately in order to avoid flooding the network
-    /// after a query is broadcasted by a router; Currently the delay is fixed and not randomized.
+    /// Reports are delayed to avoid flooding the network after a router broadcasts a query.
     #[cfg(feature = "proto-ipv6")]
     pub(super) fn process_mldv2<'frame>(
         &mut self,
