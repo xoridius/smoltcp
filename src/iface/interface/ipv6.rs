@@ -148,15 +148,11 @@ impl InterfaceInner {
     ///
     /// [RFC 4291 § 2.7.1]: https://tools.ietf.org/html/rfc4291#section-2.7.1
     pub fn has_solicited_node(&self, addr: Ipv6Address) -> bool {
-        self.ip_addrs.iter().any(|cidr| {
-            match *cidr {
-                IpCidr::Ipv6(cidr) if cidr.address() != Ipv6Address::LOCALHOST => {
-                    // Take the lower order 24 bits of the IPv6 address and
-                    // append those bits to FF02:0:0:0:0:1:FF00::/104.
-                    addr.octets()[14..] == cidr.address().octets()[14..]
-                }
-                _ => false,
+        self.ip_addrs.iter().any(|cidr| match *cidr {
+            IpCidr::Ipv6(cidr) if cidr.address() != Ipv6Address::LOCALHOST => {
+                addr == cidr.address().solicited_node()
             }
+            _ => false,
         })
     }
 
@@ -194,6 +190,13 @@ impl InterfaceInner {
         ipv6_packet: &Ipv6Packet<&'frame [u8]>,
     ) -> Option<Packet<'frame>> {
         let ipv6_repr = check!(Ipv6Repr::parse(ipv6_packet));
+
+        if ipv6_repr.src_addr.is_unspecified() {
+            #[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
+            return self.process_dad_neighbor_solicitation(ipv6_repr, ipv6_packet.payload());
+            #[cfg(not(any(feature = "medium-ethernet", feature = "medium-ieee802154")))]
+            return None;
+        }
 
         if !ipv6_repr.src_addr.x_is_unicast() {
             // Discard packets with non-unicast source addresses.
@@ -260,6 +263,66 @@ impl InterfaceInner {
             handled_by_raw_socket,
             ip_payload,
         )
+    }
+
+    #[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
+    fn process_dad_neighbor_solicitation<'frame>(
+        &mut self,
+        ip_repr: Ipv6Repr,
+        ip_payload: &'frame [u8],
+    ) -> Option<Packet<'frame>> {
+        match self.caps.medium {
+            #[cfg(feature = "medium-ethernet")]
+            Medium::Ethernet => {}
+            #[cfg(feature = "medium-ieee802154")]
+            Medium::Ieee802154 => {}
+            #[cfg(feature = "medium-ip")]
+            Medium::Ip => return None,
+        }
+
+        if ip_repr.next_header != IpProtocol::Icmpv6 || ip_repr.hop_limit != 255 {
+            return None;
+        }
+
+        let icmp_packet = check!(Icmpv6Packet::new_checked(ip_payload));
+        let icmp_repr = check!(Icmpv6Repr::parse(
+            &ip_repr.src_addr,
+            &ip_repr.dst_addr,
+            &icmp_packet,
+            &self.caps.checksum,
+        ));
+        let Icmpv6Repr::Ndisc(NdiscRepr::NeighborSolicit {
+            target_addr,
+            lladdr: None,
+        }) = icmp_repr
+        else {
+            return None;
+        };
+
+        let target_is_assigned = self
+            .ip_addrs
+            .iter()
+            .any(|cidr| cidr.address() == IpAddress::Ipv6(target_addr));
+        if !target_addr.x_is_unicast()
+            || !target_is_assigned
+            || ip_repr.dst_addr != target_addr.solicited_node()
+        {
+            return None;
+        }
+
+        let advert = Icmpv6Repr::Ndisc(NdiscRepr::NeighborAdvert {
+            flags: NdiscNeighborFlags::OVERRIDE,
+            target_addr,
+            lladdr: Some(self.hardware_addr.into()),
+        });
+        let ip_repr = Ipv6Repr {
+            src_addr: target_addr,
+            dst_addr: IPV6_LINK_LOCAL_ALL_NODES,
+            next_header: IpProtocol::Icmpv6,
+            hop_limit: 255,
+            payload_len: advert.buffer_len(),
+        };
+        Some(Packet::new_ipv6(ip_repr, IpPayload::Icmpv6(advert)))
     }
 
     fn process_hopbyhop<'frame>(
@@ -461,10 +524,17 @@ impl InterfaceInner {
                 target_addr,
                 flags,
             } => {
-                let ip_addr = ip_repr.src_addr.into();
+                if !target_addr.x_is_unicast()
+                    || flags.contains(NdiscNeighborFlags::SOLICITED)
+                        && ip_repr.dst_addr.is_multicast()
+                {
+                    return None;
+                }
+
+                let ip_addr = target_addr.into();
                 if let Some(lladdr) = lladdr {
                     let lladdr = check!(lladdr.parse(self.caps.medium));
-                    if !lladdr.is_unicast() || !target_addr.x_is_unicast() {
+                    if !lladdr.is_unicast() {
                         return None;
                     }
                     if flags.contains(NdiscNeighborFlags::OVERRIDE)
@@ -480,33 +550,41 @@ impl InterfaceInner {
                 lladdr,
                 ..
             } => {
+                let target_is_assigned = self
+                    .ip_addrs
+                    .iter()
+                    .any(|cidr| cidr.address() == IpAddress::Ipv6(target_addr));
+                if !target_addr.x_is_unicast()
+                    || !target_is_assigned
+                    || ip_repr.dst_addr != target_addr
+                        && ip_repr.dst_addr != target_addr.solicited_node()
+                {
+                    return None;
+                }
+
                 if let Some(lladdr) = lladdr {
                     let lladdr = check!(lladdr.parse(self.caps.medium));
-                    if !lladdr.is_unicast() || !target_addr.x_is_unicast() {
+                    if !lladdr.is_unicast() {
                         return None;
                     }
                     self.neighbor_cache
                         .fill(ip_repr.src_addr.into(), lladdr, self.now);
                 }
 
-                if self.has_solicited_node(ip_repr.dst_addr) && self.has_ip_addr(target_addr) {
-                    let advert = Icmpv6Repr::Ndisc(NdiscRepr::NeighborAdvert {
-                        flags: NdiscNeighborFlags::SOLICITED,
-                        target_addr,
-                        #[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
-                        lladdr: Some(self.hardware_addr.into()),
-                    });
-                    let ip_repr = Ipv6Repr {
-                        src_addr: target_addr,
-                        dst_addr: ip_repr.src_addr,
-                        next_header: IpProtocol::Icmpv6,
-                        hop_limit: 0xff,
-                        payload_len: advert.buffer_len(),
-                    };
-                    Some(Packet::new_ipv6(ip_repr, IpPayload::Icmpv6(advert)))
-                } else {
-                    None
-                }
+                let advert = Icmpv6Repr::Ndisc(NdiscRepr::NeighborAdvert {
+                    flags: NdiscNeighborFlags::SOLICITED | NdiscNeighborFlags::OVERRIDE,
+                    target_addr,
+                    #[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
+                    lladdr: Some(self.hardware_addr.into()),
+                });
+                let ip_repr = Ipv6Repr {
+                    src_addr: target_addr,
+                    dst_addr: ip_repr.src_addr,
+                    next_header: IpProtocol::Icmpv6,
+                    hop_limit: 0xff,
+                    payload_len: advert.buffer_len(),
+                };
+                Some(Packet::new_ipv6(ip_repr, IpPayload::Icmpv6(advert)))
             }
             #[cfg(feature = "proto-ipv6-slaac")]
             NdiscRepr::RouterAdvert {

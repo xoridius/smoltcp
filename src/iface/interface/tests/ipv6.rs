@@ -29,6 +29,42 @@ fn parse_ipv6(data: &[u8]) -> crate::wire::Result<Packet<'_>> {
     }
 }
 
+fn emit_icmpv6(
+    src_addr: Ipv6Address,
+    dst_addr: Ipv6Address,
+    hop_limit: u8,
+    icmp_repr: Icmpv6Repr<'_>,
+) -> Vec<u8> {
+    let ipv6_repr = Ipv6Repr {
+        src_addr,
+        dst_addr,
+        next_header: IpProtocol::Icmpv6,
+        hop_limit,
+        payload_len: icmp_repr.buffer_len(),
+    };
+    let mut bytes = vec![0; ipv6_repr.buffer_len() + icmp_repr.buffer_len()];
+    ipv6_repr.emit(&mut Ipv6Packet::new_unchecked(&mut bytes));
+    icmp_repr.emit(
+        &src_addr,
+        &dst_addr,
+        &mut Icmpv6Packet::new_unchecked(&mut bytes[ipv6_repr.buffer_len()..]),
+        &ChecksumCapabilities::default(),
+    );
+    bytes
+}
+
+#[cfg(feature = "socket-raw")]
+fn add_ipv6_raw_socket(sockets: &mut SocketSet<'_>) -> crate::iface::SocketHandle {
+    let rx_buffer = raw::PacketBuffer::new(vec![raw::PacketMetadata::EMPTY], vec![0; IPV6_MIN_MTU]);
+    let tx_buffer = raw::PacketBuffer::new(vec![raw::PacketMetadata::EMPTY], vec![0; IPV6_MIN_MTU]);
+    sockets.add(raw::Socket::new(
+        Some(IpVersion::Ipv6),
+        None,
+        rx_buffer,
+        tx_buffer,
+    ))
+}
+
 #[rstest]
 #[case::ip(Medium::Ip)]
 #[cfg(feature = "medium-ip")]
@@ -700,12 +736,19 @@ fn ndisc_neighbor_advertisement_ethernet(#[case] medium: Medium) {
 
     assert_eq!(
         iface.inner.neighbor_cache.lookup(
-            &IpAddress::Ipv6(Ipv6Address::new(0xfdbe, 0, 0, 0, 0, 0, 0, 0x0002)),
+            &IpAddress::Ipv6(Ipv6Address::new(0xfe80, 0, 0, 0, 0, 0, 0, 0x0002)),
             iface.inner.now,
         ),
         NeighborAnswer::Found(HardwareAddress::Ethernet(EthernetAddress::from_bytes(&[
             0, 0, 0, 0, 0, 1
         ]))),
+    );
+    assert_eq!(
+        iface.inner.neighbor_cache.lookup(
+            &IpAddress::Ipv6(Ipv6Address::new(0xfdbe, 0, 0, 0, 0, 0, 0, 0x0002)),
+            iface.inner.now,
+        ),
+        NeighborAnswer::NotFound,
     );
 }
 
@@ -810,12 +853,319 @@ fn ndisc_neighbor_advertisement_ieee802154(#[case] medium: Medium) {
 
     assert_eq!(
         iface.inner.neighbor_cache.lookup(
-            &IpAddress::Ipv6(Ipv6Address::new(0xfdbe, 0, 0, 0, 0, 0, 0, 0x0002)),
+            &IpAddress::Ipv6(Ipv6Address::new(0xfe80, 0, 0, 0, 0, 0, 0, 0x0002)),
             iface.inner.now,
         ),
         NeighborAnswer::Found(HardwareAddress::Ieee802154(Ieee802154Address::from_bytes(
             &[0, 0, 0, 0, 0, 0, 0, 1]
         ))),
+    );
+    assert_eq!(
+        iface.inner.neighbor_cache.lookup(
+            &IpAddress::Ipv6(Ipv6Address::new(0xfdbe, 0, 0, 0, 0, 0, 0, 0x0002)),
+            iface.inner.now,
+        ),
+        NeighborAnswer::NotFound,
+    );
+}
+
+#[derive(Clone, Copy)]
+enum InvalidNeighborAdvertisement {
+    MulticastTarget,
+    SolicitedMulticastDestination,
+}
+
+#[rstest]
+#[case::multicast_target(InvalidNeighborAdvertisement::MulticastTarget)]
+#[case::solicited_multicast_destination(
+    InvalidNeighborAdvertisement::SolicitedMulticastDestination
+)]
+#[cfg(feature = "medium-ethernet")]
+fn ndisc_neighbor_advertisement_rejects_invalid_fields(
+    #[case] invalid: InvalidNeighborAdvertisement,
+) {
+    let src_addr = Ipv6Address::new(0xfe80, 0, 0, 0, 0, 0, 0, 2);
+    let local_addr = Ipv6Address::new(0xfe80, 0, 0, 0, 0, 0, 0, 1);
+    let lladdr = EthernetAddress([0x02, 0, 0, 0, 0, 2]);
+    let (target_addr, dst_addr, flags) = match invalid {
+        InvalidNeighborAdvertisement::MulticastTarget => (
+            IPV6_LINK_LOCAL_ALL_NODES,
+            local_addr,
+            NdiscNeighborFlags::OVERRIDE,
+        ),
+        InvalidNeighborAdvertisement::SolicitedMulticastDestination => (
+            local_addr,
+            local_addr.solicited_node(),
+            NdiscNeighborFlags::SOLICITED,
+        ),
+    };
+    let advertisement = Icmpv6Repr::Ndisc(NdiscRepr::NeighborAdvert {
+        flags,
+        target_addr,
+        lladdr: Some(lladdr.into()),
+    });
+    let bytes = emit_icmpv6(src_addr, dst_addr, 255, advertisement);
+    let (mut iface, mut sockets, _device) = setup(Medium::Ethernet);
+
+    assert_eq!(
+        iface.inner.process_ipv6(
+            &mut sockets,
+            PacketMeta::default(),
+            HardwareAddress::Ethernet(lladdr),
+            &Ipv6Packet::new_checked(&bytes[..]).unwrap(),
+        ),
+        None
+    );
+    assert_eq!(
+        iface
+            .inner
+            .neighbor_cache
+            .lookup(&IpAddress::Ipv6(src_addr), iface.inner.now),
+        NeighborAnswer::NotFound
+    );
+    if target_addr.x_is_unicast() {
+        assert_eq!(
+            iface
+                .inner
+                .neighbor_cache
+                .lookup(&IpAddress::Ipv6(target_addr), iface.inner.now),
+            NeighborAnswer::NotFound
+        );
+    }
+}
+
+#[rstest]
+#[case::ethernet(Medium::Ethernet)]
+#[cfg(feature = "medium-ethernet")]
+#[case::ieee802154(Medium::Ieee802154)]
+#[cfg(feature = "medium-ieee802154")]
+#[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
+fn dad_neighbor_solicitation(#[case] medium: Medium) {
+    let target_addr = Ipv6Address::new(0xfe80, 0, 0, 0, 0, 0, 0, 1);
+    let solicitation = Icmpv6Repr::Ndisc(NdiscRepr::NeighborSolicit {
+        target_addr,
+        lladdr: None,
+    });
+    let bytes = emit_icmpv6(
+        Ipv6Address::UNSPECIFIED,
+        target_addr.solicited_node(),
+        255,
+        solicitation,
+    );
+    let (mut iface, mut sockets, _device) = setup(medium);
+    #[cfg(feature = "socket-raw")]
+    let raw_handle = add_ipv6_raw_socket(&mut sockets);
+
+    let response = iface.inner.process_ipv6(
+        &mut sockets,
+        PacketMeta::default(),
+        HardwareAddress::default(),
+        &Ipv6Packet::new_checked(&bytes[..]).unwrap(),
+    );
+    let advertisement = Icmpv6Repr::Ndisc(NdiscRepr::NeighborAdvert {
+        flags: NdiscNeighborFlags::OVERRIDE,
+        target_addr,
+        lladdr: Some(iface.inner.hardware_addr.into()),
+    });
+    assert_eq!(
+        response,
+        Some(Packet::new_ipv6(
+            Ipv6Repr {
+                src_addr: target_addr,
+                dst_addr: IPV6_LINK_LOCAL_ALL_NODES,
+                next_header: IpProtocol::Icmpv6,
+                hop_limit: 255,
+                payload_len: advertisement.buffer_len(),
+            },
+            IpPayload::Icmpv6(advertisement),
+        ))
+    );
+    assert_eq!(
+        iface
+            .inner
+            .neighbor_cache
+            .lookup(&IpAddress::Ipv6(target_addr), iface.inner.now),
+        NeighborAnswer::NotFound
+    );
+    #[cfg(feature = "socket-raw")]
+    assert!(!sockets.get_mut::<raw::Socket>(raw_handle).can_recv());
+}
+
+#[derive(Clone, Copy)]
+enum InvalidDadNeighborSolicitation {
+    HopLimit,
+    SourceLinkLayerAddress,
+    Destination,
+    MulticastTarget,
+    Checksum,
+    EchoRequest,
+    UnconfiguredTarget,
+}
+
+#[rstest]
+#[case::hop_limit(InvalidDadNeighborSolicitation::HopLimit)]
+#[case::source_link_layer_address(InvalidDadNeighborSolicitation::SourceLinkLayerAddress)]
+#[case::destination(InvalidDadNeighborSolicitation::Destination)]
+#[case::multicast_target(InvalidDadNeighborSolicitation::MulticastTarget)]
+#[case::checksum(InvalidDadNeighborSolicitation::Checksum)]
+#[case::echo_request(InvalidDadNeighborSolicitation::EchoRequest)]
+#[case::unconfigured_target(InvalidDadNeighborSolicitation::UnconfiguredTarget)]
+#[cfg(feature = "medium-ethernet")]
+fn dad_neighbor_solicitation_rejects_invalid_packets(
+    #[case] invalid: InvalidDadNeighborSolicitation,
+) {
+    let configured_addr = Ipv6Address::new(0xfe80, 0, 0, 0, 0, 0, 0, 1);
+    let remote_addr = Ipv6Address::new(0xfe80, 0, 0, 0, 0, 0, 0, 2);
+    let mut target_addr = configured_addr;
+    let mut dst_addr = target_addr.solicited_node();
+    let mut hop_limit = 255;
+    let mut lladdr = None;
+    match invalid {
+        InvalidDadNeighborSolicitation::HopLimit => hop_limit = 254,
+        InvalidDadNeighborSolicitation::SourceLinkLayerAddress => {
+            lladdr = Some(EthernetAddress([0x02, 0, 0, 0, 0, 2]).into())
+        }
+        InvalidDadNeighborSolicitation::Destination => dst_addr = IPV6_LINK_LOCAL_ALL_NODES,
+        InvalidDadNeighborSolicitation::MulticastTarget => target_addr = IPV6_LINK_LOCAL_ALL_NODES,
+        InvalidDadNeighborSolicitation::UnconfiguredTarget => {
+            target_addr = remote_addr;
+            dst_addr = target_addr.solicited_node();
+        }
+        InvalidDadNeighborSolicitation::Checksum | InvalidDadNeighborSolicitation::EchoRequest => {}
+    }
+
+    let icmp_repr = if matches!(invalid, InvalidDadNeighborSolicitation::EchoRequest) {
+        Icmpv6Repr::EchoRequest {
+            ident: 1,
+            seq_no: 1,
+            data: &[],
+        }
+    } else {
+        Icmpv6Repr::Ndisc(NdiscRepr::NeighborSolicit {
+            target_addr,
+            lladdr,
+        })
+    };
+    let mut bytes = emit_icmpv6(Ipv6Address::UNSPECIFIED, dst_addr, hop_limit, icmp_repr);
+    if matches!(invalid, InvalidDadNeighborSolicitation::Checksum) {
+        bytes[IPV6_HEADER_LEN + 2] ^= 1;
+    }
+
+    let (mut iface, mut sockets, _device) = setup(Medium::Ethernet);
+    iface.set_any_ip(true);
+    #[cfg(feature = "socket-raw")]
+    let raw_handle = add_ipv6_raw_socket(&mut sockets);
+    assert_eq!(
+        iface.inner.process_ipv6(
+            &mut sockets,
+            PacketMeta::default(),
+            HardwareAddress::default(),
+            &Ipv6Packet::new_checked(&bytes[..]).unwrap(),
+        ),
+        None
+    );
+    if target_addr.x_is_unicast() {
+        assert_eq!(
+            iface
+                .inner
+                .neighbor_cache
+                .lookup(&IpAddress::Ipv6(target_addr), iface.inner.now),
+            NeighborAnswer::NotFound
+        );
+    }
+    #[cfg(feature = "socket-raw")]
+    assert!(!sockets.get_mut::<raw::Socket>(raw_handle).can_recv());
+}
+
+#[test]
+#[cfg(all(
+    feature = "medium-ip",
+    any(feature = "medium-ethernet", feature = "medium-ieee802154")
+))]
+fn dad_neighbor_solicitation_on_ip_medium_is_ignored() {
+    let target_addr = Ipv6Address::new(0xfe80, 0, 0, 0, 0, 0, 0, 1);
+    let solicitation = Icmpv6Repr::Ndisc(NdiscRepr::NeighborSolicit {
+        target_addr,
+        lladdr: None,
+    });
+    let bytes = emit_icmpv6(
+        Ipv6Address::UNSPECIFIED,
+        target_addr.solicited_node(),
+        255,
+        solicitation,
+    );
+    let (mut iface, mut sockets, _device) = setup(Medium::Ip);
+
+    assert_eq!(
+        iface.inner.process_ipv6(
+            &mut sockets,
+            PacketMeta::default(),
+            HardwareAddress::default(),
+            &Ipv6Packet::new_checked(&bytes[..]).unwrap(),
+        ),
+        None
+    );
+}
+
+#[test]
+#[cfg(feature = "medium-ethernet")]
+fn ordinary_neighbor_solicitation_accepts_unicast_destination() {
+    let target_addr = Ipv6Address::new(0xfe80, 0, 0, 0, 0, 0, 0, 1);
+    let src_addr = Ipv6Address::new(0xfe80, 0, 0, 0, 0, 0, 0, 2);
+    let lladdr = EthernetAddress([0x02, 0, 0, 0, 0, 2]);
+    let solicitation = Icmpv6Repr::Ndisc(NdiscRepr::NeighborSolicit {
+        target_addr,
+        lladdr: Some(lladdr.into()),
+    });
+    let bytes = emit_icmpv6(src_addr, target_addr, 255, solicitation);
+    let (mut iface, mut sockets, _device) = setup(Medium::Ethernet);
+
+    let advertisement = Icmpv6Repr::Ndisc(NdiscRepr::NeighborAdvert {
+        flags: NdiscNeighborFlags::SOLICITED | NdiscNeighborFlags::OVERRIDE,
+        target_addr,
+        lladdr: Some(iface.inner.hardware_addr.into()),
+    });
+    assert_eq!(
+        iface.inner.process_ipv6(
+            &mut sockets,
+            PacketMeta::default(),
+            HardwareAddress::Ethernet(lladdr),
+            &Ipv6Packet::new_checked(&bytes[..]).unwrap(),
+        ),
+        Some(Packet::new_ipv6(
+            Ipv6Repr {
+                src_addr: target_addr,
+                dst_addr: src_addr,
+                next_header: IpProtocol::Icmpv6,
+                hop_limit: 255,
+                payload_len: advertisement.buffer_len(),
+            },
+            IpPayload::Icmpv6(advertisement),
+        ))
+    );
+}
+
+#[test]
+#[cfg(feature = "medium-ethernet")]
+fn ordinary_neighbor_solicitation_requires_configured_target() {
+    let target_addr = Ipv6Address::new(0xfe80, 0, 0, 0, 0, 0, 0, 99);
+    let src_addr = Ipv6Address::new(0xfe80, 0, 0, 0, 0, 0, 0, 2);
+    let solicitation = Icmpv6Repr::Ndisc(NdiscRepr::NeighborSolicit {
+        target_addr,
+        lladdr: None,
+    });
+    let bytes = emit_icmpv6(src_addr, target_addr, 255, solicitation);
+    let (mut iface, mut sockets, _device) = setup(Medium::Ethernet);
+    iface.set_any_ip(true);
+
+    assert_eq!(
+        iface.inner.process_ipv6(
+            &mut sockets,
+            PacketMeta::default(),
+            HardwareAddress::default(),
+            &Ipv6Packet::new_checked(&bytes[..]).unwrap(),
+        ),
+        None
     );
 }
 
@@ -857,7 +1207,7 @@ fn test_handle_valid_ndisc_request(#[case] medium: Medium) {
     );
 
     let icmpv6_expected = Icmpv6Repr::Ndisc(NdiscRepr::NeighborAdvert {
-        flags: NdiscNeighborFlags::SOLICITED,
+        flags: NdiscNeighborFlags::SOLICITED | NdiscNeighborFlags::OVERRIDE,
         target_addr: local_ip_addr,
         lladdr: Some(local_hw_addr.into()),
     });
@@ -1277,6 +1627,16 @@ fn test_solicited_node_addrs(#[case] medium: Medium) {
         !iface
             .inner
             .has_solicited_node(Ipv6Address::new(0xff02, 0, 0, 0, 0, 1, 0xff00, 0x0003))
+    );
+    assert!(
+        !iface
+            .inner
+            .has_solicited_node(Ipv6Address::new(0xff05, 0, 0, 0, 0, 1, 0xff00, 0x0002))
+    );
+    assert!(
+        !iface
+            .inner
+            .has_solicited_node(Ipv6Address::new(0xff02, 0, 0, 0, 0, 1, 0xff01, 0x0002))
     );
 }
 
