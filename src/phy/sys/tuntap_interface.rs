@@ -222,10 +222,10 @@ mod tests {
         peer.read_exact(&mut received).unwrap();
         assert_eq!(received, byte);
 
+        peer.set_nonblocking(true).unwrap();
         drop(interface);
 
-        let error = fd_flags(original_fd).unwrap_err();
-        assert_eq!(error.raw_os_error(), Some(libc::EBADF));
+        assert!(matches!(peer.read(&mut [0; 1]), Ok(0)));
     }
 
     #[test]
