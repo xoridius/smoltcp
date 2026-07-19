@@ -142,17 +142,14 @@ impl TrafficShape {
 
 fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Config, String> {
     let mut args = args.into_iter().peekable();
-    let mut explicit_mode = false;
     let mode = match args.peek().map(String::as_str) {
         Some("--mode") => {
-            explicit_mode = true;
             args.next();
             args.next()
                 .ok_or_else(|| "missing value for --mode, expected bench|trace".to_owned())?
                 .parse()?
         }
         Some(arg) if arg.starts_with("--mode=") => {
-            explicit_mode = true;
             let value = arg["--mode=".len()..].to_owned();
             args.next();
             value.parse()?
@@ -164,13 +161,13 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Config, String> 
         .next()
         .ok_or_else(|| "missing traffic shape".to_owned())?;
     if is_mode_option(&shape_name) {
-        return Err(mode_position_error(explicit_mode));
+        return Err(MODE_POSITION_ERROR.to_owned());
     }
     if shape_name.starts_with('-') {
         return Err(format!("unknown option '{shape_name}'"));
     }
 
-    let seconds = next_nonzero_u64(&mut args, "seconds", explicit_mode)?;
+    let seconds = next_nonzero_u64(&mut args, "seconds")?;
 
     let shape = match shape_name.as_str() {
         "udp" => TrafficShape::Udp,
@@ -179,32 +176,32 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Config, String> 
         "small" => TrafficShape::Small,
         "all" => TrafficShape::All,
         "many_tcp" => TrafficShape::ManyTcp {
-            flows: next_nonzero_usize(&mut args, "flows", explicit_mode)?,
+            flows: next_nonzero_usize(&mut args, "flows")?,
         },
         "many_tcp_fair" => TrafficShape::ManyTcpFair {
-            flows: next_nonzero_usize(&mut args, "flows", explicit_mode)?,
+            flows: next_nonzero_usize(&mut args, "flows")?,
         },
         "many_udp" => TrafficShape::ManyUdp {
-            flows: next_nonzero_usize(&mut args, "flows", explicit_mode)?,
+            flows: next_nonzero_usize(&mut args, "flows")?,
         },
         #[cfg(feature = "socket-tcp-dynamic-buffer")]
         "multi_tcp" => TrafficShape::MultiTcp {
-            threads: next_nonzero_usize(&mut args, "threads", explicit_mode)?,
-            flows_per_thread: next_nonzero_usize(&mut args, "flows per thread", explicit_mode)?,
+            threads: next_nonzero_usize(&mut args, "threads")?,
+            flows_per_thread: next_nonzero_usize(&mut args, "flows per thread")?,
         },
         #[cfg(feature = "socket-tcp-dynamic-buffer")]
         "multi_tcp_sink" => TrafficShape::MultiTcpSink {
-            threads: next_nonzero_usize(&mut args, "threads", explicit_mode)?,
-            flows_per_thread: next_nonzero_usize(&mut args, "flows per thread", explicit_mode)?,
+            threads: next_nonzero_usize(&mut args, "threads")?,
+            flows_per_thread: next_nonzero_usize(&mut args, "flows per thread")?,
         },
         #[cfg(feature = "socket-tcp-dynamic-buffer")]
         "churn" => TrafficShape::Churn {
-            rate: next_nonzero_usize(&mut args, "rate", explicit_mode)?,
+            rate: next_nonzero_usize(&mut args, "rate")?,
         },
         #[cfg(feature = "socket-tcp-dynamic-buffer")]
         "idle_hot" => {
-            let idle = next_usize(&mut args, "idle flows", explicit_mode)?;
-            let active = next_usize(&mut args, "active flows", explicit_mode)?;
+            let idle = next_usize(&mut args, "idle flows")?;
+            let active = next_usize(&mut args, "active flows")?;
             if idle == 0 && active == 0 {
                 return Err("idle_hot requires at least one idle or active flow".to_owned());
             }
@@ -219,7 +216,7 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Config, String> 
         other => return Err(format!("unknown traffic shape '{other}'")),
     };
 
-    let offload_checksums = parse_offload(&mut args, explicit_mode)?;
+    let offload_checksums = parse_offload(&mut args)?;
     Ok(Config {
         mode,
         seconds,
@@ -228,14 +225,10 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Config, String> 
     })
 }
 
-fn next_value(
-    args: &mut impl Iterator<Item = String>,
-    name: &str,
-    explicit_mode: bool,
-) -> Result<String, String> {
+fn next_value(args: &mut impl Iterator<Item = String>, name: &str) -> Result<String, String> {
     let value = args.next().ok_or_else(|| format!("missing {name}"))?;
     if is_mode_option(&value) {
-        return Err(mode_position_error(explicit_mode));
+        return Err(MODE_POSITION_ERROR.to_owned());
     }
     if value.starts_with('-') {
         return Err(format!("unknown option '{value}'"));
@@ -246,9 +239,8 @@ fn next_value(
 fn next_nonzero_u64(
     args: &mut impl Iterator<Item = String>,
     name: &str,
-    explicit_mode: bool,
 ) -> Result<NonZeroU64, String> {
-    let value = next_value(args, name, explicit_mode)?;
+    let value = next_value(args, name)?;
     let parsed = value
         .parse::<u64>()
         .map_err(|_| format!("invalid {name} '{value}': expected a non-zero integer"))?;
@@ -258,9 +250,8 @@ fn next_nonzero_u64(
 fn next_nonzero_usize(
     args: &mut impl Iterator<Item = String>,
     name: &str,
-    explicit_mode: bool,
 ) -> Result<NonZeroUsize, String> {
-    let value = next_value(args, name, explicit_mode)?;
+    let value = next_value(args, name)?;
     let parsed = value
         .parse::<usize>()
         .map_err(|_| format!("invalid {name} '{value}': expected a non-zero integer"))?;
@@ -268,26 +259,19 @@ fn next_nonzero_usize(
 }
 
 #[cfg(feature = "socket-tcp-dynamic-buffer")]
-fn next_usize(
-    args: &mut impl Iterator<Item = String>,
-    name: &str,
-    explicit_mode: bool,
-) -> Result<usize, String> {
-    let value = next_value(args, name, explicit_mode)?;
+fn next_usize(args: &mut impl Iterator<Item = String>, name: &str) -> Result<usize, String> {
+    let value = next_value(args, name)?;
     value
         .parse()
         .map_err(|_| format!("invalid {name} '{value}': expected a non-negative integer"))
 }
 
-fn parse_offload(
-    args: &mut impl Iterator<Item = String>,
-    explicit_mode: bool,
-) -> Result<bool, String> {
+fn parse_offload(args: &mut impl Iterator<Item = String>) -> Result<bool, String> {
     let Some(value) = args.next() else {
         return Ok(false);
     };
     if is_mode_option(&value) {
-        return Err(mode_position_error(explicit_mode));
+        return Err(MODE_POSITION_ERROR.to_owned());
     }
     if value.starts_with('-') {
         return Err(format!("unknown option '{value}'"));
@@ -299,7 +283,7 @@ fn parse_offload(
     }
     if let Some(trailing) = args.next() {
         if is_mode_option(&trailing) {
-            return Err(mode_position_error(explicit_mode));
+            return Err(MODE_POSITION_ERROR.to_owned());
         }
         if trailing.starts_with('-') {
             return Err(format!("unknown option '{trailing}'"));
@@ -313,13 +297,8 @@ fn is_mode_option(value: &str) -> bool {
     value == "--mode" || value.starts_with("--mode=")
 }
 
-fn mode_position_error(explicit_mode: bool) -> String {
-    if explicit_mode {
-        "--mode may be specified only once and must appear before the traffic shape".to_owned()
-    } else {
-        "--mode must appear before the traffic shape".to_owned()
-    }
-}
+const MODE_POSITION_ERROR: &str =
+    "--mode must appear before the traffic shape and may be specified only once";
 
 /// Tracks every allocation routed through the global allocator. We only count
 /// counter atomics (Relaxed), so the overhead is two adds per alloc/free.
@@ -707,6 +686,119 @@ impl Fairness {
             self.zero_flows, self.starved
         );
     }
+}
+
+fn validate_tcp_transfer(
+    shape: &str,
+    client_established: bool,
+    server_established: bool,
+    sent: u64,
+    received: u64,
+) -> Result<(), String> {
+    if !client_established {
+        return Err(format!("{shape}: client TCP side did not establish"));
+    }
+    if !server_established {
+        return Err(format!("{shape}: server TCP side did not establish"));
+    }
+    if sent == 0 {
+        return Err(format!("{shape}: sent no application bytes"));
+    }
+    if received == 0 {
+        return Err(format!("{shape}: received no application bytes"));
+    }
+    Ok(())
+}
+
+fn validate_pingpong(
+    client_established: bool,
+    server_established: bool,
+    roundtrips: u64,
+) -> Result<(), String> {
+    if !client_established {
+        return Err("pingpong: client TCP side did not establish".to_owned());
+    }
+    if !server_established {
+        return Err("pingpong: server TCP side did not establish".to_owned());
+    }
+    if roundtrips == 0 {
+        return Err("pingpong: completed no roundtrips".to_owned());
+    }
+    Ok(())
+}
+
+fn validate_udp_bindings(
+    shape: &str,
+    server_bound: bool,
+    client_bound: bool,
+) -> Result<(), String> {
+    if !server_bound {
+        return Err(format!("{shape}: server UDP socket did not bind"));
+    }
+    if !client_bound {
+        return Err(format!("{shape}: client UDP socket did not bind"));
+    }
+    Ok(())
+}
+
+fn validate_udp_transfer(
+    shape: &str,
+    server_bound: bool,
+    client_bound: bool,
+    sent: u64,
+    received: u64,
+) -> Result<(), String> {
+    validate_udp_bindings(shape, server_bound, client_bound)?;
+    if sent == 0 {
+        return Err(format!("{shape}: sent no application bytes"));
+    }
+    if received == 0 {
+        return Err(format!("{shape}: received no application bytes"));
+    }
+    Ok(())
+}
+
+fn validate_flow_stats(shape: &str, stats: &Fairness) -> Result<(), String> {
+    if stats.total == 0 {
+        return Err(format!("{shape}: received no application bytes"));
+    }
+    if stats.zero_flows != 0 {
+        return Err(format!(
+            "{shape}: {} flow(s) received zero bytes",
+            stats.zero_flows
+        ));
+    }
+    if stats.starved != 0 {
+        return Err(format!(
+            "{shape}: {} flow(s) received less than 10% of the mean",
+            stats.starved
+        ));
+    }
+    Ok(())
+}
+
+fn validate_established_flows(
+    shape: &str,
+    established: usize,
+    expected: usize,
+    received: &Fairness,
+) -> Result<(), String> {
+    if established != expected {
+        return Err(format!(
+            "{shape}: only {established}/{expected} flows established"
+        ));
+    }
+    validate_flow_stats(shape, received)
+}
+
+fn validate_fairness(shape: &str, fairness: &Fairness) -> Result<(), String> {
+    if fairness.jain < 0.95 {
+        return Err(format!(
+            "{shape}: Jain fairness {:.4} is below 0.9500",
+            fairness.jain
+        ));
+    }
+    Ok(())
 }
 
 /// Periodic RSS sample. We collect (elapsed_ms, rss, alloc_bytes) snapshots
@@ -1215,7 +1307,7 @@ mod tests {
             (vec!["--mode", "fast", "udp", "1"], "invalid mode 'fast'"),
             (
                 vec!["--mode", "bench", "--mode", "trace", "udp", "1"],
-                "--mode may be specified only once",
+                "--mode must appear before the traffic shape",
             ),
             (
                 vec!["udp", "1", "--mode", "trace"],
@@ -1305,6 +1397,123 @@ mod tests {
                 ))
             );
         }
+    }
+
+    #[test]
+    fn tcp_workload_validation_requires_establishment_and_work() {
+        assert!(validate_tcp_transfer("firehose", true, true, 1, 1).is_ok());
+        for result in [
+            validate_tcp_transfer("firehose", false, true, 1, 1),
+            validate_tcp_transfer("firehose", true, false, 1, 1),
+            validate_tcp_transfer("firehose", true, true, 0, 1),
+            validate_tcp_transfer("firehose", true, true, 1, 0),
+        ] {
+            assert!(result.is_err());
+        }
+
+        assert!(validate_pingpong(true, true, 1).is_ok());
+        assert!(validate_pingpong(false, true, 1).is_err());
+        assert!(validate_pingpong(true, false, 1).is_err());
+        assert!(validate_pingpong(true, true, 0).is_err());
+    }
+
+    #[test]
+    fn udp_workload_validation_requires_bindings_and_work() {
+        assert!(validate_udp_transfer("udp", true, true, 1, 1).is_ok());
+        for result in [
+            validate_udp_transfer("udp", false, true, 1, 1),
+            validate_udp_transfer("udp", true, false, 1, 1),
+            validate_udp_transfer("udp", true, true, 0, 1),
+            validate_udp_transfer("udp", true, true, 1, 0),
+        ] {
+            assert!(result.is_err());
+        }
+    }
+
+    #[test]
+    fn many_flow_validation_gates_setup_work_and_starvation() {
+        let fair = Fairness::from(&[100, 100]);
+        assert!(validate_established_flows("many_tcp", 2, 2, &fair).is_ok());
+        assert!(validate_established_flows("many_tcp", 1, 2, &fair).is_err());
+        assert!(validate_established_flows("many_tcp", 2, 2, &Fairness::from(&[0, 0])).is_err());
+        assert!(validate_established_flows("many_tcp", 2, 2, &Fairness::from(&[0, 100])).is_err());
+        assert!(validate_established_flows("many_tcp", 2, 2, &Fairness::from(&[1, 100])).is_err());
+
+        let unfair_without_starvation = Fairness::from(&[10, 100]);
+        assert!(validate_established_flows("many_tcp", 2, 2, &unfair_without_starvation).is_ok());
+        assert!(validate_fairness("many_tcp_fair", &unfair_without_starvation).is_err());
+        assert!(validate_fairness("many_tcp_fair", &fair).is_ok());
+
+        assert!(validate_udp_bindings("many_udp", true, true).is_ok());
+        assert!(validate_udp_bindings("many_udp", false, true).is_err());
+        assert!(validate_udp_bindings("many_udp", true, false).is_err());
+        assert!(validate_flow_stats("many_udp", &fair).is_ok());
+        assert!(validate_fairness("many_udp", &unfair_without_starvation).is_err());
+    }
+
+    #[cfg(feature = "socket-tcp-dynamic-buffer")]
+    fn worker_stats(received: u64) -> MultiTcpWorkerStats {
+        MultiTcpWorkerStats {
+            established: 2,
+            expected_flows: 2,
+            sent: received,
+            received,
+            elapsed_us: 1_000_000,
+            lane_stats: LaneStats::default(),
+        }
+    }
+
+    #[cfg(feature = "socket-tcp-dynamic-buffer")]
+    #[test]
+    fn multi_tcp_validation_gates_workers_and_pool_boundaries() {
+        let workers = [Ok(worker_stats(100)), Ok(worker_stats(100))];
+        assert!(validate_multi_tcp_workers("multi_tcp", &workers, 100, 100, 0).is_ok());
+
+        let mut incomplete = worker_stats(100);
+        incomplete.established = 1;
+        let invalid = [Err("listen failed".to_owned()), Ok(worker_stats(100))];
+        assert!(validate_multi_tcp_workers("multi_tcp", &invalid, 100, 100, 0).is_err());
+        let invalid = [Ok(incomplete), Ok(worker_stats(100))];
+        assert!(validate_multi_tcp_workers("multi_tcp", &invalid, 100, 100, 0).is_err());
+        assert!(
+            validate_multi_tcp_workers(
+                "multi_tcp",
+                &[Ok(worker_stats(0)), Ok(worker_stats(0))],
+                100,
+                100,
+                0,
+            )
+            .is_err()
+        );
+        assert!(
+            validate_multi_tcp_workers(
+                "multi_tcp",
+                &[Ok(worker_stats(1)), Ok(worker_stats(100))],
+                100,
+                100,
+                0,
+            )
+            .is_err()
+        );
+        assert!(validate_multi_tcp_workers("multi_tcp", &workers, 101, 100, 0).is_err());
+        assert!(validate_multi_tcp_workers("multi_tcp", &workers, 100, 100, 1).is_err());
+    }
+
+    #[cfg(feature = "socket-tcp-dynamic-buffer")]
+    #[test]
+    fn work_counter_and_pool_validation_rejects_empty_or_unbounded_runs() {
+        assert!(validate_nonzero_counters("churn", &[("opened", 1), ("closed", 1)]).is_ok());
+        assert!(validate_nonzero_counters("churn", &[("opened", 0)]).is_err());
+        assert!(validate_pool_boundaries("churn", 100, 100, 0).is_ok());
+        assert!(validate_pool_boundaries("churn", 101, 100, 0).is_err());
+        assert!(validate_pool_boundaries("churn", 100, 100, 1).is_err());
+    }
+
+    #[test]
+    fn duplicate_and_misplaced_modes_use_the_same_error() {
+        let duplicate = args(&["--mode", "bench", "--mode", "trace", "udp", "1"]).unwrap_err();
+        let misplaced = args(&["udp", "1", "--mode", "trace"]).unwrap_err();
+        assert_eq!(duplicate, misplaced);
     }
 
     fn lane(mtu: usize, depth: usize) -> LaneRc {
@@ -2147,7 +2356,7 @@ impl<'a> Report<'a> {
     }
 }
 
-fn shape_firehose(seconds: u64, offload: bool) {
+fn shape_firehose(seconds: u64, offload: bool) -> Result<(), String> {
     const BUF: usize = 256 * 1024;
     let lane_a: LaneRc = Rc::new(RefCell::new(Lane::new(1500, 256)));
     let lane_b: LaneRc = Rc::new(RefCell::new(Lane::new(1500, 256)));
@@ -2176,22 +2385,18 @@ fn shape_firehose(seconds: u64, offload: bool) {
         let s = server.sockets.get_mut::<tcp::Socket>(srv_h);
         s.set_ack_delay(None);
         s.set_nagle_enabled(false);
-        s.listen(1234).unwrap();
+        let _ = s.listen(1234);
     }
     {
         let c = client.sockets.get_mut::<tcp::Socket>(cli_h);
         c.set_ack_delay(None);
         c.set_nagle_enabled(false);
     }
-    client
-        .sockets
-        .get_mut::<tcp::Socket>(cli_h)
-        .connect(
-            client.iface.context(),
-            (IpAddress::v4(10, 0, 0, 1), 1234),
-            49152,
-        )
-        .unwrap();
+    let _ = client.sockets.get_mut::<tcp::Socket>(cli_h).connect(
+        client.iface.context(),
+        (IpAddress::v4(10, 0, 0, 1), 1234),
+        49152,
+    );
 
     // Use wall clock for the virtual time so TCP timers (RTO, delayed ACK) behave realistically.
     let wall_origin = StdInstant::now();
@@ -2212,6 +2417,14 @@ fn shape_firehose(seconds: u64, offload: bool) {
             break;
         }
     }
+    let client_established = matches!(
+        client.sockets.get::<tcp::Socket>(cli_h).state(),
+        tcp::State::Established
+    );
+    let server_established = matches!(
+        server.sockets.get::<tcp::Socket>(srv_h).state(),
+        tcp::State::Established
+    );
 
     let payload = vec![0x42u8; 64 * 1024];
     let deadline = StdInstant::now() + std::time::Duration::from_secs(seconds);
@@ -2296,9 +2509,16 @@ fn shape_firehose(seconds: u64, offload: bool) {
     }
     .print();
     print_lane_stats("firehose", collect_lane_stats(&[&lane_a, &lane_b]));
+    validate_tcp_transfer(
+        "firehose",
+        client_established,
+        server_established,
+        sent,
+        recvd,
+    )
 }
 
-fn shape_small(seconds: u64, offload: bool) {
+fn shape_small(seconds: u64, offload: bool) -> Result<(), String> {
     // Force tiny segments by limiting the socket buffer; with a 1500 MTU the
     // client never fills more than a single small write at a time.
     const BUF: usize = 4 * 1024;
@@ -2323,20 +2543,12 @@ fn shape_small(seconds: u64, offload: bool) {
     let srv_h = add_tcp_socket(&mut server, BUF);
     let cli_h = add_tcp_socket(&mut client, BUF);
 
-    server
-        .sockets
-        .get_mut::<tcp::Socket>(srv_h)
-        .listen(1234)
-        .unwrap();
-    client
-        .sockets
-        .get_mut::<tcp::Socket>(cli_h)
-        .connect(
-            client.iface.context(),
-            (IpAddress::v4(10, 0, 0, 1), 1234),
-            49152,
-        )
-        .unwrap();
+    let _ = server.sockets.get_mut::<tcp::Socket>(srv_h).listen(1234);
+    let _ = client.sockets.get_mut::<tcp::Socket>(cli_h).connect(
+        client.iface.context(),
+        (IpAddress::v4(10, 0, 0, 1), 1234),
+        49152,
+    );
 
     let mut t_ms: i64 = 0;
     for _ in 0..200 {
@@ -2352,6 +2564,14 @@ fn shape_small(seconds: u64, offload: bool) {
         }
         t_ms += 1;
     }
+    let client_established = matches!(
+        client.sockets.get::<tcp::Socket>(cli_h).state(),
+        tcp::State::Established
+    );
+    let server_established = matches!(
+        server.sockets.get::<tcp::Socket>(srv_h).state(),
+        tcp::State::Established
+    );
 
     let payload = [0x42u8; 64];
     let deadline = StdInstant::now() + std::time::Duration::from_secs(seconds);
@@ -2411,9 +2631,10 @@ fn shape_small(seconds: u64, offload: bool) {
     }
     .print();
     print_lane_stats("small", collect_lane_stats(&[&lane_a, &lane_b]));
+    validate_tcp_transfer("small", client_established, server_established, sent, recvd)
 }
 
-fn shape_pingpong(seconds: u64, offload: bool) {
+fn shape_pingpong(seconds: u64, offload: bool) -> Result<(), String> {
     const BUF: usize = 16 * 1024;
     let lane_a: LaneRc = Rc::new(RefCell::new(Lane::new(1500, 256)));
     let lane_b: LaneRc = Rc::new(RefCell::new(Lane::new(1500, 256)));
@@ -2436,20 +2657,12 @@ fn shape_pingpong(seconds: u64, offload: bool) {
     let srv_h = add_tcp_socket(&mut server, BUF);
     let cli_h = add_tcp_socket(&mut client, BUF);
 
-    server
-        .sockets
-        .get_mut::<tcp::Socket>(srv_h)
-        .listen(1234)
-        .unwrap();
-    client
-        .sockets
-        .get_mut::<tcp::Socket>(cli_h)
-        .connect(
-            client.iface.context(),
-            (IpAddress::v4(10, 0, 0, 1), 1234),
-            49152,
-        )
-        .unwrap();
+    let _ = server.sockets.get_mut::<tcp::Socket>(srv_h).listen(1234);
+    let _ = client.sockets.get_mut::<tcp::Socket>(cli_h).connect(
+        client.iface.context(),
+        (IpAddress::v4(10, 0, 0, 1), 1234),
+        49152,
+    );
 
     let mut t_ms: i64 = 0;
     for _ in 0..200 {
@@ -2465,6 +2678,14 @@ fn shape_pingpong(seconds: u64, offload: bool) {
         }
         t_ms += 1;
     }
+    let client_established = matches!(
+        client.sockets.get::<tcp::Socket>(cli_h).state(),
+        tcp::State::Established
+    );
+    let server_established = matches!(
+        server.sockets.get::<tcp::Socket>(srv_h).state(),
+        tcp::State::Established
+    );
 
     let msg = [0x55u8; 128];
     let deadline = StdInstant::now() + std::time::Duration::from_secs(seconds);
@@ -2541,9 +2762,10 @@ fn shape_pingpong(seconds: u64, offload: bool) {
     }
     .print();
     print_lane_stats("pingpong", collect_lane_stats(&[&lane_a, &lane_b]));
+    validate_pingpong(client_established, server_established, roundtrips)
 }
 
-fn shape_udp_firehose(seconds: u64, offload: bool) {
+fn shape_udp_firehose(seconds: u64, offload: bool) -> Result<(), String> {
     // Pure packet forwarding — no flow control, no cwnd. This is the closest
     // analogue to a packet tunnel forwarding fully-formed packets between peers.
     const PAYLOAD: usize = 1400;
@@ -2582,16 +2804,16 @@ fn shape_udp_firehose(seconds: u64, offload: bool) {
     let (cli_rx, cli_tx) = mk_buf();
     let cli_h = client.sockets.add(udp::Socket::new(cli_rx, cli_tx));
 
-    server
+    let server_bound = server
         .sockets
         .get_mut::<udp::Socket>(srv_h)
         .bind(2000)
-        .unwrap();
-    client
+        .is_ok();
+    let client_bound = client
         .sockets
         .get_mut::<udp::Socket>(cli_h)
         .bind(2001)
-        .unwrap();
+        .is_ok();
 
     let dest_meta: udp::UdpMetadata = (IpAddress::v4(10, 0, 0, 1), 2000).into();
     let payload = vec![0xa5u8; PAYLOAD];
@@ -2656,6 +2878,7 @@ fn shape_udp_firehose(seconds: u64, offload: bool) {
     }
     .print();
     print_lane_stats("udp", collect_lane_stats(&[&lane_a, &lane_b]));
+    validate_udp_transfer("udp", server_bound, client_bound, sent, recvd)
 }
 
 /// `n` concurrent TCP echo flows between two smoltcp endpoints. Each flow has
@@ -2664,7 +2887,7 @@ fn shape_udp_firehose(seconds: u64, offload: bool) {
 /// Verifies two properties:
 ///   * memory stays bounded (RSS trace + net heap delta)
 ///   * no flow is starved (Jain index + per-flow percentiles)
-fn shape_many_tcp(seconds: u64, n: usize, offload: bool, mode: RunMode) {
+fn shape_many_tcp(seconds: u64, n: usize, offload: bool, mode: RunMode) -> Result<(), String> {
     // Per-flow buffer sized small enough to keep total memory reasonable
     // even at N=1000: 1000 flows × 2 (rx+tx) × 4 KiB × 2 (server+client) ≈ 16 MiB.
     const BUF: usize = 4 * 1024;
@@ -2706,22 +2929,18 @@ fn shape_many_tcp(seconds: u64, n: usize, offload: bool, mode: RunMode) {
             let s = server.sockets.get_mut::<tcp::Socket>(h_srv);
             s.set_ack_delay(None);
             s.set_nagle_enabled(false);
-            s.listen(dst_port).unwrap();
+            let _ = s.listen(dst_port);
         }
         {
             let c = client.sockets.get_mut::<tcp::Socket>(h_cli);
             c.set_ack_delay(None);
             c.set_nagle_enabled(false);
         }
-        client
-            .sockets
-            .get_mut::<tcp::Socket>(h_cli)
-            .connect(
-                client.iface.context(),
-                (IpAddress::v4(10, 0, 0, 1), dst_port),
-                src_port,
-            )
-            .unwrap();
+        let _ = client.sockets.get_mut::<tcp::Socket>(h_cli).connect(
+            client.iface.context(),
+            (IpAddress::v4(10, 0, 0, 1), dst_port),
+            src_port,
+        );
 
         srv_handles.push(h_srv);
         cli_handles.push(h_cli);
@@ -2760,8 +2979,13 @@ fn shape_many_tcp(seconds: u64, n: usize, offload: bool, mode: RunMode) {
         .iter()
         .zip(srv_handles.iter())
         .filter(|&(&hc, &hs)| {
-            client.sockets.get::<tcp::Socket>(hc).may_send()
-                && server.sockets.get::<tcp::Socket>(hs).may_recv()
+            matches!(
+                client.sockets.get::<tcp::Socket>(hc).state(),
+                tcp::State::Established
+            ) && matches!(
+                server.sockets.get::<tcp::Socket>(hs).state(),
+                tcp::State::Established
+            )
         })
         .count();
     if established < n {
@@ -2932,12 +3156,13 @@ fn shape_many_tcp(seconds: u64, n: usize, offload: bool, mode: RunMode) {
         total_bytes,
         total_bytes as f64 / (1024.0 * 1024.0)
     );
+    validate_established_flows("many_tcp", established, n, &recvd_stats)
 }
 
 /// Deterministic fairness variant for TCP flows. Each round gives every flow
 /// one bounded client send and server drain opportunity, then rotates the
 /// start index so flow 0 does not always go first.
-fn shape_many_tcp_fair(seconds: u64, n: usize, offload: bool, mode: RunMode) {
+fn shape_many_tcp_fair(seconds: u64, n: usize, offload: bool, mode: RunMode) -> Result<(), String> {
     const BUF: usize = 4 * 1024;
     const PAYLOAD: usize = 256;
     let qd = (n * 16).clamp(1024, 16384);
@@ -2972,22 +3197,18 @@ fn shape_many_tcp_fair(seconds: u64, n: usize, offload: bool, mode: RunMode) {
             let s = server.sockets.get_mut::<tcp::Socket>(h_srv);
             s.set_ack_delay(None);
             s.set_nagle_enabled(false);
-            s.listen(dst_port).unwrap();
+            let _ = s.listen(dst_port);
         }
         {
             let c = client.sockets.get_mut::<tcp::Socket>(h_cli);
             c.set_ack_delay(None);
             c.set_nagle_enabled(false);
         }
-        client
-            .sockets
-            .get_mut::<tcp::Socket>(h_cli)
-            .connect(
-                client.iface.context(),
-                (IpAddress::v4(10, 0, 0, 1), dst_port),
-                src_port,
-            )
-            .unwrap();
+        let _ = client.sockets.get_mut::<tcp::Socket>(h_cli).connect(
+            client.iface.context(),
+            (IpAddress::v4(10, 0, 0, 1), dst_port),
+            src_port,
+        );
 
         srv_handles.push(h_srv);
         cli_handles.push(h_cli);
@@ -3020,8 +3241,13 @@ fn shape_many_tcp_fair(seconds: u64, n: usize, offload: bool, mode: RunMode) {
         .iter()
         .zip(srv_handles.iter())
         .filter(|&(&hc, &hs)| {
-            client.sockets.get::<tcp::Socket>(hc).may_send()
-                && server.sockets.get::<tcp::Socket>(hs).may_recv()
+            matches!(
+                client.sockets.get::<tcp::Socket>(hc).state(),
+                tcp::State::Established
+            ) && matches!(
+                server.sockets.get::<tcp::Socket>(hs).state(),
+                tcp::State::Established
+            )
         })
         .count();
     if established < n {
@@ -3170,12 +3396,14 @@ fn shape_many_tcp_fair(seconds: u64, n: usize, offload: bool, mode: RunMode) {
         total_bytes,
         total_bytes as f64 / (1024.0 * 1024.0)
     );
+    validate_established_flows("many_tcp_fair", established, n, &recvd_stats)?;
+    validate_fairness("many_tcp_fair", &recvd_stats)
 }
 
 /// `n` concurrent UDP echo flows. Same metrics as `many_tcp`. UDP has no
 /// flow control or cwnd so per-flow throughput is bounded only by the rate
 /// at which the runner pumps bytes through.
-fn shape_many_udp(seconds: u64, n: usize, offload: bool, mode: RunMode) {
+fn shape_many_udp(seconds: u64, n: usize, offload: bool, mode: RunMode) -> Result<(), String> {
     const PAYLOAD: usize = 256;
     // Per-flow UDP socket buffer: a small ring with ~32 metadata slots is
     // enough to keep the pipe full without ballooning memory.
@@ -3214,6 +3442,8 @@ fn shape_many_udp(seconds: u64, n: usize, offload: bool, mode: RunMode) {
     let mut srv_handles = Vec::with_capacity(n);
     let mut cli_handles = Vec::with_capacity(n);
     let mut dst_metas: Vec<udp::UdpMetadata> = Vec::with_capacity(n);
+    let mut server_bound = true;
+    let mut client_bound = true;
 
     for i in 0..n {
         let dst_port: u16 = 10_000u16.wrapping_add(i as u16);
@@ -3221,20 +3451,20 @@ fn shape_many_udp(seconds: u64, n: usize, offload: bool, mode: RunMode) {
 
         let (rx, tx) = mk_udp();
         let h_srv = server.sockets.add(udp::Socket::new(rx, tx));
-        server
+        server_bound &= server
             .sockets
             .get_mut::<udp::Socket>(h_srv)
             .bind(dst_port)
-            .unwrap();
+            .is_ok();
         srv_handles.push(h_srv);
 
         let (rx, tx) = mk_udp();
         let h_cli = client.sockets.add(udp::Socket::new(rx, tx));
-        client
+        client_bound &= client
             .sockets
             .get_mut::<udp::Socket>(h_cli)
             .bind(src_port)
-            .unwrap();
+            .is_ok();
         cli_handles.push(h_cli);
 
         dst_metas.push((IpAddress::v4(10, 0, 0, 1), dst_port).into());
@@ -3315,7 +3545,8 @@ fn shape_many_udp(seconds: u64, n: usize, offload: bool, mode: RunMode) {
     .print();
 
     Fairness::from(&sent).print("sent");
-    Fairness::from(&recvd).print("recvd");
+    let recvd_stats = Fairness::from(&recvd);
+    recvd_stats.print("recvd");
     mem_trace.print();
     print_lane_stats("many_udp", collect_lane_stats(&[&lane_a, &lane_b]));
 
@@ -3333,6 +3564,9 @@ fn shape_many_udp(seconds: u64, n: usize, offload: bool, mode: RunMode) {
         total_bytes,
         total_bytes as f64 / (1024.0 * 1024.0)
     );
+    validate_udp_bindings("many_udp", server_bound, client_bound)?;
+    validate_flow_stats("many_udp", &recvd_stats)?;
+    validate_fairness("many_udp", &recvd_stats)
 }
 
 #[cfg(feature = "socket-tcp-dynamic-buffer")]
@@ -3624,25 +3858,108 @@ impl MultiTcpWorkload {
 }
 
 #[cfg(feature = "socket-tcp-dynamic-buffer")]
-fn shape_multi_tcp(seconds: u64, n_threads: usize, flows_per_thread: usize, offload: bool) {
+#[derive(Clone, Copy)]
+struct MultiTcpWorkerStats {
+    established: usize,
+    expected_flows: usize,
+    sent: u64,
+    received: u64,
+    elapsed_us: u64,
+    lane_stats: LaneStats,
+}
+
+#[cfg(feature = "socket-tcp-dynamic-buffer")]
+fn validate_nonzero_counters(shape: &str, counters: &[(&str, u64)]) -> Result<(), String> {
+    for &(name, value) in counters {
+        if value == 0 {
+            return Err(format!("{shape}: {name} was zero"));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(feature = "socket-tcp-dynamic-buffer")]
+fn validate_pool_boundaries(
+    shape: &str,
+    active: usize,
+    budget: usize,
+    after_teardown: usize,
+) -> Result<(), String> {
+    if active > budget {
+        return Err(format!(
+            "{shape}: active pool use {active} exceeded budget {budget}"
+        ));
+    }
+    if after_teardown != 0 {
+        return Err(format!(
+            "{shape}: pool use after teardown was {after_teardown}, expected 0"
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(feature = "socket-tcp-dynamic-buffer")]
+fn validate_multi_tcp_workers(
+    shape: &str,
+    workers: &[Result<MultiTcpWorkerStats, String>],
+    pool_active: usize,
+    pool_budget: usize,
+    pool_after_teardown: usize,
+) -> Result<(), String> {
+    let mut sent = 0u64;
+    let mut received = Vec::with_capacity(workers.len());
+    for (worker_id, result) in workers.iter().enumerate() {
+        let stats = match result {
+            Ok(stats) => stats,
+            Err(error) => return Err(format!("{shape}: worker {worker_id}: {error}")),
+        };
+        if stats.established != stats.expected_flows {
+            return Err(format!(
+                "{shape}: worker {worker_id} established {}/{} flows",
+                stats.established, stats.expected_flows
+            ));
+        }
+        sent += stats.sent;
+        received.push(stats.received);
+    }
+
+    let received = Fairness::from(&received);
+    validate_nonzero_counters(shape, &[("aggregate sent bytes", sent)])?;
+    validate_flow_stats(shape, &received)?;
+    validate_fairness(shape, &received)?;
+    validate_pool_boundaries(shape, pool_active, pool_budget, pool_after_teardown)
+}
+
+#[cfg(feature = "socket-tcp-dynamic-buffer")]
+fn shape_multi_tcp(
+    seconds: u64,
+    n_threads: usize,
+    flows_per_thread: usize,
+    offload: bool,
+) -> Result<(), String> {
     shape_multi_tcp_impl(
         seconds,
         n_threads,
         flows_per_thread,
         offload,
         MultiTcpWorkload::Echo,
-    );
+    )
 }
 
 #[cfg(feature = "socket-tcp-dynamic-buffer")]
-fn shape_multi_tcp_sink(seconds: u64, n_threads: usize, flows_per_thread: usize, offload: bool) {
+fn shape_multi_tcp_sink(
+    seconds: u64,
+    n_threads: usize,
+    flows_per_thread: usize,
+    offload: bool,
+) -> Result<(), String> {
     shape_multi_tcp_impl(
         seconds,
         n_threads,
         flows_per_thread,
         offload,
         MultiTcpWorkload::Sink,
-    );
+    )
 }
 
 #[cfg(feature = "socket-tcp-dynamic-buffer")]
@@ -3652,7 +3969,7 @@ fn shape_multi_tcp_impl(
     flows_per_thread: usize,
     offload: bool,
     workload: MultiTcpWorkload,
-) {
+) -> Result<(), String> {
     use std::time::Instant as StdInstant;
 
     const MAX_BUF: u32 = 32 * 1024;
@@ -3678,6 +3995,7 @@ fn shape_multi_tcp_impl(
 
             let mut srv_handles = Vec::with_capacity(flows_per_thread);
             let mut cli_handles = Vec::with_capacity(flows_per_thread);
+            let mut setup_error = None;
             for i in 0..flows_per_thread {
                 let h_srv = add_tcp_socket_dyn(&mut server, MAX_BUF, &pool);
                 let h_cli = add_tcp_socket_dyn(&mut client, MAX_BUF, &pool);
@@ -3687,22 +4005,25 @@ fn shape_multi_tcp_impl(
                     let s = server.sockets.get_mut::<tcp::Socket>(h_srv);
                     s.set_ack_delay(None);
                     s.set_nagle_enabled(false);
-                    s.listen(dst_port).unwrap();
+                    if let Err(error) = s.listen(dst_port) {
+                        setup_error.get_or_insert_with(|| {
+                            format!("listen failed for flow {i}: {error:?}")
+                        });
+                    }
                 }
                 {
                     let c = client.sockets.get_mut::<tcp::Socket>(h_cli);
                     c.set_ack_delay(None);
                     c.set_nagle_enabled(false);
                 }
-                client
-                    .sockets
-                    .get_mut::<tcp::Socket>(h_cli)
-                    .connect(
-                        client.iface.context(),
-                        (IpAddress::v4(base, 0, 0, 1), dst_port),
-                        src_port,
-                    )
-                    .unwrap();
+                if let Err(error) = client.sockets.get_mut::<tcp::Socket>(h_cli).connect(
+                    client.iface.context(),
+                    (IpAddress::v4(base, 0, 0, 1), dst_port),
+                    src_port,
+                ) {
+                    setup_error
+                        .get_or_insert_with(|| format!("connect failed for flow {i}: {error:?}"));
+                }
                 srv_handles.push(h_srv);
                 cli_handles.push(h_cli);
             }
@@ -3730,6 +4051,19 @@ fn shape_multi_tcp_impl(
                     break;
                 }
             }
+            let established = cli_handles
+                .iter()
+                .zip(srv_handles.iter())
+                .filter(|&(&hc, &hs)| {
+                    matches!(
+                        client.sockets.get::<tcp::Socket>(hc).state(),
+                        tcp::State::Established
+                    ) && matches!(
+                        server.sockets.get::<tcp::Socket>(hs).state(),
+                        tcp::State::Established
+                    )
+                })
+                .count();
 
             // Setup and start coordination stays outside the timed traffic loop.
             if !phases.ready() {
@@ -3838,7 +4172,18 @@ fn shape_multi_tcp_impl(
             let lane_stats = collect_lane_stats(&[&lane_a, &lane_b]);
             // Keep every worker's sockets alive until the main thread samples
             // the active-end memory and pool boundaries.
-            let _ = phases.finished((sent, recvd, elapsed_us, lane_stats));
+            let result = match setup_error {
+                Some(error) => Err(error),
+                None => Ok(MultiTcpWorkerStats {
+                    established,
+                    expected_flows: flows_per_thread,
+                    sent,
+                    received: recvd,
+                    elapsed_us,
+                    lane_stats,
+                }),
+            };
+            let _ = phases.finished(result);
         }
     });
 
@@ -3862,7 +4207,8 @@ fn shape_multi_tcp_impl(
     );
     let total_elapsed_us = results
         .iter()
-        .map(|(_, _, elapsed_us, _)| *elapsed_us)
+        .filter_map(|result| result.as_ref().ok())
+        .map(|stats| stats.elapsed_us)
         .max()
         .unwrap_or(1)
         .max(1);
@@ -3870,19 +4216,30 @@ fn shape_multi_tcp_impl(
     let (vol_after, nvol_after) = ctxsw_counts();
     let vol_delta = vol_after - vol_before;
     let nvol_delta = nvol_after - nvol_before;
-    let agg_sent: u64 = results.iter().map(|(s, _, _, _)| s).sum();
-    let agg_recvd: u64 = results.iter().map(|(_, r, _, _)| r).sum();
+    let agg_sent: u64 = results
+        .iter()
+        .filter_map(|result| result.as_ref().ok())
+        .map(|stats| stats.sent)
+        .sum();
+    let agg_recvd: u64 = results
+        .iter()
+        .filter_map(|result| result.as_ref().ok())
+        .map(|stats| stats.received)
+        .sum();
     let agg_gbps = (agg_recvd as f64 * 8.0) / total_secs / 1e9;
     let per_thread_gbps: Vec<f64> = results
         .iter()
-        .map(|(_, r, elapsed_us, _)| {
-            let elapsed_us = (*elapsed_us).max(1);
-            (*r as f64 * 8.0) / (elapsed_us as f64 / 1_000_000.0) / 1e9
+        .map(|result| match result {
+            Ok(stats) => {
+                let elapsed_us = stats.elapsed_us.max(1);
+                (stats.received as f64 * 8.0) / (elapsed_us as f64 / 1_000_000.0) / 1e9
+            }
+            Err(_) => 0.0,
         })
         .collect();
     let mut lane_stats = LaneStats::default();
-    for (_, _, _, stats) in &results {
-        lane_stats.merge(*stats);
+    for stats in results.iter().filter_map(|result| result.as_ref().ok()) {
+        lane_stats.merge(stats.lane_stats);
     }
     let min = per_thread_gbps
         .iter()
@@ -3928,8 +4285,11 @@ fn shape_multi_tcp_impl(
         agg_gbps,
     );
     println!("  per-thread throughput:");
-    for (i, gbps) in per_thread_gbps.iter().enumerate() {
-        println!("    t{i:>2}: {gbps:>7.3} Gbps");
+    for (i, (gbps, result)) in per_thread_gbps.iter().zip(results.iter()).enumerate() {
+        match result {
+            Ok(_) => println!("    t{i:>2}: {gbps:>7.3} Gbps"),
+            Err(error) => println!("    t{i:>2}: ERROR ({error})"),
+        }
     }
     println!(
         "  min/max/mean:           {min:.3} / {max:.3} / {mean:.3} Gbps   CV: {cv:.4}   Jain: {jain:.4}"
@@ -3950,6 +4310,13 @@ fn shape_multi_tcp_impl(
         cas_retries as f64 / n_threads as f64 / total_secs
     );
     print_lane_stats(shape_name, lane_stats);
+    validate_multi_tcp_workers(
+        shape_name,
+        &results,
+        pool_active,
+        pool_bytes,
+        pool_after_teardown,
+    )
 }
 
 /// Connection-churn shape. Repeatedly opens and tears down TCP flows at
@@ -3958,7 +4325,12 @@ fn shape_multi_tcp_impl(
 /// under load; verifies that pool refunds keep up with admissions and
 /// the connection cap doesn't drift.
 #[cfg(feature = "socket-tcp-dynamic-buffer")]
-fn shape_churn(seconds: u64, target_conn_per_sec: usize, offload: bool, mode: RunMode) {
+fn shape_churn(
+    seconds: u64,
+    target_conn_per_sec: usize,
+    offload: bool,
+    mode: RunMode,
+) -> Result<(), String> {
     use std::time::Instant as StdInstant;
     const MAX_BUF: u32 = 32 * 1024;
     const SLOTS: usize = 256;
@@ -3992,6 +4364,7 @@ fn shape_churn(seconds: u64, target_conn_per_sec: usize, offload: bool, mode: Ru
     let mut opened: u64 = 0;
     let mut closed: u64 = 0;
     let mut bytes_xferred: u64 = 0;
+    let mut setup_error = None;
     let payload = vec![0xc5u8; PAYLOAD];
     let mut scratch = vec![0u8; PAYLOAD];
     let interval_us = if target_conn_per_sec > 0 {
@@ -4023,15 +4396,40 @@ fn shape_churn(seconds: u64, target_conn_per_sec: usize, offload: bool, mode: Ru
                 let src_port: u16 = 30_000u16.wrapping_add(opened as u16);
                 ss.set_ack_delay(None);
                 ss.set_nagle_enabled(false);
-                let _ = ss.listen(dst_port);
+                let listen_ok = match ss.listen(dst_port) {
+                    Ok(()) => true,
+                    Err(error) => {
+                        setup_error.get_or_insert_with(|| {
+                            format!("listen failed for slot {slot}: {error:?}")
+                        });
+                        false
+                    }
+                };
                 cs.set_ack_delay(None);
                 cs.set_nagle_enabled(false);
-                let _ = cs.connect(
-                    client.iface.context(),
-                    (IpAddress::v4(10, 0, 0, 1), dst_port),
-                    src_port,
-                );
-                opened += 1;
+                let connect_ok = if listen_ok {
+                    match cs.connect(
+                        client.iface.context(),
+                        (IpAddress::v4(10, 0, 0, 1), dst_port),
+                        src_port,
+                    ) {
+                        Ok(()) => true,
+                        Err(error) => {
+                            setup_error.get_or_insert_with(|| {
+                                format!("connect failed for slot {slot}: {error:?}")
+                            });
+                            false
+                        }
+                    }
+                } else {
+                    false
+                };
+                if listen_ok && connect_ok {
+                    opened += 1;
+                } else {
+                    ss.abort();
+                    cs.abort();
+                }
                 next_open_us += interval_us;
             }
             next_slot += 1;
@@ -4126,6 +4524,18 @@ fn shape_churn(seconds: u64, target_conn_per_sec: usize, offload: bool, mode: Ru
     println!("  allocation count:       {alloc_count}");
     mem_trace.print();
     print_lane_stats("churn", collect_lane_stats(&[&lane_a, &lane_b]));
+    if let Some(error) = setup_error {
+        return Err(format!("churn: {error}"));
+    }
+    validate_nonzero_counters(
+        "churn",
+        &[
+            ("opened connections", opened),
+            ("closed connections", closed),
+            ("transferred bytes", bytes_xferred),
+        ],
+    )?;
+    validate_pool_boundaries("churn", pool_at_deadline, pool_bytes, pool_after_teardown)
 }
 
 /// Mixed idle + active shape. Creates `n_idle` TCP sockets that never see
@@ -4134,7 +4544,13 @@ fn shape_churn(seconds: u64, target_conn_per_sec: usize, offload: bool, mode: Ru
 /// allocation keeps idle-flow memory at ~0 while active flows still hit
 /// full throughput.
 #[cfg(feature = "socket-tcp-dynamic-buffer")]
-fn shape_idle_hot(seconds: u64, n_idle: usize, n_active: usize, offload: bool, mode: RunMode) {
+fn shape_idle_hot(
+    seconds: u64,
+    n_idle: usize,
+    n_active: usize,
+    offload: bool,
+    mode: RunMode,
+) -> Result<(), String> {
     use std::time::Instant as StdInstant;
 
     const MAX_BUF: u32 = 32 * 1024;
@@ -4153,6 +4569,7 @@ fn shape_idle_hot(seconds: u64, n_idle: usize, n_active: usize, offload: bool, m
     // Active flows: open & connect.
     let mut srv_active: Vec<smoltcp::iface::SocketHandle> = Vec::with_capacity(n_active);
     let mut cli_active: Vec<smoltcp::iface::SocketHandle> = Vec::with_capacity(n_active);
+    let mut setup_error = None;
     for i in 0..n_active {
         let h_srv = add_tcp_socket_dyn(&mut server, MAX_BUF, &pool);
         let h_cli = add_tcp_socket_dyn(&mut client, MAX_BUF, &pool);
@@ -4162,22 +4579,22 @@ fn shape_idle_hot(seconds: u64, n_idle: usize, n_active: usize, offload: bool, m
             let s = server.sockets.get_mut::<tcp::Socket>(h_srv);
             s.set_ack_delay(None);
             s.set_nagle_enabled(false);
-            s.listen(dst_port).unwrap();
+            if let Err(error) = s.listen(dst_port) {
+                setup_error.get_or_insert_with(|| format!("listen failed for flow {i}: {error:?}"));
+            }
         }
         {
             let c = client.sockets.get_mut::<tcp::Socket>(h_cli);
             c.set_ack_delay(None);
             c.set_nagle_enabled(false);
         }
-        client
-            .sockets
-            .get_mut::<tcp::Socket>(h_cli)
-            .connect(
-                client.iface.context(),
-                (IpAddress::v4(10, 0, 0, 1), dst_port),
-                src_port,
-            )
-            .unwrap();
+        if let Err(error) = client.sockets.get_mut::<tcp::Socket>(h_cli).connect(
+            client.iface.context(),
+            (IpAddress::v4(10, 0, 0, 1), dst_port),
+            src_port,
+        ) {
+            setup_error.get_or_insert_with(|| format!("connect failed for flow {i}: {error:?}"));
+        }
         srv_active.push(h_srv);
         cli_active.push(h_cli);
     }
@@ -4232,6 +4649,19 @@ fn shape_idle_hot(seconds: u64, n_idle: usize, n_active: usize, offload: bool, m
             break;
         }
     }
+    let established = cli_active
+        .iter()
+        .zip(srv_active.iter())
+        .filter(|&(&hc, &hs)| {
+            matches!(
+                client.sockets.get::<tcp::Socket>(hc).state(),
+                tcp::State::Established
+            ) && matches!(
+                server.sockets.get::<tcp::Socket>(hs).state(),
+                tcp::State::Established
+            )
+        })
+        .count();
 
     // Steady-state echo on active flows only.
     let mut sent: u64 = 0;
@@ -4343,6 +4773,31 @@ fn shape_idle_hot(seconds: u64, n_idle: usize, n_active: usize, offload: bool, m
     );
     mem_trace.print();
     print_lane_stats("idle_hot", lane_stats);
+    if let Some(error) = setup_error {
+        return Err(format!("idle_hot: {error}"));
+    }
+    if established != n_active {
+        return Err(format!(
+            "idle_hot: only {established}/{n_active} active flows established"
+        ));
+    }
+    if n_active > 0 {
+        validate_nonzero_counters(
+            "idle_hot",
+            &[("sent bytes", sent), ("received bytes", recvd)],
+        )?;
+    }
+    if pool_after_create != 0 {
+        return Err(format!(
+            "idle_hot: post-create pool use was {pool_after_create}, expected 0"
+        ));
+    }
+    if n_active == 0 && pool_steady != 0 {
+        return Err(format!(
+            "idle_hot: idle-only steady pool use was {pool_steady}, expected 0"
+        ));
+    }
+    validate_pool_boundaries("idle_hot", pool_steady, pool_bytes, pool_after_teardown)
 }
 
 fn print_socket_sizes() {
@@ -4428,15 +4883,16 @@ fn main() -> ExitCode {
     let seconds = config.seconds.get();
     let offload = config.offload_checksums;
     let mode = config.mode;
-    match config.shape {
+    let result = match config.shape {
         TrafficShape::Firehose => shape_firehose(seconds, offload),
         TrafficShape::PingPong => shape_pingpong(seconds, offload),
         TrafficShape::Small => shape_small(seconds, offload),
         TrafficShape::Udp => shape_udp_firehose(seconds, offload),
         TrafficShape::All => {
-            shape_udp_firehose(seconds, offload);
-            shape_small(seconds, offload);
-            shape_pingpong(seconds, offload);
+            let udp = shape_udp_firehose(seconds, offload);
+            let small = shape_small(seconds, offload);
+            let pingpong = shape_pingpong(seconds, offload);
+            udp.and(small).and(pingpong)
         }
         TrafficShape::ManyTcp { flows } => shape_many_tcp(seconds, flows.get(), offload, mode),
         TrafficShape::ManyTcpFair { flows } => {
@@ -4447,25 +4903,25 @@ fn main() -> ExitCode {
         TrafficShape::MultiTcp {
             threads,
             flows_per_thread,
-        } => {
-            shape_multi_tcp(seconds, threads.get(), flows_per_thread.get(), offload);
-        }
+        } => shape_multi_tcp(seconds, threads.get(), flows_per_thread.get(), offload),
         #[cfg(feature = "socket-tcp-dynamic-buffer")]
         TrafficShape::MultiTcpSink {
             threads,
             flows_per_thread,
-        } => {
-            shape_multi_tcp_sink(seconds, threads.get(), flows_per_thread.get(), offload);
-        }
+        } => shape_multi_tcp_sink(seconds, threads.get(), flows_per_thread.get(), offload),
         #[cfg(feature = "socket-tcp-dynamic-buffer")]
-        TrafficShape::Churn { rate } => {
-            shape_churn(seconds, rate.get(), offload, mode);
-        }
+        TrafficShape::Churn { rate } => shape_churn(seconds, rate.get(), offload, mode),
         #[cfg(feature = "socket-tcp-dynamic-buffer")]
         TrafficShape::IdleHot { idle, active } => {
-            shape_idle_hot(seconds, idle, active, offload, mode);
+            shape_idle_hot(seconds, idle, active, offload, mode)
+        }
+    };
+
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("error: {error}");
+            ExitCode::FAILURE
         }
     }
-
-    ExitCode::SUCCESS
 }
