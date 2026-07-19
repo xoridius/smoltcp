@@ -1053,9 +1053,10 @@ mod tests {
         }
     }
 
-    fn assert_commands_parse(commands: &[&str], expected_count: usize) {
-        assert_eq!(commands.len(), expected_count);
-        for command in commands {
+    fn assert_manifest_commands_parse(manifest: &str, expected_count: usize) {
+        assert_eq!(manifest.lines().count(), expected_count);
+        for (line, command) in manifest.lines().enumerate() {
+            assert!(!command.trim().is_empty(), "blank line {}", line + 1);
             let result = parse_args(command.split_ascii_whitespace().map(str::to_owned));
             assert!(result.is_ok(), "command {command:?}: {result:?}");
         }
@@ -1235,57 +1236,13 @@ mod tests {
 
     #[test]
     fn full_gate_static_command_list_has_26_parseable_commands() {
-        assert_commands_parse(
-            &[
-                "--mode bench udp 3",
-                "--mode bench udp 3 offload",
-                "--mode bench firehose 3",
-                "--mode bench firehose 3 offload",
-                "--mode bench pingpong 3",
-                "--mode bench pingpong 3 offload",
-                "--mode bench small 3",
-                "--mode bench small 3 offload",
-                "--mode bench many_tcp 3 8",
-                "--mode bench many_tcp 3 8 offload",
-                "--mode bench many_tcp_fair 3 8",
-                "--mode bench many_tcp_fair 3 8 offload",
-                "--mode bench many_udp 3 8",
-                "--mode bench many_udp 3 8 offload",
-                "--mode bench many_tcp 3 50",
-                "--mode bench many_tcp 3 50 offload",
-                "--mode bench many_tcp_fair 3 50",
-                "--mode bench many_tcp_fair 3 50 offload",
-                "--mode bench many_udp 3 50",
-                "--mode bench many_udp 3 50 offload",
-                "--mode bench many_tcp 3 100",
-                "--mode bench many_tcp 3 100 offload",
-                "--mode bench many_tcp_fair 3 100",
-                "--mode bench many_tcp_fair 3 100 offload",
-                "--mode bench many_udp 3 100",
-                "--mode bench many_udp 3 100 offload",
-            ],
-            26,
-        );
+        assert_manifest_commands_parse(include_str!("../ci/ios-full-gate-static.txt"), 26);
     }
 
     #[cfg(feature = "socket-tcp-dynamic-buffer")]
     #[test]
     fn full_gate_dynamic_command_list_has_10_parseable_commands() {
-        assert_commands_parse(
-            &[
-                "--mode bench multi_tcp 3 2 50",
-                "--mode bench multi_tcp 3 2 50 offload",
-                "--mode bench multi_tcp_sink 3 2 50",
-                "--mode bench multi_tcp_sink 3 2 50 offload",
-                "--mode bench churn 3 500",
-                "--mode bench churn 3 500 offload",
-                "--mode bench idle_hot 3 1000 0",
-                "--mode bench idle_hot 3 1000 0 offload",
-                "--mode bench idle_hot 3 1000 10",
-                "--mode bench idle_hot 3 1000 10 offload",
-            ],
-            10,
-        );
+        assert_manifest_commands_parse(include_str!("../ci/ios-full-gate-dynamic.txt"), 10);
     }
 
     #[test]

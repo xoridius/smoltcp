@@ -1,0 +1,26 @@
+--mode bench udp 3
+--mode bench udp 3 offload
+--mode bench firehose 3
+--mode bench firehose 3 offload
+--mode bench pingpong 3
+--mode bench pingpong 3 offload
+--mode bench small 3
+--mode bench small 3 offload
+--mode bench many_tcp 3 8
+--mode bench many_tcp 3 8 offload
+--mode bench many_tcp_fair 3 8
+--mode bench many_tcp_fair 3 8 offload
+--mode bench many_udp 3 8
+--mode bench many_udp 3 8 offload
+--mode bench many_tcp 3 50
+--mode bench many_tcp 3 50 offload
+--mode bench many_tcp_fair 3 50
+--mode bench many_tcp_fair 3 50 offload
+--mode bench many_udp 3 50
+--mode bench many_udp 3 50 offload
+--mode bench many_tcp 3 100
+--mode bench many_tcp 3 100 offload
+--mode bench many_tcp_fair 3 100
+--mode bench many_tcp_fair 3 100 offload
+--mode bench many_udp 3 100
+--mode bench many_udp 3 100 offload

@@ -75,7 +75,7 @@ Local fork evidence:
   ios-full-gate                 Complete constrained-memory and traffic gate.
   profile-smoke [seconds]       Short throughput/fairness/RSS harness smoke.
   fuzz-build                    Build all fuzz targets on nightly.
-  fuzz-smoke [seconds] [target] Short deterministic ASan smoke, default all targets.
+  fuzz-smoke [seconds] [target] Short reproducibly seeded ASan smoke (LSan where supported); defaults to all targets.
 
 Set TRACE=0 for quieter local output.
 USAGE
@@ -199,57 +199,17 @@ ios_gate() {
 }
 
 run_profile_commands() {
+    local manifest=$1
     local command
     local -a argv
 
-    for command in "$@"; do
-        read -r -a argv <<< "$command"
-        target/release/examples/profile_loopback --mode bench "${argv[@]}"
-    done
+    while IFS= read -r command || [[ -n "$command" ]]; do
+        read -r -a argv <<< "$command" || return
+        target/release/examples/profile_loopback "${argv[@]}" || return
+    done < "$manifest"
 }
 
 ios_full_gate() {
-    local -a static_commands=(
-        "udp 3"
-        "udp 3 offload"
-        "firehose 3"
-        "firehose 3 offload"
-        "pingpong 3"
-        "pingpong 3 offload"
-        "small 3"
-        "small 3 offload"
-        "many_tcp 3 8"
-        "many_tcp 3 8 offload"
-        "many_tcp_fair 3 8"
-        "many_tcp_fair 3 8 offload"
-        "many_udp 3 8"
-        "many_udp 3 8 offload"
-        "many_tcp 3 50"
-        "many_tcp 3 50 offload"
-        "many_tcp_fair 3 50"
-        "many_tcp_fair 3 50 offload"
-        "many_udp 3 50"
-        "many_udp 3 50 offload"
-        "many_tcp 3 100"
-        "many_tcp 3 100 offload"
-        "many_tcp_fair 3 100"
-        "many_tcp_fair 3 100 offload"
-        "many_udp 3 100"
-        "many_udp 3 100 offload"
-    )
-    local -a dynamic_commands=(
-        "multi_tcp 3 2 50"
-        "multi_tcp 3 2 50 offload"
-        "multi_tcp_sink 3 2 50"
-        "multi_tcp_sink 3 2 50 offload"
-        "churn 3 500"
-        "churn 3 500 offload"
-        "idle_hot 3 1000 0"
-        "idle_hot 3 1000 0 offload"
-        "idle_hot 3 1000 10"
-        "idle_hot 3 1000 10 offload"
-    )
-
     cargo test --release --lib --no-default-features --features "std,$IOS_FEATURES" dyn_buf -- --test-threads=1
     sizecheck
     apple_check
@@ -261,10 +221,10 @@ ios_full_gate() {
     done
 
     cargo build --release --example profile_loopback
-    run_profile_commands "${static_commands[@]}"
+    run_profile_commands ci/ios-full-gate-static.txt
 
     cargo build --release --example profile_loopback --features socket-tcp-dynamic-buffer
-    run_profile_commands "${dynamic_commands[@]}"
+    run_profile_commands ci/ios-full-gate-dynamic.txt
 
     netsim
 }

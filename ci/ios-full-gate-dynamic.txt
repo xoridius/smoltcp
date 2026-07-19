@@ -1,0 +1,10 @@
+--mode bench multi_tcp 3 2 50
+--mode bench multi_tcp 3 2 50 offload
+--mode bench multi_tcp_sink 3 2 50
+--mode bench multi_tcp_sink 3 2 50 offload
+--mode bench churn 3 500
+--mode bench churn 3 500 offload
+--mode bench idle_hot 3 1000 0
+--mode bench idle_hot 3 1000 0 offload
+--mode bench idle_hot 3 1000 10
+--mode bench idle_hot 3 1000 10 offload
