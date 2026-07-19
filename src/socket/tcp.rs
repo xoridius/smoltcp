@@ -525,7 +525,7 @@ pub struct Socket<'a> {
     /// saves 4 bytes per socket on 64-bit targets.
     remote_mss: u32,
     /// The timestamp of the last packet received.
-    remote_last_ts: Option<Instant>,
+    remote_last_ts: Instant,
     /// The sequence number of the last packet received, used for sACK
     local_rx_last_seq: Option<TcpSeqNumber>,
     /// The ACK number of the last packet received.
@@ -564,11 +564,13 @@ pub struct Socket<'a> {
     /// The congestion control algorithm.
     congestion_controller: congestion::AnyController,
 
-    /// tsval generator - if some, tcp timestamp is enabled
+    /// Configured TSval generator; TIMESTAMP_ACTIVE tracks current-TCB negotiation.
     tsval_generator: Option<TcpTimestampGenerator>,
 
-    /// 0 if not seen or timestamp not enabled
+    /// Most recently accepted TSval. Valid only while REMOTE_TSVAL_VALID is set.
     last_remote_tsval: u32,
+    /// Local observation time for last_remote_tsval.
+    last_remote_tsval_at: Instant,
 
     #[cfg(feature = "async")]
     rx_waker: WakerRegistration,
@@ -591,6 +593,9 @@ const MIN_REMOTE_MSS: usize = 48;
 
 /// RFC 5681 duplicate-ACK threshold.
 const DUP_ACK_THRESHOLD: u8 = 3;
+
+/// RFC 7323 §5.5: TS.Recent becomes stale after more than 24 days.
+const PAWS_EXPIRY_MICROS: i64 = 24 * 24 * 60 * 60 * 1_000_000;
 
 bitflags::bitflags! {
     /// Packed bool fields on `Socket`. Packing them together saves
@@ -629,6 +634,12 @@ bitflags::bitflags! {
         /// This provenance is deliberately independent of RTTE's rolling
         /// timeout counter, which periodically resets while backoff persists.
         const RECOVERY_AFTER_RTO     = 1 << 10;
+        /// last_remote_tsval and last_remote_tsval_at contain valid PAWS state.
+        const REMOTE_TSVAL_VALID     = 1 << 11;
+        /// remote_last_ts contains a valid peer-activity timestamp.
+        const REMOTE_LAST_TS_VALID   = 1 << 12;
+        /// TCP timestamps are active for the current TCB.
+        const TIMESTAMP_ACTIVE       = 1 << 13;
     }
 }
 
@@ -713,7 +724,7 @@ impl<'a> Socket<'a> {
             remote_win_shift: win_shift_for_capacity(rx_capacity),
             remote_win_scale: None,
             remote_mss: DEFAULT_MSS as u32,
-            remote_last_ts: None,
+            remote_last_ts: Instant::ZERO,
             local_rx_last_ack: None,
             local_rx_last_seq: None,
             local_rx_dup_acks: 0,
@@ -728,6 +739,7 @@ impl<'a> Socket<'a> {
             last_remote_tsval: 0,
             congestion_controller,
 
+            last_remote_tsval_at: Instant::ZERO,
             #[cfg(feature = "async")]
             rx_waker: WakerRegistration::new(),
             #[cfg(feature = "async")]
@@ -1052,11 +1064,15 @@ impl<'a> Socket<'a> {
     /// Enable or disable TCP Timestamp.
     pub fn set_tsval_generator(&mut self, generator: Option<TcpTimestampGenerator>) {
         self.tsval_generator = generator;
+        self.flags.set(Flags::TIMESTAMP_ACTIVE, generator.is_some());
+        if generator.is_none() {
+            self.set_remote_tsval(None);
+        }
     }
 
     /// Return whether TCP Timestamp is enabled.
     pub fn timestamp_enabled(&self) -> bool {
-        self.tsval_generator.is_some()
+        self.flags.contains(Flags::TIMESTAMP_ACTIVE)
     }
 
     /// Set an algorithm for congestion control.
@@ -1373,6 +1389,91 @@ impl<'a> Socket<'a> {
         self.flags.set(Flags::RECOVERY_ACTIVE, point.is_some());
     }
 
+    #[inline]
+    fn remote_last_ts(&self) -> Option<Instant> {
+        self.flags
+            .contains(Flags::REMOTE_LAST_TS_VALID)
+            .then_some(self.remote_last_ts)
+    }
+
+    #[inline]
+    fn set_remote_last_ts(&mut self, timestamp: Option<Instant>) {
+        Self::write_remote_last_ts(&mut self.remote_last_ts, &mut self.flags, timestamp);
+    }
+
+    #[inline]
+    fn write_remote_last_ts(
+        remote_last_ts: &mut Instant,
+        flags: &mut Flags,
+        timestamp: Option<Instant>,
+    ) {
+        *remote_last_ts = timestamp.unwrap_or(Instant::ZERO);
+        flags.set(Flags::REMOTE_LAST_TS_VALID, timestamp.is_some());
+    }
+
+    #[inline]
+    fn remote_tsval(&self) -> Option<u32> {
+        self.flags
+            .contains(Flags::REMOTE_TSVAL_VALID)
+            .then_some(self.last_remote_tsval)
+    }
+
+    #[inline]
+    fn set_remote_tsval(&mut self, timestamp: Option<(u32, Instant)>) {
+        if let Some((tsval, observed_at)) = timestamp {
+            self.last_remote_tsval = tsval;
+            self.last_remote_tsval_at = observed_at;
+        } else {
+            self.last_remote_tsval = 0;
+            self.last_remote_tsval_at = Instant::ZERO;
+        }
+        self.flags
+            .set(Flags::REMOTE_TSVAL_VALID, timestamp.is_some());
+    }
+
+    #[inline]
+    fn remote_tsval_is_older(&self, tsval: u32) -> bool {
+        let Some(recent) = self.remote_tsval() else {
+            return false;
+        };
+        let delta = recent.wrapping_sub(tsval);
+        delta != 0 && delta < (1 << 31)
+    }
+
+    #[inline]
+    fn remote_tsval_can_update(&self, tsval: u32) -> bool {
+        let Some(recent) = self.remote_tsval() else {
+            return true;
+        };
+        tsval.wrapping_sub(recent) < (1 << 31)
+    }
+
+    #[inline]
+    fn remote_tsval_expired(&self, now: Instant) -> bool {
+        if !self.flags.contains(Flags::REMOTE_TSVAL_VALID) {
+            return false;
+        }
+        let Some(elapsed) = now
+            .total_micros()
+            .checked_sub(self.last_remote_tsval_at.total_micros())
+        else {
+            return false;
+        };
+        elapsed > PAWS_EXPIRY_MICROS
+    }
+
+    #[inline]
+    fn negotiate_timestamps(&mut self, timestamp: Option<TcpTimestampRepr>, now: Instant) {
+        let active = self.tsval_generator.is_some() && timestamp.is_some();
+        self.flags.set(Flags::TIMESTAMP_ACTIVE, active);
+        let recent = if active {
+            timestamp.map(|timestamp| (timestamp.tsval, now))
+        } else {
+            None
+        };
+        self.set_remote_tsval(recent);
+    }
+
     fn reset_congestion_controller(&mut self) {
         self.remote_mss = DEFAULT_MSS as u32;
         self.congestion_controller.reset();
@@ -1432,8 +1533,10 @@ impl<'a> Socket<'a> {
         self.remote_win_scale = None;
         self.remote_win_shift = new_win_shift;
         self.reset_congestion_controller();
-        self.remote_last_ts = None;
-        self.last_remote_tsval = 0;
+        self.set_remote_last_ts(None);
+        self.set_remote_tsval(None);
+        self.flags
+            .set(Flags::TIMESTAMP_ACTIVE, self.tsval_generator.is_some());
         self.ack_delay_timer = AckDelayTimer::Idle;
         self.challenge_ack_timer = Instant::from_secs(0);
 
@@ -1806,7 +1909,7 @@ impl<'a> Socket<'a> {
             // would be far in the past. Unless we clear it here, we'll abort the connection
             // down over in dispatch() by erroneously detecting it as timed out.
             if old_length == 0 {
-                self.remote_last_ts = None
+                Self::write_remote_last_ts(&mut self.remote_last_ts, &mut self.flags, None)
             }
 
             // if remote win is zero and we go from having no data to some data pending to
@@ -2033,9 +2136,14 @@ impl<'a> Socket<'a> {
 
     fn ack_reply(&mut self, ip_repr: &IpRepr, repr: &TcpRepr) -> (IpRepr, TcpRepr<'static>) {
         let (mut ip_reply_repr, mut reply_repr) = Self::reply(ip_repr, repr);
-        reply_repr.timestamp = repr
-            .timestamp
-            .and_then(|tcp_ts| tcp_ts.generate_reply(self.tsval_generator));
+        reply_repr.timestamp = if self.timestamp_enabled() {
+            TcpTimestampRepr::generate_reply_with_tsval(
+                self.tsval_generator,
+                self.remote_tsval().unwrap_or(0),
+            )
+        } else {
+            None
+        };
 
         // From RFC 793:
         // [...] an empty acknowledgment segment containing the current send-sequence number
@@ -2163,6 +2271,31 @@ impl<'a> Socket<'a> {
         };
         let syn_was_transmitted = self.local_seq_next == self.local_seq_no + 1;
 
+        // RFC 7323 §5.3 R1: PAWS precedes generic ACK admission on synchronized
+        // connections. RST is exempt and must not age or mutate TS.Recent.
+        if !matches!(self.state, State::Listen | State::SynSent)
+            && repr.control != TcpControl::Rst
+            && self.timestamp_enabled()
+            && let Some(timestamp) = repr.timestamp
+            && self.remote_tsval_is_older(timestamp.tsval)
+        {
+            if self.remote_tsval_expired(cx.now()) {
+                // More than 24 days old: invalidate the saved serial value and
+                // let normal admission plus the in-sequence R3 rule refresh it.
+                self.set_remote_tsval(None);
+            } else {
+                let recent = self
+                    .remote_tsval()
+                    .expect("older comparison requires valid TS.Recent");
+                net_debug!(
+                    "PAWS reject: tsval={} < ts_recent={}",
+                    timestamp.tsval,
+                    recent
+                );
+                return self.challenge_ack_reply(cx, ip_repr, repr);
+            }
+        }
+
         // Reject unacceptable acknowledgements.
         match (self.state, repr.control, repr.ack_number) {
             // An RST received in response to initial SYN is acceptable if it acknowledges
@@ -2260,24 +2393,6 @@ impl<'a> Socket<'a> {
                     return self.challenge_ack_reply(cx, ip_repr, repr);
                 }
             }
-        }
-
-        // RFC 7323 §5.3 R1 (PAWS): if the segment carries a Timestamps option,
-        // it's not a RST, and our TS.Recent is valid (non-zero), drop the
-        // segment when SEG.TSval is older than TS.Recent under i32-wrap
-        // arithmetic. The challenge ACK echoes our current TS.Recent so the
-        // peer can re-synchronize.
-        if let Some(timestamp) = repr.timestamp
-            && self.last_remote_tsval != 0
-            && repr.control != TcpControl::Rst
-            && (timestamp.tsval.wrapping_sub(self.last_remote_tsval) as i32) < 0
-        {
-            net_debug!(
-                "PAWS reject: tsval={} < ts_recent={}",
-                timestamp.tsval,
-                self.last_remote_tsval
-            );
-            return self.challenge_ack_reply(cx, ip_repr, repr);
         }
 
         let window_start = self.remote_seq_no + self.rx_buffer.len();
@@ -2508,11 +2623,7 @@ impl<'a> Socket<'a> {
                 if self.remote_win_scale.is_none() {
                     self.remote_win_shift = 0;
                 }
-                // Remote doesn't support timestamping, don't do it.
-                if repr.timestamp.is_none() {
-                    self.tsval_generator = None;
-                }
-                self.last_remote_tsval = repr.timestamp.map_or(0, |timestamp| timestamp.tsval);
+                self.negotiate_timestamps(repr.timestamp, cx.now());
                 self.set_state(State::SynReceived);
                 self.timer.set_for_idle(cx.now(), self.keep_alive);
             }
@@ -2557,11 +2668,7 @@ impl<'a> Socket<'a> {
                 if self.remote_win_scale.is_none() {
                     self.remote_win_shift = 0;
                 }
-                // Remote doesn't support timestamping, don't do it.
-                if repr.timestamp.is_none() {
-                    self.tsval_generator = None;
-                }
-                self.last_remote_tsval = repr.timestamp.map_or(0, |timestamp| timestamp.tsval);
+                self.negotiate_timestamps(repr.timestamp, cx.now());
 
                 if repr.ack_number.is_some() {
                     self.set_state(State::Established);
@@ -2641,7 +2748,7 @@ impl<'a> Socket<'a> {
         }
 
         // Update remote state.
-        self.remote_last_ts = Some(cx.now());
+        self.set_remote_last_ts(Some(cx.now()));
 
         // RFC 1323: The window field (SEG.WND) in the header of every incoming segment, with the
         // exception of SYN segments, is left-shifted by Snd.Wind.Scale bits before updating SND.WND.
@@ -2871,14 +2978,17 @@ impl<'a> Socket<'a> {
             }
         }
 
-        // RFC 7323 §4.3 R2: update TS.Recent only when the segment was at the
-        // left window edge when it arrived. Updating on out-of-order or pure
+        // Fork-conservative subset of RFC 7323 §5.3 R3: update TS.Recent only
+        // when the segment was at the left window edge when it arrived.
+        // Updating on out-of-order or pure
         // duplicate segments would let a delayed packet poison PAWS state and
         // cause us to reject the in-order segments that follow.
         if let Some(timestamp) = repr.timestamp
+            && self.timestamp_enabled()
             && segment_start == window_start
+            && self.remote_tsval_can_update(timestamp.tsval)
         {
-            self.last_remote_tsval = timestamp.tsval;
+            self.set_remote_tsval(Some((timestamp.tsval, cx.now())));
         }
 
         // update timers.
@@ -3003,7 +3113,7 @@ impl<'a> Socket<'a> {
     }
 
     fn timed_out(&self, timestamp: Instant) -> bool {
-        match (self.remote_last_ts, self.timeout) {
+        match (self.remote_last_ts(), self.timeout) {
             (Some(remote_last_ts), Some(timeout)) => timestamp >= remote_last_ts + timeout,
             (_, _) => false,
         }
@@ -3163,11 +3273,7 @@ impl<'a> Socket<'a> {
         // Timestamps (RFC 7323) cost 12 bytes (10 + 2 NOP for alignment). This
         // is an approximation of the exact accounting in the dispatch path,
         // which subtracts the actual emitted option length.
-        let options_len = if self.tsval_generator.is_some() {
-            12
-        } else {
-            0
-        };
+        let options_len = if self.timestamp_enabled() { 12 } else { 0 };
 
         // Max segment size we're able to send due to MTU limitations.
         let local_mss = cx.ip_mtu() - ip_header_len - TCP_HEADER_LEN;
@@ -3283,7 +3389,7 @@ impl<'a> Socket<'a> {
     fn egress_interest(&self, timestamp: Instant) -> Option<EgressInterest> {
         self.tuple?;
 
-        if self.remote_last_ts.is_none() || self.state == State::Closed {
+        if self.remote_last_ts().is_none() || self.state == State::Closed {
             return Some(EgressInterest {
                 seq_candidate: self.has_unsent_or_control_to_transmit(),
                 window_update: WindowUpdateInterest::Unknown,
@@ -3443,7 +3549,7 @@ impl<'a> Socket<'a> {
             return Ok(());
         };
 
-        if self.remote_last_ts.is_none() {
+        if self.remote_last_ts().is_none() {
             // We get here in exactly two cases:
             //  1) This socket just transitioned into SYN-SENT.
             //  2) This socket had an empty transmit buffer and some data was added there.
@@ -3451,7 +3557,7 @@ impl<'a> Socket<'a> {
             // period of time, it isn't anymore, and the local endpoint is talking.
             // So, we start counting the timeout not from the last received packet
             // but from the first transmitted one.
-            self.remote_last_ts = Some(cx.now());
+            self.set_remote_last_ts(Some(cx.now()));
         }
 
         self.congestion_controller.pre_transmit(cx.now());
@@ -3631,10 +3737,14 @@ impl<'a> Socket<'a> {
             max_seg_size: None,
             sack_permitted: false,
             sack_ranges: [None, None, None],
-            timestamp: TcpTimestampRepr::generate_reply_with_tsval(
-                self.tsval_generator,
-                self.last_remote_tsval,
-            ),
+            timestamp: if self.timestamp_enabled() {
+                TcpTimestampRepr::generate_reply_with_tsval(
+                    self.tsval_generator,
+                    self.remote_tsval().unwrap_or(0),
+                )
+            } else {
+                None
+            },
             payload: &[],
         };
 
@@ -3940,7 +4050,7 @@ impl<'a> Socket<'a> {
         if self.tuple.is_none() {
             // No one to talk to, nothing to transmit.
             PollAt::Ingress
-        } else if self.remote_last_ts.is_none() {
+        } else if self.remote_last_ts().is_none() {
             // Socket stopped being quiet recently, we need to acquire a timestamp.
             PollAt::Now
         } else if self.state == State::Closed {
@@ -3964,7 +4074,7 @@ impl<'a> Socket<'a> {
                 (true, AckDelayTimer::Immediate) => PollAt::Now,
             };
 
-            let timeout_poll_at = match (self.remote_last_ts, self.timeout) {
+            let timeout_poll_at = match (self.remote_last_ts(), self.timeout) {
                 // If we're transmitting or retransmitting data, we need to poll at the moment
                 // when the timeout would expire.
                 (Some(remote_last_ts), Some(timeout)) => PollAt::Time(remote_last_ts + timeout),
@@ -4346,7 +4456,7 @@ mod test {
     #[test]
     fn test_egress_may_emit_is_false_for_idle_established_socket() {
         let mut s = socket_established();
-        s.remote_last_ts = Some(Instant::from_millis(10));
+        s.set_remote_last_ts(Some(Instant::from_millis(10)));
 
         assert!(s.socket.egress_interest(Instant::from_millis(20)).is_none());
     }
@@ -4354,7 +4464,7 @@ mod test {
     #[test]
     fn test_egress_may_emit_is_true_for_pending_data() {
         let mut s = socket_established();
-        s.remote_last_ts = Some(Instant::from_millis(10));
+        s.set_remote_last_ts(Some(Instant::from_millis(10)));
         s.send_slice(b"abcdef").unwrap();
 
         assert!(s.socket.egress_interest(Instant::from_millis(20)).is_some());
@@ -4363,7 +4473,7 @@ mod test {
     #[test]
     fn test_egress_may_emit_is_true_for_pending_ack() {
         let mut s = socket_established();
-        s.remote_last_ts = Some(Instant::from_millis(10));
+        s.set_remote_last_ts(Some(Instant::from_millis(10)));
         s.remote_last_ack = Some(REMOTE_SEQ);
 
         assert!(s.socket.egress_interest(Instant::from_millis(20)).is_some());
@@ -4372,7 +4482,7 @@ mod test {
     #[test]
     fn test_egress_may_emit_is_true_for_fin() {
         let mut s = socket_fin_wait_1();
-        s.remote_last_ts = Some(Instant::from_millis(10));
+        s.set_remote_last_ts(Some(Instant::from_millis(10)));
 
         assert!(s.socket.egress_interest(Instant::from_millis(20)).is_some());
     }
@@ -4380,7 +4490,7 @@ mod test {
     #[test]
     fn test_egress_may_emit_is_true_for_expired_timer() {
         let mut s = socket_established();
-        s.remote_last_ts = Some(Instant::from_millis(10));
+        s.set_remote_last_ts(Some(Instant::from_millis(10)));
         s.timer = Timer::Retransmit {
             expires_at: Instant::from_millis_const(15),
         };
@@ -4401,7 +4511,7 @@ mod test {
     #[test]
     fn test_window_update_dispatch_clears_rx_window_dirty() {
         let mut s = socket_established_with_buffer_sizes(64, 6);
-        s.remote_last_ts = Some(Instant::from_millis(10));
+        s.set_remote_last_ts(Some(Instant::from_millis(10)));
         assert_eq!(s.rx_buffer.enqueue_slice(b"abc"), 3);
         s.remote_last_ack = Some(s.remote_seq_no + s.rx_buffer.len());
         s.remote_last_win = s.scaled_window();
@@ -4435,7 +4545,7 @@ mod test {
     #[test]
     fn test_insignificant_window_check_keeps_rx_window_dirty_without_emit() {
         let mut s = socket_established();
-        s.remote_last_ts = Some(Instant::from_millis(10));
+        s.set_remote_last_ts(Some(Instant::from_millis(10)));
         assert_eq!(s.rx_buffer.enqueue_slice(b"x"), 1);
         s.remote_last_ack = Some(s.remote_seq_no + s.rx_buffer.len());
         s.remote_last_win = s.scaled_window();
@@ -11355,7 +11465,7 @@ mod test {
     fn test_closed_timeout() {
         let mut s = socket_established();
         s.set_timeout(Some(Duration::from_millis(200)));
-        s.remote_last_ts = Some(Instant::from_millis(100));
+        s.set_remote_last_ts(Some(Instant::from_millis(100)));
         s.abort();
         assert_eq!(s.socket.poll_at(&mut s.cx), PollAt::Now);
         recv!(s, time 100, Ok(TcpRepr {
@@ -12363,7 +12473,7 @@ mod test {
             assert_eq!(s.tuple, None);
             assert_fresh_default_controller(&s, controller);
             assert_eq!(s.last_remote_tsval, 0, "PAWS history must be reset");
-            assert_eq!(s.remote_last_ts, None);
+            assert_eq!(s.remote_last_ts(), None);
             assert_eq!(s.local_seq_no, TcpSeqNumber::default());
             assert_eq!(s.local_seq_next, TcpSeqNumber::default());
             assert_eq!(s.remote_seq_no, TcpSeqNumber::default());
@@ -12728,6 +12838,580 @@ mod test {
     // must be dropped and a challenge ACK sent. TS.Recent must only update
     // for in-order segments.
     // =========================================================================================//
+    const PAWS_24_DAYS_MS: i64 = 24 * 24 * 60 * 60 * 1_000;
+
+    #[test]
+    fn paws_zero_tsval_from_syn_is_valid() {
+        let mut s = socket_listen();
+        s.set_tsval_generator(Some(|| 100));
+
+        send!(
+            s,
+            time 0,
+            TcpRepr {
+                control: TcpControl::Syn,
+                seq_number: REMOTE_SEQ,
+                ack_number: None,
+                timestamp: Some(TcpTimestampRepr::new(0, 0)),
+                ..SEND_TEMPL
+            }
+        );
+        assert_eq!(s.state(), State::SynReceived);
+
+        recv(&mut s, Instant::from_millis(0), |_| {});
+        let reply = send(
+            &mut s,
+            Instant::from_millis(1_100),
+            &TcpRepr {
+                seq_number: REMOTE_SEQ + 1,
+                ack_number: Some(LOCAL_SEQ + 1),
+                timestamp: Some(TcpTimestampRepr::new(u32::MAX, 100)),
+                ..SEND_TEMPL
+            },
+        );
+
+        assert!(reply.is_some(), "TSval zero must remain PAWS-valid");
+        assert_eq!(s.state(), State::SynReceived);
+    }
+
+    #[test]
+    fn paws_zero_tsval_from_data_is_valid() {
+        let mut s = socket_established();
+        s.set_tsval_generator(Some(|| 100));
+
+        let _ = send(
+            &mut s,
+            Instant::from_millis(0),
+            &TcpRepr {
+                seq_number: REMOTE_SEQ + 1,
+                ack_number: Some(LOCAL_SEQ + 1),
+                payload: &b"ab"[..],
+                timestamp: Some(TcpTimestampRepr::new(0, 0)),
+                ..SEND_TEMPL
+            },
+        );
+        let reply = send(
+            &mut s,
+            Instant::from_millis(1_100),
+            &TcpRepr {
+                seq_number: REMOTE_SEQ + 3,
+                ack_number: Some(LOCAL_SEQ + 1),
+                payload: &b"cd"[..],
+                timestamp: Some(TcpTimestampRepr::new(u32::MAX, 0)),
+                ..SEND_TEMPL
+            },
+        );
+
+        assert!(reply.is_some(), "older timestamp must trigger a PAWS ACK");
+        assert_eq!(s.recv_queue(), 2);
+    }
+
+    #[test]
+    fn paws_exact_half_space_is_not_older() {
+        let mut s = socket_established();
+        s.set_tsval_generator(Some(|| 100));
+
+        let _ = send(
+            &mut s,
+            Instant::from_millis(0),
+            &TcpRepr {
+                seq_number: REMOTE_SEQ + 1,
+                ack_number: Some(LOCAL_SEQ + 1),
+                payload: &b"ab"[..],
+                timestamp: Some(TcpTimestampRepr::new(0x8000_0000, 0)),
+                ..SEND_TEMPL
+            },
+        );
+        let reply = send(
+            &mut s,
+            Instant::from_millis(1_100),
+            &TcpRepr {
+                seq_number: REMOTE_SEQ + 3,
+                ack_number: Some(LOCAL_SEQ + 1),
+                payload: &b"cd"[..],
+                timestamp: Some(TcpTimestampRepr::new(0, 0)),
+                ..SEND_TEMPL
+            },
+        );
+
+        assert_eq!(reply, None);
+        assert_eq!(s.recv_queue(), 4);
+        assert_eq!(s.remote_tsval(), Some(0x8000_0000));
+        assert_eq!(s.last_remote_tsval_at, Instant::from_millis(0));
+        assert!(s.flags.contains(Flags::REMOTE_TSVAL_VALID));
+    }
+
+    #[test]
+    fn paws_ignores_timestamps_when_not_negotiated() {
+        let mut s = socket_established();
+        assert!(!s.timestamp_enabled());
+
+        let _ = send(
+            &mut s,
+            Instant::from_millis(0),
+            &TcpRepr {
+                seq_number: REMOTE_SEQ + 1,
+                ack_number: Some(LOCAL_SEQ + 1),
+                payload: &b"ab"[..],
+                timestamp: Some(TcpTimestampRepr::new(500, 0)),
+                ..SEND_TEMPL
+            },
+        );
+        let reply = send(
+            &mut s,
+            Instant::from_millis(1_100),
+            &TcpRepr {
+                seq_number: REMOTE_SEQ + 3,
+                ack_number: Some(LOCAL_SEQ + 1),
+                payload: &b"cd"[..],
+                timestamp: Some(TcpTimestampRepr::new(400, 0)),
+                ..SEND_TEMPL
+            },
+        );
+
+        assert_eq!(s.remote_tsval(), None);
+        assert_eq!(reply, None);
+        assert_eq!(s.recv_queue(), 4);
+    }
+
+    #[test]
+    fn timestamp_capability_survives_failed_no_ts_passive_open() {
+        let mut s = socket_listen();
+        s.set_tsval_generator(Some(|| 100));
+
+        send!(
+            s,
+            TcpRepr {
+                control: TcpControl::Syn,
+                seq_number: REMOTE_SEQ,
+                ack_number: None,
+                timestamp: None,
+                ..SEND_TEMPL
+            }
+        );
+        let first_local_seq = s.local_seq_no;
+        recv(&mut s, Instant::from_millis(0), |result| {
+            assert_eq!(result.unwrap().timestamp, None);
+        });
+        send!(
+            s,
+            time 1,
+            TcpRepr {
+                control: TcpControl::Rst,
+                seq_number: REMOTE_SEQ + 1,
+                ack_number: Some(first_local_seq + 1),
+                timestamp: None,
+                ..SEND_TEMPL
+            }
+        );
+        assert_eq!(s.state(), State::Listen);
+
+        send!(
+            s,
+            time 1_100,
+            TcpRepr {
+                control: TcpControl::Syn,
+                seq_number: REMOTE_SEQ,
+                ack_number: None,
+                timestamp: Some(TcpTimestampRepr::new(100, 0)),
+                ..SEND_TEMPL
+            }
+        );
+        assert!(s.timestamp_enabled());
+        recv(&mut s, Instant::from_millis(1_100), |result| {
+            assert_eq!(
+                result.unwrap().timestamp,
+                Some(TcpTimestampRepr::new(100, 100))
+            );
+        });
+    }
+
+    #[test]
+    fn timestamp_disable_then_reenable_does_not_restore_old_paws_history() {
+        let mut s = socket_established();
+        s.set_tsval_generator(Some(|| 100));
+
+        let _ = send(
+            &mut s,
+            Instant::from_millis(0),
+            &TcpRepr {
+                seq_number: REMOTE_SEQ + 1,
+                ack_number: Some(LOCAL_SEQ + 1),
+                payload: &b"ab"[..],
+                timestamp: Some(TcpTimestampRepr::new(500, 0)),
+                ..SEND_TEMPL
+            },
+        );
+        s.set_tsval_generator(None);
+        assert!(!s.timestamp_enabled());
+        s.set_tsval_generator(Some(|| 100));
+        assert!(s.timestamp_enabled());
+
+        let reply = send(
+            &mut s,
+            Instant::from_millis(1_100),
+            &TcpRepr {
+                seq_number: REMOTE_SEQ + 3,
+                ack_number: Some(LOCAL_SEQ + 1),
+                payload: &b"cd"[..],
+                timestamp: Some(TcpTimestampRepr::new(100, 0)),
+                ..SEND_TEMPL
+            },
+        );
+        assert_eq!(reply, None);
+        assert_eq!(s.recv_queue(), 4);
+    }
+
+    #[test]
+    fn paws_accepts_wrapped_timestamp_after_24_days() {
+        let mut s = socket_established();
+        s.set_tsval_generator(Some(|| 100));
+
+        let _ = send(
+            &mut s,
+            Instant::from_millis(0),
+            &TcpRepr {
+                seq_number: REMOTE_SEQ + 1,
+                ack_number: Some(LOCAL_SEQ + 1),
+                payload: &b"ab"[..],
+                timestamp: Some(TcpTimestampRepr::new(0xf000_0000, 0)),
+                ..SEND_TEMPL
+            },
+        );
+        let reply = send(
+            &mut s,
+            Instant::from_millis(PAWS_24_DAYS_MS + 1_000),
+            &TcpRepr {
+                seq_number: REMOTE_SEQ + 3,
+                ack_number: Some(LOCAL_SEQ + 1),
+                payload: &b"cd"[..],
+                timestamp: Some(TcpTimestampRepr::new(0x7000_0001, 0)),
+                ..SEND_TEMPL
+            },
+        );
+        assert_eq!(reply, None);
+        assert_eq!(s.recv_queue(), 4);
+
+        let reply = send(
+            &mut s,
+            Instant::from_millis(PAWS_24_DAYS_MS + 2_100),
+            &TcpRepr {
+                seq_number: REMOTE_SEQ + 5,
+                ack_number: Some(LOCAL_SEQ + 1),
+                payload: &b"ef"[..],
+                timestamp: Some(TcpTimestampRepr::new(0x7000_0000, 0)),
+                ..SEND_TEMPL
+            },
+        );
+        assert!(reply.is_some());
+        assert_eq!(s.recv_queue(), 4);
+    }
+
+    #[test]
+    fn paws_timestamp_is_not_stale_at_exactly_24_days() {
+        let mut s = socket_established();
+        s.set_tsval_generator(Some(|| 100));
+
+        let _ = send(
+            &mut s,
+            Instant::from_millis(0),
+            &TcpRepr {
+                seq_number: REMOTE_SEQ + 1,
+                ack_number: Some(LOCAL_SEQ + 1),
+                payload: &b"ab"[..],
+                timestamp: Some(TcpTimestampRepr::new(0xf000_0000, 0)),
+                ..SEND_TEMPL
+            },
+        );
+        let reply = send(
+            &mut s,
+            Instant::from_millis(PAWS_24_DAYS_MS),
+            &TcpRepr {
+                seq_number: REMOTE_SEQ + 3,
+                ack_number: Some(LOCAL_SEQ + 1),
+                payload: &b"cd"[..],
+                timestamp: Some(TcpTimestampRepr::new(0x7000_0001, 0)),
+                ..SEND_TEMPL
+            },
+        );
+
+        assert!(reply.is_some());
+        assert_eq!(s.recv_queue(), 2);
+    }
+
+    #[test]
+    fn paws_equal_in_sequence_timestamp_refreshes_observation_age() {
+        let mut s = socket_established();
+        s.set_tsval_generator(Some(|| 100));
+
+        let _ = send(
+            &mut s,
+            Instant::from_millis(0),
+            &TcpRepr {
+                seq_number: REMOTE_SEQ + 1,
+                ack_number: Some(LOCAL_SEQ + 1),
+                payload: &b"ab"[..],
+                timestamp: Some(TcpTimestampRepr::new(500, 0)),
+                ..SEND_TEMPL
+            },
+        );
+        let _ = send(
+            &mut s,
+            Instant::from_millis(PAWS_24_DAYS_MS),
+            &TcpRepr {
+                seq_number: REMOTE_SEQ + 3,
+                ack_number: Some(LOCAL_SEQ + 1),
+                payload: &b"cd"[..],
+                timestamp: Some(TcpTimestampRepr::new(500, 0)),
+                ..SEND_TEMPL
+            },
+        );
+        let reply = send(
+            &mut s,
+            Instant::from_millis(PAWS_24_DAYS_MS + 1_100),
+            &TcpRepr {
+                seq_number: REMOTE_SEQ + 5,
+                ack_number: Some(LOCAL_SEQ + 1),
+                payload: &b"ef"[..],
+                timestamp: Some(TcpTimestampRepr::new(400, 0)),
+                ..SEND_TEMPL
+            },
+        );
+
+        assert!(reply.is_some());
+        assert_eq!(s.recv_queue(), 4);
+    }
+
+    #[test]
+    fn paws_rejected_segment_does_not_refresh_observation_age() {
+        let mut s = socket_established();
+        s.set_tsval_generator(Some(|| 100));
+
+        let _ = send(
+            &mut s,
+            Instant::from_millis(0),
+            &TcpRepr {
+                seq_number: REMOTE_SEQ + 1,
+                ack_number: Some(LOCAL_SEQ + 1),
+                payload: &b"ab"[..],
+                timestamp: Some(TcpTimestampRepr::new(500, 0)),
+                ..SEND_TEMPL
+            },
+        );
+        let _ = send(
+            &mut s,
+            Instant::from_millis(PAWS_24_DAYS_MS - 86_400_000),
+            &TcpRepr {
+                seq_number: REMOTE_SEQ + 3,
+                ack_number: Some(LOCAL_SEQ + 1),
+                payload: &b"cd"[..],
+                timestamp: Some(TcpTimestampRepr::new(400, 0)),
+                ..SEND_TEMPL
+            },
+        );
+        let reply = send(
+            &mut s,
+            Instant::from_millis(PAWS_24_DAYS_MS + 1_000),
+            &TcpRepr {
+                seq_number: REMOTE_SEQ + 3,
+                ack_number: Some(LOCAL_SEQ + 1),
+                payload: &b"cd"[..],
+                timestamp: Some(TcpTimestampRepr::new(400, 0)),
+                ..SEND_TEMPL
+            },
+        );
+
+        assert_eq!(reply, None);
+        assert_eq!(s.recv_queue(), 4);
+    }
+
+    #[test]
+    fn paws_clock_rollback_is_conservative() {
+        let mut s = socket_established();
+        s.set_tsval_generator(Some(|| 100));
+
+        let _ = send(
+            &mut s,
+            Instant::from_millis(1_000),
+            &TcpRepr {
+                seq_number: REMOTE_SEQ + 1,
+                ack_number: Some(LOCAL_SEQ + 1),
+                payload: &b"ab"[..],
+                timestamp: Some(TcpTimestampRepr::new(500, 0)),
+                ..SEND_TEMPL
+            },
+        );
+        let reply = send(
+            &mut s,
+            Instant::from_millis(500),
+            &TcpRepr {
+                seq_number: REMOTE_SEQ + 3,
+                ack_number: Some(LOCAL_SEQ + 1),
+                payload: &b"cd"[..],
+                timestamp: Some(TcpTimestampRepr::new(400, 0)),
+                ..SEND_TEMPL
+            },
+        );
+
+        assert!(reply.is_some());
+        assert_eq!(s.recv_queue(), 2);
+    }
+
+    #[test]
+    fn paws_elapsed_time_overflow_is_conservative() {
+        let mut s = socket_established();
+        s.set_tsval_generator(Some(|| 100));
+
+        let _ = send(
+            &mut s,
+            Instant::from_micros(i64::MIN + 2_000_000),
+            &TcpRepr {
+                seq_number: REMOTE_SEQ + 1,
+                ack_number: Some(LOCAL_SEQ + 1),
+                payload: &b"ab"[..],
+                timestamp: Some(TcpTimestampRepr::new(500, 0)),
+                ..SEND_TEMPL
+            },
+        );
+        let reply = send(
+            &mut s,
+            Instant::from_micros(i64::MAX - 2_000_000),
+            &TcpRepr {
+                seq_number: REMOTE_SEQ + 3,
+                ack_number: Some(LOCAL_SEQ + 1),
+                payload: &b"cd"[..],
+                timestamp: Some(TcpTimestampRepr::new(400, 0)),
+                ..SEND_TEMPL
+            },
+        );
+
+        assert!(reply.is_some());
+        assert_eq!(s.recv_queue(), 2);
+    }
+
+    #[test]
+    fn paws_listener_history_cleared_after_handshake_rst() {
+        let mut s = socket_listen();
+        s.set_tsval_generator(Some(|| 100));
+
+        send!(
+            s,
+            TcpRepr {
+                control: TcpControl::Syn,
+                seq_number: REMOTE_SEQ,
+                ack_number: None,
+                timestamp: Some(TcpTimestampRepr::new(5_000, 0)),
+                ..SEND_TEMPL
+            }
+        );
+        let local_seq = s.local_seq_no;
+        recv(&mut s, Instant::from_millis(0), |_| {});
+        send!(
+            s,
+            time 1,
+            TcpRepr {
+                control: TcpControl::Rst,
+                seq_number: REMOTE_SEQ + 1,
+                ack_number: Some(local_seq + 1),
+                timestamp: Some(TcpTimestampRepr::new(5_000, 100)),
+                ..SEND_TEMPL
+            }
+        );
+        assert_eq!(s.remote_tsval(), None);
+        assert_eq!(s.last_remote_tsval_at, Instant::ZERO);
+        assert!(!s.flags.contains(Flags::REMOTE_TSVAL_VALID));
+        assert_eq!(s.state(), State::Listen);
+
+        let reply = send(
+            &mut s,
+            Instant::from_millis(1_100),
+            &TcpRepr {
+                control: TcpControl::Syn,
+                seq_number: REMOTE_SEQ,
+                ack_number: None,
+                timestamp: Some(TcpTimestampRepr::new(100, 0)),
+                ..SEND_TEMPL
+            },
+        );
+        assert_eq!(reply, None);
+        assert_eq!(s.remote_tsval(), Some(100));
+        assert_eq!(s.state(), State::SynReceived);
+    }
+
+    #[test]
+    fn paws_old_rst_is_accepted_without_updating_history() {
+        let mut s = socket_established();
+        s.set_tsval_generator(Some(|| 100));
+
+        let _ = send(
+            &mut s,
+            Instant::from_millis(0),
+            &TcpRepr {
+                seq_number: REMOTE_SEQ + 1,
+                ack_number: Some(LOCAL_SEQ + 1),
+                payload: &b"ab"[..],
+                timestamp: Some(TcpTimestampRepr::new(500, 0)),
+                ..SEND_TEMPL
+            },
+        );
+        let observed_at = s.last_remote_tsval_at;
+        assert_eq!(s.remote_tsval(), Some(500));
+        assert!(s.flags.contains(Flags::REMOTE_TSVAL_VALID));
+        send!(
+            s,
+            time PAWS_24_DAYS_MS + 1_000,
+            TcpRepr {
+                control: TcpControl::Rst,
+                seq_number: REMOTE_SEQ + 3,
+                ack_number: Some(LOCAL_SEQ + 1),
+                timestamp: Some(TcpTimestampRepr::new(400, 0)),
+                ..SEND_TEMPL
+            }
+        );
+
+        assert_eq!(s.state(), State::Closed);
+        assert_eq!(s.last_remote_tsval, 500);
+        assert_eq!(s.remote_tsval(), Some(500));
+        assert_eq!(s.last_remote_tsval_at, observed_at);
+        assert!(s.flags.contains(Flags::REMOTE_TSVAL_VALID));
+    }
+
+    #[test]
+    fn paws_precedes_duplicate_ack_admission() {
+        let mut s = socket_established();
+        s.set_tsval_generator(Some(|| 100));
+
+        let _ = send(
+            &mut s,
+            Instant::from_millis(0),
+            &TcpRepr {
+                seq_number: REMOTE_SEQ + 1,
+                ack_number: Some(LOCAL_SEQ + 1),
+                payload: &b"ab"[..],
+                timestamp: Some(TcpTimestampRepr::new(500, 0)),
+                ..SEND_TEMPL
+            },
+        );
+        let reply = send(
+            &mut s,
+            Instant::from_millis(1_100),
+            &TcpRepr {
+                seq_number: REMOTE_SEQ + 3,
+                ack_number: Some(LOCAL_SEQ),
+                timestamp: Some(TcpTimestampRepr::new(400, 0)),
+                ..SEND_TEMPL
+            },
+        );
+
+        assert!(
+            reply.is_some(),
+            "PAWS must run before generic ACK admission"
+        );
+        assert_eq!(
+            reply.unwrap().timestamp,
+            Some(TcpTimestampRepr::new(100, 500))
+        );
+    }
 
     #[test]
     fn test_paws_rejects_older_tsval() {
@@ -12748,7 +13432,8 @@ mod test {
         );
         assert_eq!(s.recv_queue(), 2);
 
-        // A segment with tsval=400 (older than 500 under i32 wrap) is
+        let observed_at = s.last_remote_tsval_at;
+        // A segment with tsval=400 (older than 500 in RFC serial order) is
         // PAWS-rejected: smoltcp returns a challenge ACK and the payload is
         // not delivered. Use t > 1s so the challenge-ACK rate-limiter, which
         // is set on the first send's reply path, has expired.
@@ -12772,6 +13457,14 @@ mod test {
             2,
             "PAWS-rejected payload must not be delivered"
         );
+        assert_eq!(
+            reply.unwrap().timestamp,
+            Some(TcpTimestampRepr::new(100, 500)),
+            "PAWS ACK must echo stored TS.Recent"
+        );
+        assert_eq!(s.remote_tsval(), Some(500));
+        assert_eq!(s.last_remote_tsval_at, observed_at);
+        assert!(s.flags.contains(Flags::REMOTE_TSVAL_VALID));
     }
 
     #[test]
@@ -12804,6 +13497,20 @@ mod test {
             },
         );
         assert_eq!(s.recv_queue(), 4);
+
+        let reply = send(
+            &mut s,
+            Instant::from_millis(1_100),
+            &TcpRepr {
+                seq_number: REMOTE_SEQ + 1 + 4,
+                ack_number: Some(LOCAL_SEQ + 1),
+                payload: &b"ef"[..],
+                timestamp: Some(TcpTimestampRepr::new(250, 0)),
+                ..SEND_TEMPL
+            },
+        );
+        assert!(reply.is_some());
+        assert_eq!(s.recv_queue(), 4, "newer TSval must become TS.Recent");
     }
 
     // =========================================================================================//
