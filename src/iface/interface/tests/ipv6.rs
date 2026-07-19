@@ -1193,7 +1193,7 @@ fn test_router_advertisement_ignores_invalid_prefix_length(#[case] prefix_len: u
         hop_limit: 255,
         payload_len: advertisement.buffer_len(),
     });
-    let mut eth_bytes = vec![0u8; EthernetFrame::<&[u8]>::header_len() + ip_repr.buffer_len()];
+    let mut eth_bytes = vec![0u8; EthernetFrame::<&[u8]>::buffer_len(ip_repr.buffer_len())];
     let mut frame = EthernetFrame::new_unchecked(&mut eth_bytes);
     frame.set_dst_addr(local_hw_addr);
     frame.set_src_addr(remote_hw_addr);
