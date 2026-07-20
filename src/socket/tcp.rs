@@ -621,19 +621,12 @@ bitflags::bitflags! {
         /// `recovery_point` contains the RFC 6582/6675 RecoveryPoint.
         /// Keeping validity packed avoids the padding of `Option<SeqNumber>`.
         const RECOVERY_ACTIVE        = 1 << 8;
-        /// One NoControl retry segment has been scheduled under an active
-        /// RecoveryPoint. Successful emission restores the cursor to SND.NXT.
-        const NO_CONTROL_RETRY       = 1 << 9;
-        /// The active recovery episode has crossed a retransmission timeout.
-        /// This provenance is deliberately independent of RTTE's rolling
-        /// timeout counter, which periodically resets while backoff persists.
-        const RECOVERY_AFTER_RTO     = 1 << 10;
         /// last_remote_tsval and last_remote_tsval_at contain valid PAWS state.
-        const REMOTE_TSVAL_VALID     = 1 << 11;
+        const REMOTE_TSVAL_VALID     = 1 << 9;
         /// remote_last_ts contains a valid peer-activity timestamp.
-        const REMOTE_LAST_TS_VALID   = 1 << 12;
+        const REMOTE_LAST_TS_VALID   = 1 << 10;
         /// RFC 7323 Snd.TS.OK. In SYN-SENT, records a transmitted TS offer.
-        const SND_TS_OK              = 1 << 13;
+        const SND_TS_OK              = 1 << 11;
     }
 }
 
@@ -1095,10 +1088,6 @@ impl<'a> Socket<'a> {
             .set_mss(congestion::window_to_usize(self.remote_mss));
         self.congestion_controller
             .set_remote_window(congestion::window_to_usize(self.remote_win_len));
-
-        if self.congestion_controller.manages_window() {
-            self.cancel_no_control_retry();
-        }
     }
 
     /// Return the current congestion control algorithm.
@@ -1366,8 +1355,6 @@ impl<'a> Socket<'a> {
     fn set_recovery_point(&mut self, point: Option<TcpSeqNumber>) {
         if let Some(point) = point {
             self.recovery_point = point;
-        } else {
-            self.flags.remove(Flags::RECOVERY_AFTER_RTO);
         }
         self.flags.set(Flags::RECOVERY_ACTIVE, point.is_some());
     }
@@ -1493,7 +1480,6 @@ impl<'a> Socket<'a> {
         self.set_recovery_point(None);
         self.flags.remove(Flags::REMOTE_HAS_SACK);
         self.flags.remove(Flags::SACK_REDUNDANT_PASS);
-        self.flags.remove(Flags::NO_CONTROL_RETRY);
         self.flags.remove(Flags::LOCAL_HAS_SACK);
         self.tx_buffer.clear();
         self.rx_buffer.clear();
@@ -2088,10 +2074,6 @@ impl<'a> Socket<'a> {
 
         if old_state == State::SynSent && state == State::Closed {
             self.flags.remove(Flags::SND_TS_OK);
-        }
-
-        if !matches!(state, State::Established | State::CloseWait) {
-            self.cancel_no_control_retry();
         }
 
         #[cfg(feature = "async")]
@@ -2773,10 +2755,6 @@ impl<'a> Socket<'a> {
         let new_remote_win_len = (repr.window_len as u32) << (scale as u32);
         let is_window_update = new_remote_win_len != self.remote_win_len;
         self.remote_win_len = new_remote_win_len;
-        if new_remote_win_len == 0 && self.flags.contains(Flags::NO_CONTROL_RETRY) {
-            self.cancel_no_control_retry();
-            net_debug!("cancelled NoControl retry after zero-window update");
-        }
 
         self.congestion_controller
             .set_remote_window(congestion::window_to_usize(new_remote_win_len));
@@ -2805,7 +2783,9 @@ impl<'a> Socket<'a> {
             // 2. If exactly 3 duplicate ACKs received, set for fast retransmit
             // 3. Update the last received ACK (self.local_rx_last_ack)
             let mut notify_congestion_ack = false;
-            // SND.NXT is the sole proof that transmitted data remains outstanding.
+            // SND.NXT proves that transmitted data remains outstanding. The
+            // recovery cursor separately gates duplicate-ACK processing while
+            // a retransmission walk is still catching up.
             let has_transmitted_outstanding_data = ack_number < self.local_seq_next;
             match self.local_rx_last_ack {
                 // Duplicate ACK if payload empty and ACK doesn't move send window ->
@@ -2815,10 +2795,9 @@ impl<'a> Socket<'a> {
                     if repr.payload.is_empty()
                         && last_rx_ack == ack_number
                         && has_transmitted_outstanding_data
+                        && ack_number < self.remote_last_seq
                         && !is_window_update =>
                 {
-                    // Classification uses only SND.NXT. Scheduling then coalesces
-                    // complete triplets while another retransmission is pending.
                     self.local_rx_dup_acks = self.local_rx_dup_acks.saturating_add(1);
 
                     net_debug!(
@@ -2833,38 +2812,12 @@ impl<'a> Socket<'a> {
                     );
 
                     if self.local_rx_dup_acks == DUP_ACK_THRESHOLD {
-                        let recovery_quiescent = self.remote_last_seq == self.local_seq_next;
-                        match self.recovery_point() {
-                            None => {
-                                self.timer.set_for_fast_retransmit();
-                                // RFC 6582/6675: remember how far we had sent when
-                                // recovery began; ACKs below this are partial ACKs.
-                                self.set_recovery_point(Some(self.local_seq_next));
-                                self.flags.remove(Flags::RECOVERY_AFTER_RTO);
-                                self.flags.remove(Flags::SACK_REDUNDANT_PASS);
-                                net_debug!("started fast retransmit");
-                            }
-                            Some(_)
-                                if !self.congestion_controller.manages_window()
-                                    && recovery_quiescent
-                                    && !self.tx_buffer.is_empty()
-                                    && self.remote_win_len > 0
-                                    && !self.flags.contains(Flags::NO_CONTROL_RETRY) =>
-                            {
-                                self.flags.insert(Flags::NO_CONTROL_RETRY);
-                                net_debug!("scheduled one NoControl duplicate-ACK retry");
-                            }
-                            Some(_) if !self.congestion_controller.manages_window() => {
-                                // Close a completed triplet that cannot schedule
-                                // work, or the saturating count can strand later
-                                // quiescent recovery above the threshold.
-                                if !self.flags.contains(Flags::NO_CONTROL_RETRY) {
-                                    self.local_rx_dup_acks = 0;
-                                }
-                                net_debug!("coalesced NoControl duplicate-ACK triplet");
-                            }
-                            Some(_) => {}
-                        }
+                        self.timer.set_for_fast_retransmit();
+                        // RFC 6582/6675: remember how far we had sent when
+                        // recovery began; ACKs below this are partial ACKs.
+                        self.set_recovery_point(Some(self.local_seq_next));
+                        self.flags.remove(Flags::SACK_REDUNDANT_PASS);
+                        net_debug!("started fast retransmit");
                     }
 
                     // Inform the congestion controller of the duplicate ACK.
@@ -2930,30 +2883,9 @@ impl<'a> Socket<'a> {
                 self.recovery_point(),
                 Some(recovery_point) if ack_len > 0 && ack_number < recovery_point
             );
-            let controller_manages_window = self.congestion_controller.manages_window();
             let should_rewind_partial_ack = partial_recovery_ack
-                && (controller_manages_window || !self.sack_scoreboard.is_empty());
-
-            // Preserve the established selective recovery walk whenever SACK
-            // evidence exists. Only a scoreless NoControl recovery that has
-            // already crossed an RTO gets one side repair: this avoids waiting
-            // through another backed-off timeout without perturbing the common
-            // pre-RTO/SACK-directed packet order. Reusing the pending bit
-            // coalesces partial ACKs before dispatch, deriving the eventual
-            // retry from the latest SND.UNA rather than stale state.
-            if partial_recovery_ack {
-                self.flags.remove(Flags::NO_CONTROL_RETRY);
-                if !controller_manages_window
-                    && self.sack_scoreboard.is_empty()
-                    && self.flags.contains(Flags::RECOVERY_AFTER_RTO)
-                    && self.remote_last_seq == self.local_seq_next
-                    && !self.tx_buffer.is_empty()
-                    && self.remote_win_len > 0
-                {
-                    self.flags.insert(Flags::NO_CONTROL_RETRY);
-                    net_debug!("scheduled one NoControl partial-ACK repair");
-                }
-            }
+                && (self.congestion_controller.manages_window()
+                    || !self.sack_scoreboard.is_empty());
 
             match self.recovery_point() {
                 // The cumulative ACK reached the recovery point: loss
@@ -2961,7 +2893,6 @@ impl<'a> Socket<'a> {
                 Some(recovery_point) if ack_number >= recovery_point => {
                     self.set_recovery_point(None);
                     self.flags.remove(Flags::SACK_REDUNDANT_PASS);
-                    self.flags.remove(Flags::NO_CONTROL_RETRY);
                 }
                 // Partial ACK during recovery: SND.UNA advanced but not past
                 // the recovery point, which means the segment
@@ -3173,30 +3104,6 @@ impl<'a> Socket<'a> {
         }
     }
 
-    /// Select the first unsacked byte for a one-segment NoControl retry.
-    /// If every buffered byte is SACKed, retry SND.UNA to solicit a fresh
-    /// cumulative ACK without discarding or mutating the scoreboard.
-    fn no_control_retry_seq(&self) -> TcpSeqNumber {
-        let tx_len = self.tx_buffer.len();
-        let mut offset = 0;
-        for (start, end) in self.sack_scoreboard.iter_data() {
-            if offset < start {
-                break;
-            }
-            if offset < end {
-                offset = end;
-            }
-        }
-        // A window shrink can place the selected SACK hole beyond the new
-        // right edge after scheduling. Any positive window still permits an
-        // ACK-soliciting SND.UNA retransmission; zero windows cancel the retry
-        // during ingress and are also excluded by dispatch eligibility.
-        if offset >= tx_len || offset >= congestion::window_to_usize(self.remote_win_len) {
-            offset = 0;
-        }
-        self.local_seq_no + offset
-    }
-
     /// Invariant I1: `remote_last_seq` never points into the interior of a
     /// peer-SACKed range — those bytes are already delivered, so the cursor
     /// jumps to the range's end. This is enforced at every site that moves
@@ -3362,27 +3269,7 @@ impl<'a> Socket<'a> {
     }
 
     #[inline]
-    fn no_control_retry_eligible(&self) -> bool {
-        self.flags.contains(Flags::NO_CONTROL_RETRY)
-            && !self.congestion_controller.manages_window()
-            && matches!(self.state, State::Established | State::CloseWait)
-            && self.remote_win_len > 0
-            && !self.tx_buffer.is_empty()
-    }
-
-    #[inline]
-    fn cancel_no_control_retry(&mut self) {
-        if self.flags.contains(Flags::NO_CONTROL_RETRY) {
-            self.flags.remove(Flags::NO_CONTROL_RETRY);
-            self.local_rx_dup_acks = 0;
-        }
-    }
-
-    #[inline]
     fn has_unsent_or_control_to_transmit(&self) -> bool {
-        if self.no_control_retry_eligible() {
-            return true;
-        }
         match self.state {
             State::SynSent | State::SynReceived => self.remote_last_seq == self.local_seq_no,
             State::Established | State::CloseWait => {
@@ -3575,21 +3462,14 @@ impl<'a> Socket<'a> {
         // Cache `seq_to_transmit` across the retransmit and send checks. A
         // timer-driven cursor rewind invalidates it, so recompute below.
         let retransmit_due = self.timer.should_retransmit(cx.now());
-        let mut no_control_retry = self.no_control_retry_eligible() && !retransmit_due;
-        let mut want_send =
-            egress_interest.seq_candidate && (no_control_retry || self.seq_to_transmit(cx));
+        let mut want_send = egress_interest.seq_candidate && self.seq_to_transmit(cx);
 
         // Check if any state needs to be changed because of a timer.
         if self.timed_out(cx.now()) {
             // If a timeout expires, we should abort the connection.
             net_debug!("timeout exceeded");
             self.set_state(State::Closed);
-        } else if retransmit_due && (!want_send || self.flags.contains(Flags::NO_CONTROL_RETRY)) {
-            // The retransmission backstop has priority over a queued
-            // one-segment repair derived from older ACK state.
-            self.cancel_no_control_retry();
-            self.local_rx_dup_acks = 0;
-
+        } else if retransmit_due && !want_send {
             // Octets in flight, measured before the cursor rewind below resets
             // flight_size() to zero — the congestion controller needs the real
             // value to size ssthresh.
@@ -3610,17 +3490,13 @@ impl<'a> Socket<'a> {
                 self.rtte.on_rto();
 
                 self.sack_scoreboard.clear();
-                // RFC 6582 §3: (re)arm the recovery point on timeout as
-                // well. SACK blocks arriving during the go-back-N walk
-                // repopulate the scoreboard, and partial ACKs below this
-                // point then repair re-lost holes immediately instead of
-                // waiting out further exponentially backed-off RTOs.
+                // (Re)arm RecoveryPoint at SND.NXT. Later
+                // SACK evidence can guide the retransmission walk; a
+                // cumulative ACK reaching this point completes recovery.
                 self.set_recovery_point(Some(self.local_seq_next));
-                self.flags.insert(Flags::RECOVERY_AFTER_RTO);
                 self.flags.remove(Flags::SACK_REDUNDANT_PASS);
             } else {
                 net_debug!("retransmitting for fast-retransmit");
-                self.flags.remove(Flags::RECOVERY_AFTER_RTO);
 
                 // RFC 5681: a fast retransmit enters fast recovery, halving
                 // ssthresh and inflating cwnd by the dup-ack'd segments. The
@@ -3667,14 +3543,6 @@ impl<'a> Socket<'a> {
             }
         }
 
-        // A timer may have transitioned the socket out of a retry-capable
-        // state. Do not let the send decision cached above survive that
-        // transition and borrow payload for a control-only segment.
-        if no_control_retry && !self.no_control_retry_eligible() {
-            no_control_retry = false;
-            want_send = egress_interest.seq_candidate && self.seq_to_transmit(cx);
-        }
-
         #[cfg(feature = "socket-tcp-pause-synack")]
         if matches!(self.state, State::SynReceived) && self.flags.contains(Flags::SYNACK_PAUSED) {
             return Ok(());
@@ -3710,15 +3578,6 @@ impl<'a> Socket<'a> {
             return Ok(());
         } else {
             return Ok(());
-        }
-
-        // A NoControl retry borrows the send cursor only while constructing
-        // and emitting one segment. Scheduling itself leaves the canonical
-        // cursor at SND.NXT, and both success and error restore it below.
-        let normal_tx_cursor = self.remote_last_seq;
-        if no_control_retry {
-            debug_assert_eq!(normal_tx_cursor, self.local_seq_next);
-            self.remote_last_seq = self.no_control_retry_seq();
         }
 
         // Construct the lowered IP representation.
@@ -3861,7 +3720,7 @@ impl<'a> Socket<'a> {
                 // delivered. The cursor is never *inside* a range
                 // (invariant I1, `normalize_tx_cursor`), so clamping to the
                 // next range start suffices and leaves at least one byte.
-                if (!self.flags.contains(Flags::SACK_REDUNDANT_PASS) || no_control_retry)
+                if !self.flags.contains(Flags::SACK_REDUNDANT_PASS)
                     && !self.sack_scoreboard.is_empty()
                 {
                     for (start, _) in self.sack_scoreboard.iter_data() {
@@ -3951,13 +3810,9 @@ impl<'a> Socket<'a> {
         // to not waste time waiting for the retransmit timer on packets that we know
         // for sure will not be successfully transmitted.
         ip_repr.set_payload_len(repr.buffer_len());
-        debug_assert!(!no_control_retry || !repr.payload.is_empty());
         if let Err(err) = emit(cx, (ip_repr, repr)) {
             if let Some(previous) = previous_snd_ts_ok {
                 self.flags.set(Flags::SND_TS_OK, previous);
-            }
-            if no_control_retry {
-                self.remote_last_seq = normal_tx_cursor;
             }
             return Err(err);
         }
@@ -4010,32 +3865,22 @@ impl<'a> Socket<'a> {
         let new_remote_last_win = repr.window_len;
         let new_remote_last_win_unscaled = repr.control == TcpControl::Syn;
 
-        if no_control_retry {
-            debug_assert!(seg_len > 0);
-            debug_assert!(
-                self.local_rx_dup_acks == 0 || self.local_rx_dup_acks >= DUP_ACK_THRESHOLD
-            );
-            self.rtte.on_retransmit();
-            self.remote_last_seq = normal_tx_cursor;
-            self.cancel_no_control_retry();
-        } else {
-            self.remote_last_seq = new_remote_last_seq;
-            // Restore invariant I1: the segment we just emitted may end exactly
-            // at the start of a SACKed block; jump the cursor over it so the
-            // next dispatch starts at the following hole (or new data). The RTT
-            // and congestion updates below use the captured pre-jump values, so
-            // they account the segment actually transmitted.
-            self.normalize_tx_cursor();
-            // If that jump exhausted the selective walk while loss recovery is
-            // still open (cursor at the end of buffered data, holes all sent),
-            // fall into the one-shot redundant pass — under NoControl only.
-            if self.recovery_point().is_some()
-                && !self.flags.contains(Flags::SACK_REDUNDANT_PASS)
-                && !self.sack_scoreboard.is_empty()
-                && self.remote_last_seq == self.local_seq_no + self.tx_buffer.len()
-            {
-                self.enter_sack_redundant_pass();
-            }
+        self.remote_last_seq = new_remote_last_seq;
+        // Restore invariant I1: the segment we just emitted may end exactly
+        // at the start of a SACKed block; jump the cursor over it so the
+        // next dispatch starts at the following hole (or new data). The RTT
+        // and congestion updates below use the captured pre-jump values, so
+        // they account the segment actually transmitted.
+        self.normalize_tx_cursor();
+        // If that jump exhausted the selective walk while loss recovery is
+        // still open (cursor at the end of buffered data, holes all sent),
+        // fall into the one-shot redundant pass — under NoControl only.
+        if self.recovery_point().is_some()
+            && !self.flags.contains(Flags::SACK_REDUNDANT_PASS)
+            && !self.sack_scoreboard.is_empty()
+            && self.remote_last_seq == self.local_seq_no + self.tx_buffer.len()
+        {
+            self.enter_sack_redundant_pass();
         }
         self.remote_last_ack = new_remote_last_ack;
         self.remote_last_win = new_remote_last_win;
@@ -4087,8 +3932,6 @@ impl<'a> Socket<'a> {
             PollAt::Now
         } else if self.state == State::Closed {
             // Socket was aborted, we have an RST packet to transmit.
-            PollAt::Now
-        } else if self.no_control_retry_eligible() {
             PollAt::Now
         } else if self.seq_to_transmit(cx) {
             // We have a data or flag packet to transmit.
@@ -8733,31 +8576,6 @@ mod test {
         s
     }
 
-    /// Enter active NoControl recovery and schedule its one-segment
-    /// duplicate-ACK rescue without dispatching it.
-    fn socket_with_pending_no_control_retry() -> TestSocket {
-        let mut s = socket_with_four_segments_in_flight();
-        s.set_congestion_control(CongestionControl::None);
-        let recovery_point = s.local_seq_next;
-        let una = s.local_seq_no;
-        s.set_recovery_point(Some(recovery_point));
-        s.local_rx_last_ack = Some(una);
-        s.local_rx_dup_acks = 0;
-
-        for t in [1200, 1201, 1202] {
-            send!(s, time t, TcpRepr {
-                seq_number: REMOTE_SEQ + 1,
-                ack_number: Some(una),
-                ..SEND_TEMPL
-            });
-        }
-
-        assert!(s.flags.contains(Flags::NO_CONTROL_RETRY));
-        assert_eq!(s.local_rx_dup_acks, DUP_ACK_THRESHOLD);
-        assert_eq!(s.remote_last_seq, s.local_seq_next);
-        s
-    }
-
     /// Three duplicate ACKs reporting segments 2 and 4 as SACKed.
     #[cfg(any(
         feature = "socket-tcp-cubic",
@@ -8978,20 +8796,6 @@ mod test {
         assert_eq!(s.recovery_point(), recovery_point);
         assert_eq!(s.congestion_controller.window(), cwnd_before_partial_ack);
 
-        // A partial ACK resets duplicate-ACK counting while RecoveryPoint
-        // remains active. Three more duplicates below SND.NXT must not start
-        // a second fast-retransmit episode for the same recovery window.
-        for t in [1211, 1212, 1213] {
-            send!(s, time t, TcpRepr {
-                seq_number: REMOTE_SEQ + 1,
-                ack_number: Some(LOCAL_SEQ + 1 + 12),
-                ..SEND_TEMPL
-            });
-        }
-        assert_eq!(s.local_rx_dup_acks, 3);
-        assert!(!matches!(s.timer, Timer::FastRetransmit));
-        assert_eq!(s.recovery_point(), recovery_point);
-
         recv!(s, time 1215, Ok(TcpRepr {
             seq_number: LOCAL_SEQ + 1 + 12,
             ack_number: Some(REMOTE_SEQ + 1),
@@ -9014,6 +8818,46 @@ mod test {
             ..SEND_TEMPL
         });
         assert_eq!(s.congestion_controller.window(), cwnd_after_full_ack);
+    }
+
+    #[test]
+    fn no_control_partial_ack_rewinds_to_first_sack_hole() {
+        let mut s = socket_with_four_segments_in_flight();
+        s.set_congestion_control(CongestionControl::None);
+        let una = s.local_seq_no;
+        let recovery_point = s.local_seq_next;
+        s.set_recovery_point(Some(recovery_point));
+
+        send!(s, time 1100, TcpRepr {
+            seq_number: REMOTE_SEQ + 1,
+            ack_number: Some(una + 6),
+            sack_ranges: [
+                sack_block(una + 6, una + 12),
+                sack_block(una + 18, una + 24),
+                None,
+            ],
+            ..SEND_TEMPL
+        });
+
+        let scoreboard = std::vec![(0, 6), (12, 18)];
+        assert_eq!(
+            s.sack_scoreboard.iter_data().collect::<std::vec::Vec<_>>(),
+            scoreboard
+        );
+        assert_eq!(s.remote_last_seq, una + 12);
+        assert_eq!(s.recovery_point(), Some(recovery_point));
+
+        recv!(s, time 1101, Ok(TcpRepr {
+            seq_number: una + 12,
+            ack_number: Some(REMOTE_SEQ + 1),
+            payload:    &b"wwwwww"[..],
+            ..RECV_TEMPL
+        }));
+        assert_eq!(
+            s.sack_scoreboard.iter_data().collect::<std::vec::Vec<_>>(),
+            scoreboard
+        );
+        assert_eq!(s.recovery_point(), Some(recovery_point));
     }
 
     #[test]
@@ -9278,13 +9122,8 @@ mod test {
     }
 
     #[test]
-    fn no_control_initial_triplet_starts_recovery_with_rewound_cursor() {
+    fn duplicate_ack_triplet_uses_snd_nxt_after_cursor_rewind() {
         let mut s = socket_established();
-        s.set_congestion_control(CongestionControl::None);
-        assert!(
-            !s.congestion_controller.manages_window(),
-            "fixture must exercise NoControl"
-        );
         s.remote_mss = 6;
         s.send_slice(b"xxxxxxyyyyyy").unwrap();
         recv!(s, time 100, Ok(TcpRepr {
@@ -9300,698 +9139,26 @@ mod test {
             ..RECV_TEMPL
         }));
 
-        assert_eq!(s.local_seq_next, LOCAL_SEQ + 1 + 12);
-        assert_eq!(s.remote_last_seq, s.local_seq_next);
-
-        // Model the state after loss recovery has already rewound the send
-        // cursor: retransmission at this ACK is pending on the existing timer.
-        s.remote_last_seq = s.local_seq_no;
+        let snd_nxt = s.local_seq_next;
+        s.remote_last_seq = s.local_seq_no + 6;
         s.timer = Timer::Retransmit {
             expires_at: Instant::from_millis_const(5_000),
         };
         s.local_rx_last_ack = Some(s.local_seq_no);
         s.local_rx_dup_acks = 0;
-        // A fresh non-RTO recovery episode must sanitize stale provenance.
-        s.flags.insert(Flags::RECOVERY_AFTER_RTO);
-        s.rtte.timestamp = Some((Instant::from_millis_const(900), s.local_seq_no));
-        let rtt_timestamp = s.rtte.timestamp;
 
-        for t in [1_000, 1_001] {
+        for t in [1_000, 1_001, 1_002] {
             send!(s, time t, TcpRepr {
                 seq_number: REMOTE_SEQ + 1,
                 ack_number: Some(LOCAL_SEQ + 1),
                 ..SEND_TEMPL
             });
         }
-        assert_eq!(s.local_rx_dup_acks, 2);
 
-        // Initial recovery is keyed only by SND.NXT, not by the mutable send
-        // cursor. The third duplicate must start fast retransmit even though
-        // some other scheduler has already rewound the cursor.
-        send!(s, time 1_002, TcpRepr {
-            seq_number: REMOTE_SEQ + 1,
-            ack_number: Some(LOCAL_SEQ + 1),
-            ..SEND_TEMPL
-        });
-        assert_eq!(s.local_rx_dup_acks, 3);
         assert!(matches!(s.timer, Timer::FastRetransmit));
-        assert_eq!(s.recovery_point(), Some(s.local_seq_next));
-        assert!(!s.flags.contains(Flags::RECOVERY_AFTER_RTO));
-        assert_eq!(s.remote_last_seq, s.local_seq_no);
-        assert_eq!(s.local_seq_next, LOCAL_SEQ + 1 + 12);
-        assert_eq!(s.rtte.timestamp, rtt_timestamp);
-        assert!(!s.rtte.have_measurement);
-        assert_eq!(s.rtte.rto, RTTE_INITIAL_RTO);
-    }
-
-    #[test]
-    fn no_control_triplet_schedules_one_retry_segment() {
-        let mut s = socket_with_four_segments_in_flight();
-        s.set_congestion_control(CongestionControl::None);
-        assert!(!s.congestion_controller.manages_window());
-
-        let recovery_point = s.local_seq_next;
-        s.set_recovery_point(Some(recovery_point));
-        let tx_len = s.tx_buffer.len();
-        let _ = s.sack_scoreboard.add(0, tx_len);
-        let scoreboard_before: std::vec::Vec<_> = s.sack_scoreboard.iter_data().collect();
-        s.flags.insert(Flags::SACK_REDUNDANT_PASS);
-        let retransmit_timer = Timer::Retransmit {
-            expires_at: Instant::from_millis_const(5_000),
-        };
-        s.timer = retransmit_timer;
-        s.local_rx_last_ack = Some(s.local_seq_no);
-        s.local_rx_dup_acks = 0;
-        s.rtte.rto = 8_000;
-        s.rtte.rto_count = 3;
-        s.rtte.timestamp = Some((Instant::from_millis_const(900), s.local_seq_no));
-        let rtt_state = (
-            s.rtte.timestamp,
-            s.rtte.have_measurement,
-            s.rtte.srtt,
-            s.rtte.rttvar,
-            s.rtte.rto,
-            s.rtte.rto_count,
-        );
-
-        // The selective/redundant walk reached SND.NXT. A fresh triplet now
-        // proves that one ACK-soliciting retry is useful.
-        assert_eq!(s.remote_last_seq, s.local_seq_next);
-        for t in [1_200, 1_201, 1_202] {
-            send!(s, time t, TcpRepr {
-                seq_number: REMOTE_SEQ + 1,
-                ack_number: Some(LOCAL_SEQ + 1),
-                ..SEND_TEMPL
-            });
-        }
-
-        assert_eq!(s.timer, retransmit_timer);
-        assert_eq!(s.recovery_point(), Some(recovery_point));
-        assert_eq!(s.local_rx_dup_acks, 3);
-        assert_eq!(s.remote_last_seq, s.local_seq_next);
-        assert!(s.flags.contains(Flags::NO_CONTROL_RETRY));
-        assert!(s.flags.contains(Flags::SACK_REDUNDANT_PASS));
-        assert_eq!(
-            s.sack_scoreboard.iter_data().collect::<std::vec::Vec<_>>(),
-            scoreboard_before
-        );
-        assert_eq!(
-            (
-                s.rtte.timestamp,
-                s.rtte.have_measurement,
-                s.rtte.srtt,
-                s.rtte.rttvar,
-                s.rtte.rto,
-                s.rtte.rto_count,
-            ),
-            rtt_state
-        );
-
-        s.cx.set_now(Instant::from_millis_const(1_209));
-        let mut attempted = false;
-        let failed: Result<(), ()> = s.socket.dispatch(&mut s.cx, |_, (_, repr)| {
-            attempted = true;
-            assert_eq!(repr.seq_number, LOCAL_SEQ + 1);
-            assert_eq!(repr.payload, &b"xxxxxx"[..]);
-            Err(())
-        });
-        assert!(attempted);
-        assert_eq!(failed, Err(()));
-        assert_eq!(s.remote_last_seq, s.local_seq_next);
-        assert!(s.flags.contains(Flags::NO_CONTROL_RETRY));
-        assert_eq!(s.local_rx_dup_acks, 3);
-        assert_eq!(s.timer, retransmit_timer);
-        assert_eq!(
-            s.sack_scoreboard.iter_data().collect::<std::vec::Vec<_>>(),
-            scoreboard_before
-        );
-
-        // Dispatch exactly one SND.UNA packet from the one-shot retry.
-        recv!(s, time 1210, Ok(TcpRepr {
-            seq_number: LOCAL_SEQ + 1,
-            ack_number: Some(REMOTE_SEQ + 1),
-            payload:    &b"xxxxxx"[..],
-            ..RECV_TEMPL
-        }));
-        assert_eq!(s.recovery_point(), Some(recovery_point));
-        assert_eq!(s.remote_last_seq, s.local_seq_next);
-        assert_eq!(s.local_rx_dup_acks, 0);
-        assert!(!s.flags.contains(Flags::NO_CONTROL_RETRY));
-        assert!(s.flags.contains(Flags::SACK_REDUNDANT_PASS));
-        assert_eq!(
-            s.sack_scoreboard.iter_data().collect::<std::vec::Vec<_>>(),
-            scoreboard_before
-        );
-        assert_eq!(s.timer, retransmit_timer);
-        assert_eq!(s.rtte.timestamp, None);
-        assert_eq!(
-            (
-                s.rtte.have_measurement,
-                s.rtte.srtt,
-                s.rtte.rttvar,
-                s.rtte.rto,
-                s.rtte.rto_count,
-            ),
-            (
-                rtt_state.1,
-                rtt_state.2,
-                rtt_state.3,
-                rtt_state.4,
-                rtt_state.5
-            )
-        );
-        recv_nothing!(s, time 1211);
-
-        // Another retry cannot arm until another complete triplet arrives.
-        for t in [1_220, 1_221] {
-            send!(s, time t, TcpRepr {
-                seq_number: REMOTE_SEQ + 1,
-                ack_number: Some(LOCAL_SEQ + 1),
-                ..SEND_TEMPL
-            });
-        }
-        assert_eq!(s.local_rx_dup_acks, 2);
-        assert!(!s.flags.contains(Flags::NO_CONTROL_RETRY));
-        assert_eq!(s.timer, retransmit_timer);
-        assert_eq!(s.recovery_point(), Some(recovery_point));
-    }
-
-    #[test]
-    fn no_control_pending_retry_is_cancelled_before_abort_rst() {
-        let mut s = socket_with_pending_no_control_retry();
-        let snd_nxt = s.local_seq_next;
-
-        s.abort();
-
-        assert_eq!(s.state, State::Closed);
-        assert!(!s.flags.contains(Flags::NO_CONTROL_RETRY));
-        assert_eq!(s.local_rx_dup_acks, 0);
-        assert_eq!(s.remote_last_seq, snd_nxt);
+        assert_eq!(s.recovery_point(), Some(snd_nxt));
+        assert_eq!(s.remote_last_seq, s.local_seq_no + 6);
         assert_eq!(s.local_seq_next, snd_nxt);
-
-        recv!(s, time 1210, Ok(TcpRepr {
-            control:    TcpControl::Rst,
-            seq_number: snd_nxt,
-            ack_number: Some(REMOTE_SEQ + 1),
-            ..RECV_TEMPL
-        }), exact);
-        assert_eq!(s.remote_last_seq, snd_nxt);
-        assert_eq!(s.local_seq_next, snd_nxt);
-        assert_eq!(s.socket.poll_at(&mut s.cx), PollAt::Ingress);
-        recv_nothing!(s, time 1210);
-    }
-
-    #[test]
-    fn no_control_pending_retry_is_cancelled_before_inactivity_timeout_rst() {
-        let mut s = socket_with_pending_no_control_retry();
-        let snd_nxt = s.local_seq_next;
-        s.set_timeout(Some(Duration::from_millis(10)));
-
-        recv!(s, time 1212, Ok(TcpRepr {
-            control:    TcpControl::Rst,
-            seq_number: snd_nxt,
-            ack_number: Some(REMOTE_SEQ + 1),
-            ..RECV_TEMPL
-        }), exact);
-
-        assert_eq!(s.state, State::Closed);
-        assert!(!s.flags.contains(Flags::NO_CONTROL_RETRY));
-        assert_eq!(s.local_rx_dup_acks, 0);
-        assert_eq!(s.remote_last_seq, snd_nxt);
-        assert_eq!(s.local_seq_next, snd_nxt);
-        assert_eq!(s.socket.poll_at(&mut s.cx), PollAt::Ingress);
-        recv_nothing!(s, time 1212);
-    }
-
-    #[test]
-    fn no_control_pending_retry_is_cancelled_before_close_fin() {
-        let mut s = socket_with_pending_no_control_retry();
-        let snd_nxt = s.local_seq_next;
-
-        s.close();
-
-        assert_eq!(s.state, State::FinWait1);
-        assert!(!s.flags.contains(Flags::NO_CONTROL_RETRY));
-        assert_eq!(s.local_rx_dup_acks, 0);
-        assert_eq!(s.remote_last_seq, snd_nxt);
-        assert_eq!(s.local_seq_next, snd_nxt);
-
-        recv!(s, time 1210, Ok(TcpRepr {
-            control:    TcpControl::Fin,
-            seq_number: snd_nxt,
-            ack_number: Some(REMOTE_SEQ + 1),
-            ..RECV_TEMPL
-        }), exact);
-        assert_eq!(s.remote_last_seq, snd_nxt + 1);
-        assert_eq!(s.local_seq_next, snd_nxt + 1);
-        assert!(!s.flags.contains(Flags::NO_CONTROL_RETRY));
-        assert_eq!(s.local_rx_dup_acks, 0);
-        recv_nothing!(s, time 1211);
-    }
-
-    #[cfg(feature = "socket-tcp-reno")]
-    #[test]
-    fn no_control_pending_retry_is_cancelled_when_switching_to_reno() {
-        let mut s = socket_with_pending_no_control_retry();
-        let snd_nxt = s.local_seq_next;
-
-        s.set_congestion_control(CongestionControl::Reno);
-
-        assert_eq!(s.congestion_control(), CongestionControl::Reno);
-        assert!(s.congestion_controller.manages_window());
-        assert!(!s.flags.contains(Flags::NO_CONTROL_RETRY));
-        assert_eq!(s.local_rx_dup_acks, 0);
-        assert_eq!(s.remote_last_seq, snd_nxt);
-        assert_eq!(s.local_seq_next, snd_nxt);
-        assert!(!matches!(s.socket.poll_at(&mut s.cx), PollAt::Now));
-        recv_nothing!(s, time 1210);
-    }
-
-    #[cfg(feature = "socket-tcp-cubic")]
-    #[test]
-    fn no_control_pending_retry_is_cancelled_when_switching_to_cubic() {
-        let mut s = socket_with_pending_no_control_retry();
-        let snd_nxt = s.local_seq_next;
-
-        s.set_congestion_control(CongestionControl::Cubic);
-
-        assert_eq!(s.congestion_control(), CongestionControl::Cubic);
-        assert!(s.congestion_controller.manages_window());
-        assert!(!s.flags.contains(Flags::NO_CONTROL_RETRY));
-        assert_eq!(s.local_rx_dup_acks, 0);
-        assert_eq!(s.remote_last_seq, snd_nxt);
-        assert_eq!(s.local_seq_next, snd_nxt);
-        assert!(!matches!(s.socket.poll_at(&mut s.cx), PollAt::Now));
-        recv_nothing!(s, time 1210);
-    }
-
-    #[test]
-    fn no_control_partial_ack_with_empty_scoreboard_before_rto_does_not_retry() {
-        let mut s = socket_with_four_segments_in_flight();
-        s.set_congestion_control(CongestionControl::None);
-        let una = s.local_seq_no;
-        let recovery_point = s.local_seq_next;
-        s.set_recovery_point(Some(recovery_point));
-        // Estimator history is not recovery provenance. Even a positive
-        // counter must not enable the post-RTO repair without its epoch flag.
-        s.rtte.rto_count = 2;
-        s.rtte.rto = 8_000;
-        s.timer = Timer::Retransmit {
-            expires_at: Instant::from_millis_const(5_000),
-        };
-
-        send!(s, time 1000, TcpRepr {
-            seq_number: REMOTE_SEQ + 1,
-            ack_number: Some(una + 6),
-            ..SEND_TEMPL
-        });
-
-        assert_eq!(s.local_seq_no, una + 6);
-        assert_eq!(s.local_seq_next, recovery_point);
-        assert_eq!(s.remote_last_seq, recovery_point);
-        assert_eq!(s.recovery_point(), Some(recovery_point));
-        assert!(s.sack_scoreboard.is_empty());
-        assert!(!s.flags.contains(Flags::NO_CONTROL_RETRY));
-        recv_nothing!(s, time 1001);
-    }
-
-    #[test]
-    fn no_control_partial_ack_with_scoreboard_uses_ordinary_first_hole_rewind() {
-        let mut s = socket_with_four_segments_in_flight();
-        s.set_congestion_control(CongestionControl::None);
-        let una = s.local_seq_no;
-        let recovery_point = s.local_seq_next;
-        s.set_recovery_point(Some(recovery_point));
-
-        send!(s, time 1100, TcpRepr {
-            seq_number: REMOTE_SEQ + 1,
-            ack_number: Some(una + 6),
-            sack_ranges: [
-                sack_block(una + 6, una + 12),
-                sack_block(una + 18, una + 24),
-                None,
-            ],
-            ..SEND_TEMPL
-        });
-
-        let scoreboard = s.sack_scoreboard.iter_data().collect::<std::vec::Vec<_>>();
-        assert_eq!(scoreboard, std::vec![(0, 6), (12, 18)]);
-        assert_eq!(s.remote_last_seq, una + 12);
-        assert!(!s.flags.contains(Flags::NO_CONTROL_RETRY));
-
-        recv!(s, time 1101, Ok(TcpRepr {
-            seq_number: una + 12,
-            ack_number: Some(REMOTE_SEQ + 1),
-            payload:    &b"wwwwww"[..],
-            ..RECV_TEMPL
-        }));
-        // Sending that last hole exhausts the selective walk and enters the
-        // existing one-shot redundant pass at the new SND.UNA.
-        assert_eq!(s.remote_last_seq, una + 6);
-        assert_eq!(s.recovery_point(), Some(recovery_point));
-        assert_eq!(
-            s.sack_scoreboard.iter_data().collect::<std::vec::Vec<_>>(),
-            scoreboard
-        );
-        assert!(!s.flags.contains(Flags::NO_CONTROL_RETRY));
-        assert!(s.flags.contains(Flags::SACK_REDUNDANT_PASS));
-    }
-
-    #[test]
-    fn no_control_post_rto_empty_scoreboard_partial_ack_schedules_one_retry() {
-        let mut s = socket_with_four_segments_in_flight();
-        s.set_congestion_control(CongestionControl::None);
-        let una = s.local_seq_no;
-        let recovery_point = s.local_seq_next;
-        s.set_recovery_point(Some(recovery_point));
-        s.flags.insert(Flags::RECOVERY_AFTER_RTO);
-        // Provenance is deliberately independent of the estimator's rolling
-        // counter, which returns to zero after repeated timeouts.
-        s.rtte.rto_count = 0;
-        s.remote_last_seq = recovery_point;
-
-        send!(s, time 1150, TcpRepr {
-            seq_number: REMOTE_SEQ + 1,
-            ack_number: Some(una + 6),
-            ..SEND_TEMPL
-        });
-
-        let restarted_timer = s.timer;
-        assert_eq!(s.local_seq_no, una + 6);
-        assert_eq!(s.remote_last_seq, recovery_point);
-        assert_eq!(s.recovery_point(), Some(recovery_point));
-        assert!(s.sack_scoreboard.is_empty());
-        assert!(s.flags.contains(Flags::RECOVERY_AFTER_RTO));
-        assert!(s.flags.contains(Flags::NO_CONTROL_RETRY));
-
-        recv!(s, time 1151, Ok(TcpRepr {
-            seq_number: una + 6,
-            ack_number: Some(REMOTE_SEQ + 1),
-            payload:    &b"yyyyyy"[..],
-            ..RECV_TEMPL
-        }));
-        assert_eq!(s.remote_last_seq, recovery_point);
-        assert_eq!(s.recovery_point(), Some(recovery_point));
-        assert!(s.flags.contains(Flags::RECOVERY_AFTER_RTO));
-        assert!(!s.flags.contains(Flags::NO_CONTROL_RETRY));
-        assert_eq!(s.timer, restarted_timer);
-        assert_eq!(s.rtte.timestamp, None);
-        recv_nothing!(s, time 1152);
-    }
-
-    #[test]
-    fn no_control_recovery_after_rto_clears_on_full_ack_and_reset() {
-        let mut s = socket_with_four_segments_in_flight();
-        s.set_congestion_control(CongestionControl::None);
-        let recovery_point = s.local_seq_next;
-        s.set_recovery_point(Some(recovery_point));
-        s.flags.insert(Flags::RECOVERY_AFTER_RTO);
-
-        send!(s, time 1175, TcpRepr {
-            seq_number: REMOTE_SEQ + 1,
-            ack_number: Some(recovery_point),
-            ..SEND_TEMPL
-        });
-
-        assert!(s.recovery_point().is_none());
-        assert!(!s.flags.contains(Flags::RECOVERY_AFTER_RTO));
-
-        s.set_recovery_point(Some(recovery_point));
-        s.flags.insert(Flags::RECOVERY_AFTER_RTO);
-        s.reset();
-        assert!(s.recovery_point().is_none());
-        assert!(!s.flags.contains(Flags::RECOVERY_AFTER_RTO));
-    }
-
-    #[test]
-    fn no_control_second_partial_ack_recomputes_pending_retry() {
-        let mut s = socket_with_four_segments_in_flight();
-        s.set_congestion_control(CongestionControl::None);
-        let una = s.local_seq_no;
-        let recovery_point = s.local_seq_next;
-        s.set_recovery_point(Some(recovery_point));
-        s.flags.insert(Flags::RECOVERY_AFTER_RTO);
-
-        for ack in [una + 6, una + 12] {
-            send!(s, time 1200, TcpRepr {
-                seq_number: REMOTE_SEQ + 1,
-                ack_number: Some(ack),
-                ..SEND_TEMPL
-            });
-            assert!(s.flags.contains(Flags::NO_CONTROL_RETRY));
-            assert_eq!(s.remote_last_seq, recovery_point);
-        }
-        let restarted_timer = s.timer;
-
-        recv!(s, time 1201, Ok(TcpRepr {
-            seq_number: una + 12,
-            ack_number: Some(REMOTE_SEQ + 1),
-            payload:    &b"wwwwww"[..],
-            ..RECV_TEMPL
-        }));
-        assert_eq!(s.remote_last_seq, recovery_point);
-        assert_eq!(s.recovery_point(), Some(recovery_point));
-        assert!(!s.flags.contains(Flags::NO_CONTROL_RETRY));
-        assert_eq!(s.timer, restarted_timer);
-        recv_nothing!(s, time 1202);
-    }
-
-    #[test]
-    fn no_control_rto_without_pending_retry_resets_duplicate_ack_triplet() {
-        let mut s = socket_with_four_segments_in_flight();
-        s.set_congestion_control(CongestionControl::None);
-        let una = s.local_seq_no;
-        let recovery_point = s.local_seq_next;
-        s.set_recovery_point(Some(recovery_point));
-        s.local_rx_last_ack = Some(una);
-        s.local_rx_dup_acks = DUP_ACK_THRESHOLD - 1;
-        s.timer = Timer::Retransmit {
-            expires_at: Instant::from_millis_const(2_000),
-        };
-
-        recv!(s, time 2000, Ok(TcpRepr {
-            seq_number: una,
-            ack_number: Some(REMOTE_SEQ + 1),
-            payload:    &b"xxxxxx"[..],
-            ..RECV_TEMPL
-        }));
-
-        assert!(!s.flags.contains(Flags::NO_CONTROL_RETRY));
-        assert_eq!(s.local_rx_dup_acks, 0);
-
-        // Model the quiescent point reached after the RTO walk. A fresh
-        // duplicate-ACK triplet must start at zero: the first two ACKs stay
-        // inert, and only the third authorizes the one-segment rescue.
-        s.remote_last_seq = recovery_point;
-        for (index, time) in [2_001, 2_002, 2_003].into_iter().enumerate() {
-            send!(s, time time, TcpRepr {
-                seq_number: REMOTE_SEQ + 1,
-                ack_number: Some(una),
-                ..SEND_TEMPL
-            });
-            assert_eq!(s.local_rx_dup_acks, (index + 1) as u8);
-            assert_eq!(
-                s.flags.contains(Flags::NO_CONTROL_RETRY),
-                index + 1 == DUP_ACK_THRESHOLD as usize
-            );
-        }
-    }
-
-    #[test]
-    fn no_control_expired_rto_preempts_pending_retry() {
-        let mut s = socket_with_four_segments_in_flight();
-        s.set_congestion_control(CongestionControl::None);
-        let una = s.local_seq_no;
-        let recovery_point = s.local_seq_next;
-        s.set_recovery_point(Some(recovery_point));
-        let tx_len = s.tx_buffer.len();
-        let _ = s.sack_scoreboard.add(0, tx_len);
-        s.flags.insert(Flags::SACK_REDUNDANT_PASS);
-        s.flags.insert(Flags::NO_CONTROL_RETRY);
-        s.local_rx_dup_acks = 3;
-        s.rtte.rto = 1_000;
-        s.rtte.rto_count = 1;
-        s.timer = Timer::Retransmit {
-            expires_at: Instant::from_millis_const(2_000),
-        };
-
-        recv!(s, time 2000, Ok(TcpRepr {
-            seq_number: una,
-            ack_number: Some(REMOTE_SEQ + 1),
-            payload:    &b"xxxxxx"[..],
-            ..RECV_TEMPL
-        }));
-
-        assert!(!s.flags.contains(Flags::NO_CONTROL_RETRY));
-        assert!(!s.flags.contains(Flags::SACK_REDUNDANT_PASS));
-        assert_eq!(s.local_rx_dup_acks, 0);
-        assert!(s.sack_scoreboard.is_empty());
-        assert_eq!(s.remote_last_seq, una + 6);
-        assert_eq!(s.local_seq_next, recovery_point);
-        assert_eq!(s.recovery_point(), Some(recovery_point));
-        assert!(s.flags.contains(Flags::RECOVERY_AFTER_RTO));
-        assert_eq!(s.rtte.rto, 2_000);
-        assert_eq!(s.rtte.rto_count, 2);
-        assert_eq!(
-            s.timer,
-            Timer::Retransmit {
-                expires_at: Instant::from_millis_const(4_000)
-            }
-        );
-    }
-
-    #[test]
-    fn no_control_nonquiescent_triplet_resets_for_later_rescue() {
-        let mut s = socket_with_four_segments_in_flight();
-        s.set_congestion_control(CongestionControl::None);
-        let una = s.local_seq_no;
-        let recovery_point = s.local_seq_next;
-        s.set_recovery_point(Some(recovery_point));
-        s.remote_last_seq = una;
-        s.local_rx_last_ack = Some(una);
-        s.local_rx_dup_acks = 0;
-        let timer = s.timer;
-
-        for t in [3000, 3001, 3002] {
-            send!(s, time t, TcpRepr {
-                seq_number: REMOTE_SEQ + 1,
-                ack_number: Some(una),
-                ..SEND_TEMPL
-            });
-        }
-        assert_eq!(s.local_rx_dup_acks, 0);
-        assert!(!s.flags.contains(Flags::NO_CONTROL_RETRY));
-        assert_eq!(s.timer, timer);
-
-        s.remote_last_seq = recovery_point;
-        for t in [3010, 3011, 3012] {
-            send!(s, time t, TcpRepr {
-                seq_number: REMOTE_SEQ + 1,
-                ack_number: Some(una),
-                ..SEND_TEMPL
-            });
-        }
-        assert_eq!(s.local_rx_dup_acks, 3);
-        assert!(s.flags.contains(Flags::NO_CONTROL_RETRY));
-    }
-
-    #[test]
-    fn no_control_pending_retry_coalesces_duplicate_ack_burst() {
-        let mut s = socket_with_four_segments_in_flight();
-        s.set_congestion_control(CongestionControl::None);
-        let una = s.local_seq_no;
-        let recovery_point = s.local_seq_next;
-        s.set_recovery_point(Some(recovery_point));
-        let tx_len = s.tx_buffer.len();
-        let _ = s.sack_scoreboard.add(0, tx_len);
-        s.local_rx_last_ack = Some(una);
-        s.timer = Timer::Retransmit {
-            expires_at: Instant::from_millis_const(10_000),
-        };
-
-        for t in [4000, 4001, 4002, 4003, 4004] {
-            send!(s, time t, TcpRepr {
-                seq_number: REMOTE_SEQ + 1,
-                ack_number: Some(una),
-                ..SEND_TEMPL
-            });
-        }
-        assert!(s.flags.contains(Flags::NO_CONTROL_RETRY));
-
-        recv!(s, time 4005, Ok(TcpRepr {
-            seq_number: una,
-            ack_number: Some(REMOTE_SEQ + 1),
-            payload:    &b"xxxxxx"[..],
-            ..RECV_TEMPL
-        }));
-        assert_eq!(s.local_rx_dup_acks, 0);
-        assert!(!s.flags.contains(Flags::NO_CONTROL_RETRY));
-        assert_eq!(s.remote_last_seq, recovery_point);
-        recv_nothing!(s, time 4006);
-
-        for t in [4010, 4011] {
-            send!(s, time t, TcpRepr {
-                seq_number: REMOTE_SEQ + 1,
-                ack_number: Some(una),
-                ..SEND_TEMPL
-            });
-        }
-        assert_eq!(s.local_rx_dup_acks, 2);
-        assert!(!s.flags.contains(Flags::NO_CONTROL_RETRY));
-    }
-
-    #[test]
-    fn no_control_zero_window_update_cancels_pending_retry_without_spin() {
-        let mut s = socket_with_four_segments_in_flight();
-        s.set_congestion_control(CongestionControl::None);
-        let una = s.local_seq_no;
-        let recovery_point = s.local_seq_next;
-        s.set_recovery_point(Some(recovery_point));
-        s.local_rx_last_ack = Some(una);
-        s.timer = Timer::new();
-
-        for t in [5000, 5001, 5002] {
-            send!(s, time t, TcpRepr {
-                seq_number: REMOTE_SEQ + 1,
-                ack_number: Some(una),
-                ..SEND_TEMPL
-            });
-        }
-        assert!(s.flags.contains(Flags::NO_CONTROL_RETRY));
-
-        send!(s, time 5003, TcpRepr {
-            seq_number: REMOTE_SEQ + 1,
-            ack_number: Some(una),
-            window_len: 0,
-            ..SEND_TEMPL
-        });
-        assert_eq!(s.remote_win_len, 0);
-        assert_eq!(s.local_rx_dup_acks, 0);
-        assert!(!s.flags.contains(Flags::NO_CONTROL_RETRY));
-        assert!(matches!(s.timer, Timer::ZeroWindowProbe { .. }));
-        assert!(!matches!(s.socket.poll_at(&mut s.cx), PollAt::Now));
-        recv_nothing!(s, time 5003);
-    }
-
-    #[test]
-    fn no_control_window_shrink_retries_una_when_first_hole_is_outside_window() {
-        let mut s = socket_with_four_segments_in_flight();
-        s.set_congestion_control(CongestionControl::None);
-        let una = s.local_seq_no;
-        let recovery_point = s.local_seq_next;
-        s.set_recovery_point(Some(recovery_point));
-        let _ = s.sack_scoreboard.add(0, 12);
-        s.local_rx_last_ack = Some(una);
-        s.timer = Timer::Retransmit {
-            expires_at: Instant::from_millis_const(10_000),
-        };
-
-        for t in [6000, 6001, 6002] {
-            send!(s, time t, TcpRepr {
-                seq_number: REMOTE_SEQ + 1,
-                ack_number: Some(una),
-                ..SEND_TEMPL
-            });
-        }
-        assert!(s.flags.contains(Flags::NO_CONTROL_RETRY));
-
-        send!(s, time 6003, TcpRepr {
-            seq_number: REMOTE_SEQ + 1,
-            ack_number: Some(una),
-            window_len: 6,
-            ..SEND_TEMPL
-        });
-        assert_eq!(s.remote_win_len, 6);
-        assert!(s.flags.contains(Flags::NO_CONTROL_RETRY));
-
-        recv!(s, time 6004, Ok(TcpRepr {
-            seq_number: una,
-            ack_number: Some(REMOTE_SEQ + 1),
-            payload:    &b"xxxxxx"[..],
-            ..RECV_TEMPL
-        }));
-        assert_eq!(s.remote_last_seq, recovery_point);
-        assert!(!s.flags.contains(Flags::NO_CONTROL_RETRY));
     }
 
     #[test]
@@ -12495,8 +11662,6 @@ mod test {
             let recovery_point = s.local_seq_next;
             s.set_recovery_point(Some(recovery_point));
             s.flags.insert(Flags::SACK_REDUNDANT_PASS);
-            s.flags.insert(Flags::NO_CONTROL_RETRY);
-            s.flags.insert(Flags::RECOVERY_AFTER_RTO);
 
             send!(
                 s,
@@ -12528,8 +11693,6 @@ mod test {
             assert!(!s.flags.contains(Flags::REMOTE_HAS_SACK));
             assert!(!s.flags.contains(Flags::LOCAL_HAS_SACK));
             assert!(!s.flags.contains(Flags::SACK_REDUNDANT_PASS));
-            assert!(!s.flags.contains(Flags::NO_CONTROL_RETRY));
-            assert!(!s.flags.contains(Flags::RECOVERY_AFTER_RTO));
             assert_eq!(s.recovery_point(), None);
             assert_eq!(s.local_rx_last_ack, None);
             assert_eq!(s.local_rx_last_seq, None);
