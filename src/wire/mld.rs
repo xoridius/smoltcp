@@ -7,10 +7,12 @@
 use byteorder::{ByteOrder, NetworkEndian};
 
 use super::{Error, Result};
+#[cfg(feature = "multicast")]
 use crate::time::Duration;
 use crate::wire::Ipv6Address;
 use crate::wire::icmpv6::{Message, Packet, field};
 
+#[cfg(feature = "multicast")]
 pub(crate) const fn max_resp_delay(code: u16) -> Duration {
     if code < 0x8000 {
         Duration::from_millis(code as u64)
@@ -647,6 +649,7 @@ mod test {
         assert_eq!(&*packet.into_inner(), &REPORT_PACKET_BYTES[..]);
     }
 
+    #[cfg(feature = "multicast")]
     #[test]
     fn test_max_resp_delay() {
         for (code, millis) in [

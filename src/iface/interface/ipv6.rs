@@ -1,10 +1,12 @@
 use super::*;
 
+#[cfg(feature = "proto-ipv6-slaac")]
 use crate::iface::Route;
 
 struct HopByHopContinuation<'frame> {
     next_header: IpProtocol,
     payload: &'frame [u8],
+    #[cfg(feature = "multicast")]
     mld_router_alert: bool,
 }
 
@@ -174,6 +176,7 @@ impl InterfaceInner {
     }
 
     /// Get the first link-local IPv6 address of the interface, if present.
+    #[cfg(any(feature = "multicast", feature = "proto-ipv6-slaac"))]
     fn link_local_ipv6_address(&self) -> Option<Ipv6Address> {
         self.ip_addrs.iter().find_map(|addr| match *addr {
             #[cfg(feature = "proto-ipv4")]
@@ -221,6 +224,7 @@ impl InterfaceInner {
             HopByHopContinuation {
                 next_header: ipv6_repr.next_header,
                 payload: ipv6_packet.payload(),
+                #[cfg(feature = "multicast")]
                 mld_router_alert: false,
             }
         };
@@ -351,15 +355,20 @@ impl InterfaceInner {
         let hbh_hdr = check!(Ipv6HopByHopHeader::new_checked(ext_repr.data));
         let hbh_repr = check!(Ipv6HopByHopRepr::parse(&hbh_hdr));
 
+        #[cfg(feature = "multicast")]
         let mut router_alert_count = 0;
+        #[cfg(feature = "multicast")]
         let mut mld_router_alert = false;
         for opt_repr in &hbh_repr.options {
             match opt_repr {
                 Ipv6OptionRepr::Pad1 | Ipv6OptionRepr::PadN(_) => {}
+                #[cfg(feature = "multicast")]
                 Ipv6OptionRepr::RouterAlert(alert) => {
                     router_alert_count += 1;
                     mld_router_alert = *alert == Ipv6OptionRouterAlert::MulticastListenerDiscovery;
                 }
+                #[cfg(not(feature = "multicast"))]
+                Ipv6OptionRepr::RouterAlert(_) => {}
                 #[cfg(feature = "proto-rpl")]
                 Ipv6OptionRepr::Rpl(_) => {}
 
@@ -387,6 +396,7 @@ impl InterfaceInner {
         HopByHopResponse::Continue(HopByHopContinuation {
             next_header: ext_repr.next_header,
             payload: &ip_payload[ext_repr.header_len() + ext_repr.data.len()..],
+            #[cfg(feature = "multicast")]
             mld_router_alert: hbh_repr.buffer_len() == ext_repr.data.len()
                 && router_alert_count == 1
                 && mld_router_alert,
@@ -404,9 +414,13 @@ impl InterfaceInner {
         next: HopByHopContinuation<'frame>,
     ) -> Option<Packet<'frame>> {
         match next.next_header {
-            IpProtocol::Icmpv6 => {
-                self.process_icmpv6(sockets, ipv6_repr, next.mld_router_alert, next.payload)
-            }
+            IpProtocol::Icmpv6 => self.process_icmpv6(
+                sockets,
+                ipv6_repr,
+                #[cfg(feature = "multicast")]
+                next.mld_router_alert,
+                next.payload,
+            ),
 
             #[cfg(any(feature = "socket-udp", feature = "socket-dns"))]
             IpProtocol::Udp => self.process_udp(
@@ -451,7 +465,7 @@ impl InterfaceInner {
         &mut self,
         _sockets: &mut SocketSet,
         ip_repr: Ipv6Repr,
-        _mld_router_alert: bool,
+        #[cfg(feature = "multicast")] mld_router_alert: bool,
         ip_payload: &'frame [u8],
     ) -> Option<Packet<'frame>> {
         let icmp_packet = check!(Icmpv6Packet::new_checked(ip_payload));
@@ -514,7 +528,7 @@ impl InterfaceInner {
                 MldRepr::Query { .. }
                     if ip_repr.hop_limit == 1
                         && ip_repr.src_addr.is_link_local()
-                        && _mld_router_alert =>
+                        && mld_router_alert =>
                 {
                     self.process_mldv2(ip_repr, repr)
                 }
@@ -658,6 +672,7 @@ impl InterfaceInner {
         ))
     }
 
+    #[cfg(feature = "multicast")]
     pub(super) fn mldv2_report_packet<'any>(
         &self,
         records: &'any [MldAddressRecordRepr<'any>],

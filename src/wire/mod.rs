@@ -263,7 +263,7 @@ pub use self::ndiscoption::{
     Repr as NdiscOptionRepr, Type as NdiscOptionType,
 };
 
-#[cfg(feature = "proto-ipv6")]
+#[cfg(all(feature = "proto-ipv6", feature = "multicast"))]
 pub(crate) use self::mld::max_resp_delay as mldv2_max_resp_delay;
 #[cfg(feature = "proto-ipv6")]
 pub use self::mld::{
