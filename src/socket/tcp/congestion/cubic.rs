@@ -284,10 +284,6 @@ impl Controller for Cubic {
     fn set_mss(&mut self, mss: usize) {
         let mss = window_to_u32(mss);
         self.mss = mss;
-        // Fork delta (FORK.md §16): open the window at RFC 6928 IW10 —
-        // min(10*MSS, max(2*MSS, 14600)) — when the peer's MSS is learned on
-        // the SYN, rather than upstream's flat 2*MSS. Faster first-RTT ramp for
-        // short flows.
         let initial_window = initial_window(mss);
         self.cwnd = initial_window;
         self.w_max = initial_window;
@@ -735,8 +731,6 @@ mod test {
         );
     }
 
-    // Fork delta (FORK.md §16): set_mss opens the window at RFC 6928 IW10
-    // = min(10*MSS, max(2*MSS, 14600)).
     #[test]
     fn cubic_iw10_on_set_mss() {
         for (mss, expected) in [(48, 480), (536, 5_360), (1_460, 14_600)] {

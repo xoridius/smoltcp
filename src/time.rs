@@ -57,7 +57,7 @@ impl Instant {
     /// Create a new `Instant` from a number of seconds.
     pub fn from_secs<T: Into<i64>>(secs: T) -> Instant {
         Instant {
-            micros: secs.into() * 1000000,
+            micros: secs.into() * 1_000_000,
         }
     }
 
@@ -75,19 +75,19 @@ impl Instant {
     /// The fractional number of milliseconds that have passed
     /// since the beginning of time.
     pub const fn millis(&self) -> i64 {
-        self.micros % 1000000 / 1000
+        self.micros % 1_000_000 / 1000
     }
 
     /// The fractional number of microseconds that have passed
     /// since the beginning of time.
     pub const fn micros(&self) -> i64 {
-        self.micros % 1000000
+        self.micros % 1_000_000
     }
 
     /// The number of whole seconds that have passed since the
     /// beginning of time.
     pub const fn secs(&self) -> i64 {
-        self.micros / 1000000
+        self.micros / 1_000_000
     }
 
     /// The total number of milliseconds that have passed since
@@ -105,11 +105,11 @@ impl Instant {
 #[cfg(feature = "std")]
 impl From<::std::time::Instant> for Instant {
     fn from(other: ::std::time::Instant) -> Instant {
-        static REFERENTIAL: ::std::sync::LazyLock<::std::time::Instant> =
+        static ORIGIN: ::std::sync::LazyLock<::std::time::Instant> =
             ::std::sync::LazyLock::new(::std::time::Instant::now);
 
-        let n = other.saturating_duration_since(*REFERENTIAL);
-        Self::from_micros(n.as_secs() as i64 * 1000000 + n.subsec_micros() as i64)
+        let n = other.saturating_duration_since(*ORIGIN);
+        Self::from_micros(n.as_secs() as i64 * 1_000_000 + n.subsec_micros() as i64)
     }
 }
 
@@ -119,7 +119,7 @@ impl From<::std::time::SystemTime> for Instant {
         let n = other
             .duration_since(::std::time::UNIX_EPOCH)
             .expect("start time must not be before the unix epoch");
-        Self::from_micros(n.as_secs() as i64 * 1000000 + n.subsec_micros() as i64)
+        Self::from_micros(n.as_secs() as i64 * 1_000_000 + n.subsec_micros() as i64)
     }
 }
 
@@ -204,7 +204,7 @@ impl Duration {
     /// Create a new `Duration` from a number of seconds.
     pub const fn from_secs(secs: u64) -> Duration {
         Duration {
-            micros: secs * 1000000,
+            micros: secs * 1_000_000,
         }
     }
 
@@ -215,12 +215,12 @@ impl Duration {
 
     /// The fractional number of milliseconds in this `Duration`.
     pub const fn micros(&self) -> u64 {
-        self.micros % 1000000
+        self.micros % 1_000_000
     }
 
     /// The number of whole seconds in this `Duration`.
     pub const fn secs(&self) -> u64 {
-        self.micros / 1000000
+        self.micros / 1_000_000
     }
 
     /// The total number of milliseconds in this `Duration`.
@@ -340,7 +340,7 @@ impl ops::ShrAssign<u32> for Duration {
 
 impl From<::core::time::Duration> for Duration {
     fn from(other: ::core::time::Duration) -> Duration {
-        Duration::from_micros(other.as_secs() * 1000000 + other.subsec_micros() as u64)
+        Duration::from_micros(other.as_secs() * 1_000_000 + other.subsec_micros() as u64)
     }
 }
 

@@ -238,8 +238,7 @@ impl Interface {
     /// Do multicast egress.
     ///
     /// - Send join/leave packets according to the multicast group state.
-    /// - Depending on `igmp_report_state` and the therein contained
-    ///   timeouts, send IGMP membership reports.
+    /// - Send scheduled IGMP and MLD membership reports.
     pub(crate) fn multicast_egress(&mut self, device: &mut (impl Device + ?Sized)) {
         // Process multicast joins.
         while let Some((&addr, _)) = self
@@ -448,9 +447,7 @@ impl Interface {
 impl InterfaceInner {
     /// Host duties of the **IGMPv2** protocol.
     ///
-    /// Sets up `igmp_report_state` for responding to IGMP general/specific membership queries.
-    /// Membership must not be reported immediately in order to avoid flooding the network
-    /// after a query is broadcasted by a router; this is not currently done.
+    /// Schedules delayed reports for general and group-specific membership queries.
     #[cfg(feature = "proto-ipv4")]
     pub(super) fn process_igmp<'frame>(
         &mut self,
@@ -462,7 +459,6 @@ impl InterfaceInner {
         let igmp_packet = check!(IgmpPacket::new_checked(ip_payload));
         let igmp_repr = check!(IgmpRepr::parse(&igmp_packet));
 
-        // FIXME: report membership after a delay
         match igmp_repr {
             IgmpRepr::MembershipQuery {
                 group_addr,

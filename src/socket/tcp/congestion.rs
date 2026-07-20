@@ -37,6 +37,8 @@ pub(super) trait Controller {
     fn set_mss(&mut self, mss: usize) {}
 }
 
+/// RFC 6928 initial window: `min(10 * MSS, max(2 * MSS, 14_600))`.
+/// Controllers apply it after learning the peer's MSS during the handshake.
 #[cfg(any(test, feature = "socket-tcp-reno", feature = "socket-tcp-cubic"))]
 #[inline]
 pub(super) fn initial_window(mss: u32) -> u32 {

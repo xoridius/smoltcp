@@ -150,8 +150,8 @@ impl<K> PacketAssembler<K> {
     ///
     /// # Errors
     ///
-    /// - Returns [`Error::PacketAssemblerBufferTooSmall`] when trying to add data into the buffer at a non-existing
-    ///   place.
+    /// Returns [`AssemblerError`] if the fragment range exceeds protocol bounds
+    /// or, without allocation support, the reassembly buffer.
     pub(crate) fn add(&mut self, data: &[u8], offset: usize) -> Result<(), AssemblerError> {
         let end = checked_fragment_end(offset, data.len())?;
 

@@ -604,7 +604,6 @@ impl InterfaceInner {
                 let advert = Icmpv6Repr::Ndisc(NdiscRepr::NeighborAdvert {
                     flags: NdiscNeighborFlags::SOLICITED | NdiscNeighborFlags::OVERRIDE,
                     target_addr,
-                    #[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
                     lladdr: Some(self.hardware_addr.into()),
                 });
                 let ip_repr = Ipv6Repr {

@@ -139,10 +139,6 @@ fn bpf_ifreq_for(name: &str) -> io::Result<BpfIfreq> {
     ifreq_for(name)
 }
 
-fn invalid_bpf_record() -> io::Error {
-    io::Error::new(io::ErrorKind::InvalidData, "invalid BPF packet header")
-}
-
 impl BpfDevice {
     pub fn new(name: &str, _medium: Medium) -> io::Result<BpfDevice> {
         let ifreq = bpf_ifreq_for(name)?;
@@ -258,7 +254,10 @@ impl BpfDevice {
             }
             Err(_) => {
                 self.read_offset = self.read_len;
-                Err(invalid_bpf_record())
+                Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "invalid BPF record",
+                ))
             }
         }
     }

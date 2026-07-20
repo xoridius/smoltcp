@@ -598,13 +598,7 @@ const DUP_ACK_THRESHOLD: u8 = 3;
 const PAWS_EXPIRY_MICROS: i64 = 24 * 24 * 60 * 60 * 1_000_000;
 
 bitflags::bitflags! {
-    /// Packed bool fields on `Socket`. Packing them together saves
-    /// ~8 bytes of inter-field padding the compiler would otherwise emit
-    /// between scattered `bool` fields (`rx_fin_received`,
-    /// `remote_last_win_unscaled`, `remote_has_sack`, `nagle`,
-    /// `synack_paused`, `rx_window_update_dirty`). This matches the same
-    /// `bitflags!`-based packing style used by `wire::dns::Flags`,
-    /// `wire::dhcpv4::Flags`, etc.
+    /// Per-socket boolean and validity state packed into one word.
     struct Flags: u16 {
         const RX_FIN_RECEIVED        = 1 << 0;
         const REMOTE_LAST_WIN_UNSCALED = 1 << 1;
@@ -902,16 +896,8 @@ impl<'a> Socket<'a> {
         state.pool.as_ref().is_none_or(|p| p.available() >= need)
     }
 
-    /// Compute the next target capacity given the current size, the
-    /// per-flow max, and the chunk floor. Geometric (×2) growth amortizes
-    /// the O(len) memcpy across grow steps to O(total), matching how
-    /// Linux's `tcp_rcv_space_adjust` doubles `rcv_space.space` and how
-    /// `tcp_sndbuf_expand` derives `sndmem` from `cwnd × MSS × factor`.
-    ///
-    /// Under pool pressure we fall back to linear `+chunk` growth so a
-    /// single socket can't drain the global budget out from under others —
-    /// the smoltcp analogue of Linux suppressing autotuning when
-    /// `tcp_under_memory_pressure(sk)` is true.
+    /// Compute the next capacity. Geometric growth amortizes copying; under
+    /// pool pressure, grow by one chunk to preserve capacity for other flows.
     #[cfg(feature = "socket-tcp-dynamic-buffer")]
     fn next_capacity(cur: usize, chunk: usize, max: usize, pressure: bool) -> usize {
         if cur >= max {
@@ -930,10 +916,8 @@ impl<'a> Socket<'a> {
     /// shared pool via `state`. Shared by the rx and tx grow paths; the
     /// only difference between them is which buffer and which cap.
     ///
-    /// Returns `true` if any growth happened. Silent failure (pool
-    /// exhaustion, already at max, allocation refused) leaves the buffer
-    /// at its current size — the kernel-canonical "advertise zero / small
-    /// window (rx) or backpressure the writer (tx) on pressure" signal.
+    /// Returns `true` if the buffer grew. Failure leaves its capacity unchanged,
+    /// applying receive flow control or transmit backpressure as appropriate.
     #[cfg(feature = "socket-tcp-dynamic-buffer")]
     fn try_grow_buffer(
         buffer: &mut SocketBuffer<'a>,
@@ -1889,14 +1873,8 @@ impl<'a> Socket<'a> {
             return Err(SendError::InvalidState);
         }
 
-        // Dynamic-buffer tx growth: if the caller is about to enqueue and
-        // the tx buffer is near-full, try to grow up to tx_max. One grow
-        // per call (geometric step) matches the kernel cadence — Linux's
-        // `tcp_sndbuf_expand` runs per ACK; XNU's auto-snd-grow fires once
-        // when sb_cc crosses 7/8 of sb_hiwat. Failure is silent: the
-        // enqueue copies fewer bytes and the caller sees backpressure via
-        // the returned `n`. Window check first (cheapest discriminating
-        // guard) so a non-full buffer short-circuits immediately.
+        // Grow one step when less than a chunk remains. Failure is exposed as
+        // partial enqueue/backpressure through the returned byte count.
         #[cfg(feature = "socket-tcp-dynamic-buffer")]
         if let Some(state) = self.dyn_state.as_ref()
             && self.tx_buffer.window() < state.grow_chunk as usize
@@ -3012,11 +2990,9 @@ impl<'a> Socket<'a> {
             }
         }
 
-        // Fork-conservative subset of RFC 7323 §5.3 R3: update TS.Recent only
-        // when the segment was at the left window edge when it arrived.
-        // Updating on out-of-order or pure
-        // duplicate segments would let a delayed packet poison PAWS state and
-        // cause us to reject the in-order segments that follow.
+        // Approximate RFC 7323 §5.3 R3 without tracking Last.ACK.sent: update
+        // TS.Recent only at the left window edge. Out-of-order or duplicate
+        // segments could otherwise poison PAWS state for in-order data.
         if let Some(timestamp) = repr.timestamp
             && self.timestamp_active()
             && segment_start == window_start
@@ -3596,11 +3572,8 @@ impl<'a> Socket<'a> {
 
         self.congestion_controller.pre_transmit(cx.now());
 
-        // `seq_to_transmit` is called twice in the original flow (once for the
-        // retransmit check, once for the send decision below); both look at the
-        // same MSS/window/cwnd state. Cache it. If the retransmit branch fires
-        // it rewinds `remote_last_seq` so the cached value is stale — refresh
-        // it there.
+        // Cache `seq_to_transmit` across the retransmit and send checks. A
+        // timer-driven cursor rewind invalidates it, so recompute below.
         let retransmit_due = self.timer.should_retransmit(cx.now());
         let mut no_control_retry = self.no_control_retry_eligible() && !retransmit_due;
         let mut want_send =
@@ -3966,8 +3939,7 @@ impl<'a> Socket<'a> {
                 && (self.state == State::SynSent || self.listen_endpoint.port != 0)
             {
                 previous_snd_ts_ok = Some(self.flags.contains(Flags::SND_TS_OK));
-                self.flags
-                    .set(Flags::SND_TS_OK, repr.timestamp.is_some());
+                self.flags.set(Flags::SND_TS_OK, repr.timestamp.is_some());
             }
         }
 
