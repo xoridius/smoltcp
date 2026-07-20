@@ -564,7 +564,7 @@ pub struct Socket<'a> {
     /// The congestion control algorithm.
     congestion_controller: congestion::AnyController,
 
-    /// Configured TSval generator; TIMESTAMP_ACTIVE tracks current-TCB negotiation.
+    /// Configured TSval generator; SND_TS_OK tracks per-TCB negotiation.
     tsval_generator: Option<TcpTimestampGenerator>,
 
     /// Most recently accepted TSval. Valid only while REMOTE_TSVAL_VALID is set.
@@ -638,8 +638,8 @@ bitflags::bitflags! {
         const REMOTE_TSVAL_VALID     = 1 << 11;
         /// remote_last_ts contains a valid peer-activity timestamp.
         const REMOTE_LAST_TS_VALID   = 1 << 12;
-        /// TCP timestamps are active for the current TCB.
-        const TIMESTAMP_ACTIVE       = 1 << 13;
+        /// RFC 7323 Snd.TS.OK. In SYN-SENT, records a transmitted TS offer.
+        const SND_TS_OK              = 1 << 13;
     }
 }
 
@@ -1064,7 +1064,6 @@ impl<'a> Socket<'a> {
     /// Enable or disable TCP Timestamp.
     pub fn set_tsval_generator(&mut self, generator: Option<TcpTimestampGenerator>) {
         self.tsval_generator = generator;
-        self.flags.set(Flags::TIMESTAMP_ACTIVE, generator.is_some());
         if generator.is_none() {
             self.set_remote_tsval(None);
         }
@@ -1072,7 +1071,7 @@ impl<'a> Socket<'a> {
 
     /// Return whether TCP Timestamp is enabled.
     pub fn timestamp_enabled(&self) -> bool {
-        self.flags.contains(Flags::TIMESTAMP_ACTIVE)
+        self.tsval_generator.is_some()
     }
 
     /// Set an algorithm for congestion control.
@@ -1432,6 +1431,11 @@ impl<'a> Socket<'a> {
     }
 
     #[inline]
+    fn timestamp_active(&self) -> bool {
+        self.flags.contains(Flags::SND_TS_OK) && self.timestamp_enabled()
+    }
+
+    #[inline]
     fn remote_tsval_is_older(&self, tsval: u32) -> bool {
         let Some(recent) = self.remote_tsval() else {
             return false;
@@ -1464,9 +1468,9 @@ impl<'a> Socket<'a> {
 
     #[inline]
     fn negotiate_timestamps(&mut self, timestamp: Option<TcpTimestampRepr>, now: Instant) {
-        let active = self.tsval_generator.is_some() && timestamp.is_some();
-        self.flags.set(Flags::TIMESTAMP_ACTIVE, active);
-        let recent = if active {
+        let negotiated = self.flags.contains(Flags::SND_TS_OK) && timestamp.is_some();
+        self.flags.set(Flags::SND_TS_OK, negotiated);
+        let recent = if negotiated {
             timestamp.map(|timestamp| (timestamp.tsval, now))
         } else {
             None
@@ -1535,8 +1539,7 @@ impl<'a> Socket<'a> {
         self.reset_congestion_controller();
         self.set_remote_last_ts(None);
         self.set_remote_tsval(None);
-        self.flags
-            .set(Flags::TIMESTAMP_ACTIVE, self.tsval_generator.is_some());
+        self.flags.remove(Flags::SND_TS_OK);
         self.ack_delay_timer = AckDelayTimer::Idle;
         self.challenge_ack_timer = Instant::from_secs(0);
 
@@ -2105,6 +2108,10 @@ impl<'a> Socket<'a> {
 
         self.state = state;
 
+        if old_state == State::SynSent && state == State::Closed {
+            self.flags.remove(Flags::SND_TS_OK);
+        }
+
         if !matches!(state, State::Established | State::CloseWait) {
             self.cancel_no_control_retry();
         }
@@ -2162,7 +2169,7 @@ impl<'a> Socket<'a> {
 
     fn ack_reply(&mut self, ip_repr: &IpRepr, repr: &TcpRepr) -> (IpRepr, TcpRepr<'static>) {
         let (mut ip_reply_repr, mut reply_repr) = Self::reply(ip_repr, repr);
-        reply_repr.timestamp = if self.timestamp_enabled() {
+        reply_repr.timestamp = if self.timestamp_active() {
             TcpTimestampRepr::generate_reply_with_tsval(
                 self.tsval_generator,
                 self.remote_tsval().unwrap_or(0),
@@ -2301,7 +2308,7 @@ impl<'a> Socket<'a> {
         // connections. RST is exempt and must not age or mutate TS.Recent.
         if !matches!(self.state, State::Listen | State::SynSent)
             && repr.control != TcpControl::Rst
-            && self.timestamp_enabled()
+            && self.timestamp_active()
             && let Some(timestamp) = repr.timestamp
             && self.remote_tsval_is_older(timestamp.tsval)
         {
@@ -2649,7 +2656,8 @@ impl<'a> Socket<'a> {
                 if self.remote_win_scale.is_none() {
                     self.remote_win_shift = 0;
                 }
-                self.negotiate_timestamps(repr.timestamp, cx.now());
+                let timestamp = repr.timestamp.map(|timestamp| (timestamp.tsval, cx.now()));
+                self.set_remote_tsval(timestamp);
                 self.set_state(State::SynReceived);
                 self.timer.set_for_idle(cx.now(), self.keep_alive);
             }
@@ -3010,7 +3018,7 @@ impl<'a> Socket<'a> {
         // duplicate segments would let a delayed packet poison PAWS state and
         // cause us to reject the in-order segments that follow.
         if let Some(timestamp) = repr.timestamp
-            && self.timestamp_enabled()
+            && self.timestamp_active()
             && segment_start == window_start
             && self.remote_tsval_can_update(timestamp.tsval)
         {
@@ -3299,7 +3307,7 @@ impl<'a> Socket<'a> {
         // Timestamps (RFC 7323) cost 12 bytes (10 + 2 NOP for alignment). This
         // is an approximation of the exact accounting in the dispatch path,
         // which subtracts the actual emitted option length.
-        let options_len = if self.timestamp_enabled() { 12 } else { 0 };
+        let options_len = if self.timestamp_active() { 12 } else { 0 };
 
         // Max segment size we're able to send due to MTU limitations.
         let local_mss = cx.ip_mtu() - ip_header_len - TCP_HEADER_LEN;
@@ -3763,7 +3771,11 @@ impl<'a> Socket<'a> {
             max_seg_size: None,
             sack_permitted: false,
             sack_ranges: [None, None, None],
-            timestamp: if self.timestamp_enabled() {
+            timestamp: if self.timestamp_active()
+                || (self.state == State::SynSent
+                    && self.local_seq_next == self.local_seq_no
+                    && self.timestamp_enabled())
+            {
                 TcpTimestampRepr::generate_reply_with_tsval(
                     self.tsval_generator,
                     self.remote_tsval().unwrap_or(0),
@@ -3800,6 +3812,16 @@ impl<'a> Socket<'a> {
                 } else {
                     repr.sack_permitted = self.flags.contains(Flags::REMOTE_HAS_SACK);
                     repr.window_scale = self.remote_win_scale.map(|_| self.remote_win_shift);
+                    if self.listen_endpoint.port != 0
+                        && self.local_seq_next == self.local_seq_no
+                        && self.remote_tsval().is_some()
+                        && self.timestamp_enabled()
+                    {
+                        repr.timestamp = TcpTimestampRepr::generate_reply_with_tsval(
+                            self.tsval_generator,
+                            self.remote_tsval().unwrap_or(0),
+                        );
+                    }
                 }
             }
 
@@ -3934,10 +3956,19 @@ impl<'a> Socket<'a> {
             tcp_trace!("sending {}", flags);
         }
 
+        let mut previous_snd_ts_ok = None;
         if repr.control == TcpControl::Syn {
             // Fill the MSS option. See RFC 6691 for an explanation of this calculation.
             let max_segment_size = cx.ip_mtu() - ip_repr.header_len() - TCP_HEADER_LEN;
             repr.max_seg_size = Some(max_segment_size as u16);
+
+            if self.local_seq_next == self.local_seq_no
+                && (self.state == State::SynSent || self.listen_endpoint.port != 0)
+            {
+                previous_snd_ts_ok = Some(self.flags.contains(Flags::SND_TS_OK));
+                self.flags
+                    .set(Flags::SND_TS_OK, repr.timestamp.is_some());
+            }
         }
 
         // Actually send the packet. If this succeeds, it means the packet is in
@@ -3950,6 +3981,9 @@ impl<'a> Socket<'a> {
         ip_repr.set_payload_len(repr.buffer_len());
         debug_assert!(!no_control_retry || !repr.payload.is_empty());
         if let Err(err) = emit(cx, (ip_repr, repr)) {
+            if let Some(previous) = previous_snd_ts_ok {
+                self.flags.set(Flags::SND_TS_OK, previous);
+            }
             if no_control_retry {
                 self.remote_last_seq = normal_tx_cursor;
             }
@@ -4462,6 +4496,13 @@ mod test {
 
     fn socket_established() -> TestSocket {
         socket_established_with_buffer_sizes(64, 64)
+    }
+
+    fn socket_established_with_timestamps(generator: TcpTimestampGenerator) -> TestSocket {
+        let mut s = socket_established();
+        s.set_tsval_generator(Some(generator));
+        s.flags.insert(Flags::SND_TS_OK);
+        s
     }
 
     fn socket_fin_wait_1() -> TestSocket {
@@ -7043,8 +7084,7 @@ mod test {
         const EFFECTIVE_MSS: usize = 64;
 
         // construct socket where remote MSS is less than local MSS
-        let mut s = socket_established();
-        s.set_tsval_generator(Some(|| 1));
+        let mut s = socket_established_with_timestamps(|| 1);
         s.remote_mss = EFFECTIVE_MSS as u32;
 
         // Payload should contain 12 bytes less due to timestamp
@@ -7068,6 +7108,7 @@ mod test {
         // construct socket where remote MSS is more than local MSS
         let mut s = socket_established_with_buffer_sizes(EFFECTIVE_MSS, 64);
         s.set_tsval_generator(Some(|| 1));
+        s.flags.insert(Flags::SND_TS_OK);
         s.remote_mss = 9999;
         s.remote_win_len = 9999;
 
@@ -7145,6 +7186,7 @@ mod test {
         let mut s = socket_established_with_buffer_sizes(256, 64);
         s.set_nagle_enabled(true);
         s.set_tsval_generator(Some(|| 1));
+        s.flags.insert(Flags::SND_TS_OK);
         s.remote_mss = EFFECTIVE_MSS as u32;
 
         // Send small segment to "arm" Nagle's
@@ -12630,8 +12672,7 @@ mod test {
 
     #[test]
     fn test_tsval_established_connection() {
-        let mut s = socket_established();
-        s.set_tsval_generator(Some(|| 1));
+        let mut s = socket_established_with_timestamps(|| 1);
 
         assert!(s.timestamp_enabled());
 
@@ -12682,7 +12723,7 @@ mod test {
     }
 
     #[test]
-    fn test_tsval_disabled_in_remote_client() {
+    fn test_tsval_not_negotiated_by_remote_client() {
         let mut s = socket_listen();
         s.set_tsval_generator(Some(|| 1));
         assert!(s.timestamp_enabled());
@@ -12697,7 +12738,8 @@ mod test {
         );
         assert_eq!(s.state(), State::SynReceived);
         assert_eq!(s.tuple, Some(TUPLE));
-        assert!(!s.timestamp_enabled());
+        assert!(s.timestamp_enabled());
+        assert!(!s.timestamp_active());
         recv!(
             s,
             [TcpRepr {
@@ -12763,7 +12805,7 @@ mod test {
     }
 
     #[test]
-    fn test_tsval_disabled_in_remote_server() {
+    fn test_tsval_not_negotiated_by_remote_server() {
         let mut s = socket();
         s.set_tsval_generator(Some(|| 1));
         assert!(s.timestamp_enabled());
@@ -12797,7 +12839,8 @@ mod test {
                 ..SEND_TEMPL
             }
         );
-        assert!(!s.timestamp_enabled());
+        assert!(s.timestamp_enabled());
+        assert!(!s.timestamp_active());
         s.send_slice(b"abcdef").unwrap();
         recv!(
             s,
@@ -12859,6 +12902,156 @@ mod test {
         );
     }
 
+    #[test]
+    fn failed_timestamped_syn_does_not_change_untimestamped_retry() {
+        let mut s = socket_syn_sent();
+        s.set_tsval_generator(Some(|| 100));
+
+        let result: Result<(), ()> = s.socket.dispatch(&mut s.cx, |_, (_, repr)| {
+            assert_eq!(repr.timestamp, Some(TcpTimestampRepr::new(100, 0)));
+            Err(())
+        });
+        assert_eq!(result, Err(()));
+        assert_eq!(s.local_seq_next, s.local_seq_no);
+        assert!(!s.flags.contains(Flags::SND_TS_OK));
+
+        s.set_tsval_generator(None);
+        recv(&mut s, Instant::ZERO, |result| {
+            assert_eq!(result.unwrap().timestamp, None)
+        });
+
+        s.set_tsval_generator(Some(|| 100));
+        s.timer.set_for_fast_retransmit();
+        recv(&mut s, Instant::ZERO, |result| {
+            assert_eq!(result.unwrap().timestamp, None)
+        });
+        let _ = send(
+            &mut s,
+            Instant::ZERO,
+            &TcpRepr {
+                control: TcpControl::Syn,
+                seq_number: REMOTE_SEQ,
+                ack_number: Some(LOCAL_SEQ + 1),
+                timestamp: Some(TcpTimestampRepr::new(500, 0)),
+                ..SEND_TEMPL
+            },
+        );
+        assert_eq!(s.state(), State::Established);
+        assert!(!s.timestamp_active());
+        assert_eq!(s.remote_tsval(), None);
+    }
+
+    #[test]
+    fn timestamped_syn_offer_survives_temporary_disable() {
+        let mut s = socket_syn_sent();
+        s.set_tsval_generator(Some(|| 100));
+        recv(&mut s, Instant::ZERO, |result| {
+            assert_eq!(
+                result.unwrap().timestamp,
+                Some(TcpTimestampRepr::new(100, 0))
+            )
+        });
+        assert!(s.flags.contains(Flags::SND_TS_OK));
+
+        s.set_tsval_generator(None);
+        let _ = send(
+            &mut s,
+            Instant::ZERO,
+            &TcpRepr {
+                control: TcpControl::Syn,
+                seq_number: REMOTE_SEQ,
+                ack_number: Some(LOCAL_SEQ + 1),
+                timestamp: Some(TcpTimestampRepr::new(500, 100)),
+                ..SEND_TEMPL
+            },
+        );
+        assert_eq!(s.state(), State::Established);
+        assert!(!s.timestamp_active());
+        assert_eq!(s.remote_tsval(), Some(500));
+
+        s.set_tsval_generator(Some(|| 100));
+        assert!(s.timestamp_active());
+    }
+
+    #[test]
+    fn timestamped_syn_offer_does_not_enable_abort_rst() {
+        let mut s = socket_syn_sent();
+        s.set_tsval_generator(Some(|| 100));
+        recv(&mut s, Instant::ZERO, |_| {});
+
+        s.abort();
+        recv(&mut s, Instant::ZERO, |result| {
+            let repr = result.unwrap();
+            assert_eq!((repr.control, repr.timestamp), (TcpControl::Rst, None));
+        });
+    }
+
+    #[test]
+    fn simultaneous_open_does_not_add_a_late_timestamp_offer() {
+        let mut s = socket_syn_sent();
+        recv(&mut s, Instant::ZERO, |result| {
+            assert_eq!(result.unwrap().timestamp, None)
+        });
+
+        s.set_tsval_generator(Some(|| 100));
+        let _ = send(
+            &mut s,
+            Instant::ZERO,
+            &TcpRepr {
+                control: TcpControl::Syn,
+                seq_number: REMOTE_SEQ,
+                ack_number: None,
+                timestamp: Some(TcpTimestampRepr::new(500, 0)),
+                ..SEND_TEMPL
+            },
+        );
+        assert_eq!(s.state(), State::SynReceived);
+        assert!(!s.timestamp_active());
+        recv(&mut s, Instant::ZERO, |result| {
+            assert_eq!(result.unwrap().timestamp, None)
+        });
+    }
+
+    #[cfg(feature = "socket-tcp-pause-synack")]
+    #[test]
+    fn paused_synack_without_timestamp_does_not_negotiate_timestamps() {
+        let mut s = socket_listen();
+        s.set_tsval_generator(Some(|| 100));
+        s.pause_synack(true);
+        let _ = send(
+            &mut s,
+            Instant::ZERO,
+            &TcpRepr {
+                control: TcpControl::Syn,
+                seq_number: REMOTE_SEQ,
+                ack_number: None,
+                timestamp: Some(TcpTimestampRepr::new(500, 0)),
+                ..SEND_TEMPL
+            },
+        );
+        assert_eq!(s.state(), State::SynReceived);
+        recv_nothing!(s);
+
+        s.set_tsval_generator(None);
+        s.pause_synack(false);
+        recv(&mut s, Instant::ZERO, |result| {
+            assert_eq!(result.unwrap().timestamp, None)
+        });
+        let _ = send(
+            &mut s,
+            Instant::ZERO,
+            &TcpRepr {
+                seq_number: REMOTE_SEQ + 1,
+                ack_number: Some(LOCAL_SEQ + 1),
+                ..SEND_TEMPL
+            },
+        );
+        assert_eq!(s.state(), State::Established);
+
+        s.set_tsval_generator(Some(|| 100));
+        assert!(!s.timestamp_active());
+    }
+
     // =========================================================================================//
     // PAWS (RFC 7323 §5.3): segments whose timestamp is older than TS.Recent
     // must be dropped and a challenge ACK sent. TS.Recent must only update
@@ -12902,8 +13095,7 @@ mod test {
 
     #[test]
     fn paws_zero_tsval_from_data_is_valid() {
-        let mut s = socket_established();
-        s.set_tsval_generator(Some(|| 100));
+        let mut s = socket_established_with_timestamps(|| 100);
 
         let _ = send(
             &mut s,
@@ -12934,8 +13126,7 @@ mod test {
 
     #[test]
     fn paws_exact_half_space_is_not_older() {
-        let mut s = socket_established();
-        s.set_tsval_generator(Some(|| 100));
+        let mut s = socket_established_with_timestamps(|| 100);
 
         let _ = send(
             &mut s,
@@ -13001,6 +13192,31 @@ mod test {
     }
 
     #[test]
+    fn configuring_timestamps_does_not_negotiate_established_connection() {
+        let mut s = socket_established();
+        s.set_tsval_generator(Some(|| 100));
+        assert!(s.timestamp_enabled());
+
+        s.send_slice(b"ab").unwrap();
+        let mut outgoing_timestamp = None;
+        recv(&mut s, Instant::from_millis(0), |result| {
+            outgoing_timestamp = result.unwrap().timestamp;
+        });
+
+        let _ = send(
+            &mut s,
+            Instant::from_millis(1),
+            &TcpRepr {
+                seq_number: REMOTE_SEQ + 1,
+                ack_number: Some(LOCAL_SEQ + 3),
+                timestamp: Some(TcpTimestampRepr::new(500, 0)),
+                ..SEND_TEMPL
+            },
+        );
+        assert_eq!((outgoing_timestamp, s.remote_tsval()), (None, None));
+    }
+
+    #[test]
     fn timestamp_capability_survives_failed_no_ts_passive_open() {
         let mut s = socket_listen();
         s.set_tsval_generator(Some(|| 100));
@@ -13031,6 +13247,8 @@ mod test {
             }
         );
         assert_eq!(s.state(), State::Listen);
+        assert!(s.timestamp_enabled());
+        assert!(!s.timestamp_active());
 
         send!(
             s,
@@ -13054,22 +13272,40 @@ mod test {
 
     #[test]
     fn timestamp_disable_then_reenable_does_not_restore_old_paws_history() {
-        let mut s = socket_established();
+        let mut s = socket_listen();
         s.set_tsval_generator(Some(|| 100));
 
-        let _ = send(
-            &mut s,
-            Instant::from_millis(0),
-            &TcpRepr {
-                seq_number: REMOTE_SEQ + 1,
-                ack_number: Some(LOCAL_SEQ + 1),
-                payload: &b"ab"[..],
+        send!(
+            s,
+            TcpRepr {
+                control: TcpControl::Syn,
+                seq_number: REMOTE_SEQ,
+                ack_number: None,
                 timestamp: Some(TcpTimestampRepr::new(500, 0)),
                 ..SEND_TEMPL
-            },
+            }
         );
+        recv(&mut s, Instant::from_millis(0), |result| {
+            assert_eq!(
+                result.unwrap().timestamp,
+                Some(TcpTimestampRepr::new(100, 500))
+            );
+        });
+        send!(
+            s,
+            time 1,
+            TcpRepr {
+                seq_number: REMOTE_SEQ + 1,
+                ack_number: Some(LOCAL_SEQ + 1),
+                timestamp: Some(TcpTimestampRepr::new(501, 100)),
+                ..SEND_TEMPL
+            }
+        );
+        assert_eq!(s.state(), State::Established);
+
         s.set_tsval_generator(None);
         assert!(!s.timestamp_enabled());
+        assert_eq!(s.remote_tsval(), None);
         s.set_tsval_generator(Some(|| 100));
         assert!(s.timestamp_enabled());
 
@@ -13077,7 +13313,7 @@ mod test {
             &mut s,
             Instant::from_millis(1_100),
             &TcpRepr {
-                seq_number: REMOTE_SEQ + 3,
+                seq_number: REMOTE_SEQ + 1,
                 ack_number: Some(LOCAL_SEQ + 1),
                 payload: &b"cd"[..],
                 timestamp: Some(TcpTimestampRepr::new(100, 0)),
@@ -13085,13 +13321,21 @@ mod test {
             },
         );
         assert_eq!(reply, None);
-        assert_eq!(s.recv_queue(), 4);
+        assert_eq!(s.remote_tsval(), Some(100));
+        assert_eq!(s.recv_queue(), 2);
+
+        s.send_slice(b"ef").unwrap();
+        recv(&mut s, Instant::from_millis(1_101), |result| {
+            assert_eq!(
+                result.unwrap().timestamp,
+                Some(TcpTimestampRepr::new(100, 100))
+            );
+        });
     }
 
     #[test]
     fn paws_accepts_wrapped_timestamp_after_24_days() {
-        let mut s = socket_established();
-        s.set_tsval_generator(Some(|| 100));
+        let mut s = socket_established_with_timestamps(|| 100);
 
         let _ = send(
             &mut s,
@@ -13135,8 +13379,7 @@ mod test {
 
     #[test]
     fn paws_timestamp_is_not_stale_at_exactly_24_days() {
-        let mut s = socket_established();
-        s.set_tsval_generator(Some(|| 100));
+        let mut s = socket_established_with_timestamps(|| 100);
 
         let _ = send(
             &mut s,
@@ -13167,8 +13410,7 @@ mod test {
 
     #[test]
     fn paws_equal_in_sequence_timestamp_refreshes_observation_age() {
-        let mut s = socket_established();
-        s.set_tsval_generator(Some(|| 100));
+        let mut s = socket_established_with_timestamps(|| 100);
 
         let _ = send(
             &mut s,
@@ -13210,8 +13452,7 @@ mod test {
 
     #[test]
     fn paws_rejected_segment_does_not_refresh_observation_age() {
-        let mut s = socket_established();
-        s.set_tsval_generator(Some(|| 100));
+        let mut s = socket_established_with_timestamps(|| 100);
 
         let _ = send(
             &mut s,
@@ -13253,8 +13494,7 @@ mod test {
 
     #[test]
     fn paws_clock_rollback_is_conservative() {
-        let mut s = socket_established();
-        s.set_tsval_generator(Some(|| 100));
+        let mut s = socket_established_with_timestamps(|| 100);
 
         let _ = send(
             &mut s,
@@ -13285,8 +13525,7 @@ mod test {
 
     #[test]
     fn paws_elapsed_time_overflow_is_conservative() {
-        let mut s = socket_established();
-        s.set_tsval_generator(Some(|| 100));
+        let mut s = socket_established_with_timestamps(|| 100);
 
         let _ = send(
             &mut s,
@@ -13366,8 +13605,7 @@ mod test {
 
     #[test]
     fn paws_old_rst_is_accepted_without_updating_history() {
-        let mut s = socket_established();
-        s.set_tsval_generator(Some(|| 100));
+        let mut s = socket_established_with_timestamps(|| 100);
 
         let _ = send(
             &mut s,
@@ -13404,8 +13642,7 @@ mod test {
 
     #[test]
     fn paws_precedes_duplicate_ack_admission() {
-        let mut s = socket_established();
-        s.set_tsval_generator(Some(|| 100));
+        let mut s = socket_established_with_timestamps(|| 100);
 
         let _ = send(
             &mut s,
@@ -13441,8 +13678,7 @@ mod test {
 
     #[test]
     fn test_paws_rejects_older_tsval() {
-        let mut s = socket_established();
-        s.set_tsval_generator(Some(|| 100));
+        let mut s = socket_established_with_timestamps(|| 100);
 
         // First in-order segment with tsval=500 sets TS.Recent = 500.
         let _ = send(
@@ -13498,8 +13734,7 @@ mod test {
         // Two in-order segments with monotonically increasing tsvals must both
         // be accepted; this guards against the PAWS check rejecting normal
         // traffic.
-        let mut s = socket_established();
-        s.set_tsval_generator(Some(|| 100));
+        let mut s = socket_established_with_timestamps(|| 100);
         let _ = send(
             &mut s,
             Instant::from_millis(0),
