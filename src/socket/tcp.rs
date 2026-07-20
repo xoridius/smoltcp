@@ -627,6 +627,8 @@ bitflags::bitflags! {
         const REMOTE_LAST_TS_VALID   = 1 << 10;
         /// RFC 7323 Snd.TS.OK. In SYN-SENT, records a transmitted TS offer.
         const SND_TS_OK              = 1 << 11;
+        /// RecoveryPoint was recorded by an RTO, not fast recovery.
+        const RECOVERY_AFTER_RTO     = 1 << 12;
     }
 }
 
@@ -1355,6 +1357,8 @@ impl<'a> Socket<'a> {
     fn set_recovery_point(&mut self, point: Option<TcpSeqNumber>) {
         if let Some(point) = point {
             self.recovery_point = point;
+        } else {
+            self.flags.remove(Flags::RECOVERY_AFTER_RTO);
         }
         self.flags.set(Flags::RECOVERY_ACTIVE, point.is_some());
     }
@@ -2816,6 +2820,7 @@ impl<'a> Socket<'a> {
                         // RFC 6582/6675: remember how far we had sent when
                         // recovery began; ACKs below this are partial ACKs.
                         self.set_recovery_point(Some(self.local_seq_next));
+                        self.flags.remove(Flags::RECOVERY_AFTER_RTO);
                         self.flags.remove(Flags::SACK_REDUNDANT_PASS);
                         net_debug!("started fast retransmit");
                     }
@@ -2879,12 +2884,14 @@ impl<'a> Socket<'a> {
                 net_debug!("ignoring SACK blocks because SACK was not locally advertised");
             }
 
-            let partial_recovery_ack = matches!(
+            let below_recovery_point = matches!(
                 self.recovery_point(),
                 Some(recovery_point) if ack_len > 0 && ack_number < recovery_point
             );
-            let should_rewind_partial_ack = partial_recovery_ack
-                && (self.congestion_controller.manages_window()
+            let recovery_after_rto = self.flags.contains(Flags::RECOVERY_AFTER_RTO);
+            let partial_recovery_ack = below_recovery_point && !recovery_after_rto;
+            let should_rewind_partial_ack = below_recovery_point
+                && ((!recovery_after_rto && self.congestion_controller.manages_window())
                     || !self.sack_scoreboard.is_empty());
 
             match self.recovery_point() {
@@ -3494,6 +3501,7 @@ impl<'a> Socket<'a> {
                 // SACK evidence can guide the retransmission walk; a
                 // cumulative ACK reaching this point completes recovery.
                 self.set_recovery_point(Some(self.local_seq_next));
+                self.flags.insert(Flags::RECOVERY_AFTER_RTO);
                 self.flags.remove(Flags::SACK_REDUNDANT_PASS);
             } else {
                 net_debug!("retransmitting for fast-retransmit");
@@ -8994,6 +9002,62 @@ mod test {
             }));
         }
         assert!(s.sack_scoreboard.is_empty());
+    }
+
+    #[cfg(any(feature = "socket-tcp-reno", feature = "socket-tcp-cubic"))]
+    #[test]
+    fn partial_ack_after_rto_resumes_congestion_control() {
+        for controller in managed_controllers() {
+            let mut s = socket_with_four_segments_in_flight();
+            s.set_congestion_control(controller);
+            s.congestion_controller.set_mss(6);
+            let una = s.local_seq_no;
+            let recovery_point = s.local_seq_next;
+
+            recv!(s, time 5000, Ok(TcpRepr {
+                seq_number: una,
+                ack_number: Some(REMOTE_SEQ + 1),
+                payload:    &b"xxxxxx"[..],
+                ..RECV_TEMPL
+            }));
+            assert_eq!(s.congestion_controller.window(), 6);
+            assert!(s.flags.contains(Flags::RECOVERY_AFTER_RTO));
+
+            send!(s, time 5010, TcpRepr {
+                seq_number: REMOTE_SEQ + 1,
+                ack_number: Some(una + 6),
+                ..SEND_TEMPL
+            });
+
+            assert_eq!(s.recovery_point(), Some(recovery_point));
+            assert_eq!(s.congestion_controller.window(), 12);
+
+            for (time, offset, payload) in [(5020, 6, &b"yyyyyy"[..]), (5025, 12, &b"wwwwww"[..])] {
+                recv!(s, time time, Ok(TcpRepr {
+                    seq_number: una + offset,
+                    ack_number: Some(REMOTE_SEQ + 1),
+                    payload,
+                    ..RECV_TEMPL
+                }));
+            }
+            assert_eq!(s.remote_last_seq, una + 18);
+
+            send!(s, time 5030, TcpRepr {
+                seq_number: REMOTE_SEQ + 1,
+                ack_number: Some(una + 12),
+                ..SEND_TEMPL
+            });
+            assert!(s.congestion_controller.window() > 12);
+            assert_eq!(s.remote_last_seq, una + 18);
+
+            send!(s, time 5040, TcpRepr {
+                seq_number: REMOTE_SEQ + 1,
+                ack_number: Some(recovery_point),
+                ..SEND_TEMPL
+            });
+            assert!(s.recovery_point().is_none());
+            assert!(!s.flags.contains(Flags::RECOVERY_AFTER_RTO));
+        }
     }
 
     #[test]
