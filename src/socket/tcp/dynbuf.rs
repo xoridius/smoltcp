@@ -251,6 +251,13 @@ impl DynamicBufferState {
     }
 
     pub(super) fn allocate_initial(&mut self) -> (Vec<u8>, Vec<u8>) {
+        self.allocate_initial_with(try_zeroed_socket_storage)
+    }
+
+    fn allocate_initial_with<F>(&mut self, mut allocate: F) -> (Vec<u8>, Vec<u8>)
+    where
+        F: FnMut(usize) -> Option<Vec<u8>>,
+    {
         let rx_initial = self.rx_initial as usize;
         let tx_initial = self.tx_initial as usize;
         let Some(charge) = combined_initial_capacity(rx_initial, tx_initial) else {
@@ -260,10 +267,7 @@ impl DynamicBufferState {
             return (Vec::new(), Vec::new());
         }
 
-        match (
-            try_zeroed_socket_storage(rx_initial),
-            try_zeroed_socket_storage(tx_initial),
-        ) {
+        match (allocate(rx_initial), allocate(tx_initial)) {
             (Some(rx_storage), Some(tx_storage)) => (rx_storage, tx_storage),
             _ => {
                 self.refund(charge);
@@ -425,6 +429,33 @@ mod test {
         assert_eq!(state.tx_initial, 1 << 30);
         assert_eq!(state.tx_capacity_max(), 1 << 30);
         assert_eq!(state.grow_chunk, 1);
+    }
+
+    #[test]
+    fn initial_second_allocation_failure_rolls_back_reservation() {
+        let pool = MemoryPool::new(6144);
+        let mut state = DynamicBufferState::new(
+            DynamicBufferConfig {
+                rx_initial: 4096,
+                rx_max: 8192,
+                tx_initial: 2048,
+                tx_max: 4096,
+                grow_chunk: 4096,
+            },
+            Some(pool.clone()),
+        );
+        let mut calls = 0;
+
+        let (rx_storage, tx_storage) = state.allocate_initial_with(|capacity| {
+            calls += 1;
+            (calls == 1).then(|| vec![0; capacity])
+        });
+
+        assert_eq!(calls, 2);
+        assert!(rx_storage.is_empty());
+        assert!(tx_storage.is_empty());
+        assert_eq!(state.charged, 0);
+        assert_eq!(pool.used(), 0);
     }
 
     #[test]

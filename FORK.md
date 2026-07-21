@@ -742,7 +742,7 @@ rustup +nightly component add miri rust-src
 MIRIFLAGS="-Zmiri-tree-borrows" cargo +nightly miri test --lib socket::tcp
 MIRIFLAGS="-Zmiri-tree-borrows" cargo +nightly miri test --lib test_deconstruct
 MIRIFLAGS="-Zmiri-tree-borrows" cargo +nightly miri test --lib \
-  --features socket-tcp-dynamic-buffer socket::tcp::test::dyn_buf::next_capacity_math
+  --features socket-tcp-dynamic-buffer socket::tcp::dynbuf::test::next_capacity_math
 ```
 
 Detects UB, aliasing violations, out-of-bounds reads, and uninitialised
