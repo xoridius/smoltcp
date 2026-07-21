@@ -118,6 +118,7 @@ apple_check() {
 }
 
 docs() {
+    tools/test-upstream-delta.sh
     RUSTDOCFLAGS="-Dwarnings" cargo +stable doc --no-deps
     RUSTDOCFLAGS="-Dwarnings" cargo +stable doc --no-deps --lib \
         --no-default-features --features "$IOS_FEATURES"
@@ -205,7 +206,7 @@ quick() {
 }
 
 ios_gate() {
-    cargo test --release --lib --no-default-features --features "$TUNNEL_DYNAMIC_FEATURES" dyn_buf -- --test-threads=1
+    cargo test --release --lib --no-default-features --features "$TUNNEL_DYNAMIC_FEATURES" dyn -- --test-threads=1
     cargo test --release --test sizecheck --no-default-features --features "$IOS_FEATURES" -- --nocapture
     cargo run --release --example dynbuf_memcompare --no-default-features \
         --features "$TUNNEL_DYNAMIC_FEATURES" -- dynamic 300
@@ -226,7 +227,7 @@ run_profile_commands() {
 ios_full_gate() {
     local target_dir="${CARGO_TARGET_DIR:-target}"
 
-    cargo test --release --lib --no-default-features --features "$TUNNEL_DYNAMIC_FEATURES" dyn_buf -- --test-threads=1
+    cargo test --release --lib --no-default-features --features "$TUNNEL_DYNAMIC_FEATURES" dyn -- --test-threads=1
     sizecheck
     apple_check
 

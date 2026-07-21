@@ -729,11 +729,14 @@ impl<'a> Socket<'a> {
 
     /// Create a pool-backed dynamic-buffer TCP socket.
     ///
-    /// The socket's rx and tx buffers start at `config.rx_initial` /
-    /// `config.tx_initial` and grow on demand toward `config.rx_max` /
-    /// `config.tx_max` as the connection exercises pressure. On
-    /// `Closed` / abort / drop, the backing storage is released and any
-    /// pool reservation is refunded.
+    /// The socket attempts to allocate `config.rx_initial` and
+    /// `config.tx_initial` up front, then grows on demand toward
+    /// `config.rx_max` and `config.tx_max`. Allocation or pool-budget failure
+    /// leaves both buffers empty so TCP backpressure can preserve the budget.
+    /// Terminal transitions preserve unread receive data. [`recv_slice`](Self::recv_slice)
+    /// and [`recv_with`](Self::recv_with) reclaim its storage after draining it.
+    /// [`recv`](Self::recv) may return a borrow into that storage, so reclamation
+    /// waits for reset, drop, or a later non-borrowing receive.
     ///
     /// The RFC 1323 window-scale option advertised on the SYN is sized for
     /// `rx_max`, so the negotiated scale accommodates any future growth.

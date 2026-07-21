@@ -94,7 +94,13 @@ if ! awk -v start="$LEDGER_START" -v end="$LEDGER_END" '
     exit 2
 fi
 
-if ! git remote get-url upstream >/dev/null 2>&1; then
+if upstream_url="$(git remote get-url upstream 2>/dev/null)"; then
+    if [[ "$upstream_url" != "$UPSTREAM_URL" ]]; then
+        echo "error: upstream remote URL mismatch: $upstream_url" >&2
+        echo "expected: $UPSTREAM_URL" >&2
+        exit 2
+    fi
+else
     git remote add upstream "$UPSTREAM_URL"
 fi
 echo "fetching upstream..."
