@@ -4,6 +4,12 @@
 --mode bench multi_tcp_sink 3 2 50 offload
 --mode bench churn 3 500
 --mode bench churn 3 500 offload
+--mode bench rst_unread_rx 3 100
+--mode bench rst_unread_rx 3 100 offload
+--mode bench pool_pressure 3 50
+--mode bench pool_pressure 3 50 offload
+--mode bench mixed_tcp_udp 3 50 50
+--mode bench mixed_tcp_udp 3 50 50 offload
 --mode bench idle_hot 3 1000 0
 --mode bench idle_hot 3 1000 0 offload
 --mode bench idle_hot 3 1000 10

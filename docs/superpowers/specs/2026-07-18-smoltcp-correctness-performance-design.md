@@ -3,9 +3,9 @@
 ## Purpose
 
 Land the important correctness, compatibility, and evidence fixes identified by
-the 2026-07-18 fork audit while keeping the Apple packet-tunnel path at least as
-fast and memory-efficient as the pinned baseline. The work covers the smoltcp
-fork and the tunnel consumer that pins it.
+the 2026-07-18 fork audit while keeping the Apple packet-tunnel feature shape at
+least as fast and memory-efficient as the pinned baseline. This landing is
+limited to the smoltcp fork.
 
 ## Scope
 
@@ -20,8 +20,7 @@ The implementation is split into three independently verifiable workstreams.
    DAD, IEEE 802.15.4 MIC length validation, and MLDv2 response-code decoding.
 3. **Performance evidence and landing:** deterministic correctness and netsim
    gates, constrained-memory traffic matrices, raw RSS and allocation reporting,
-   Apple target checks, fuzz coverage, downstream consumer integration, and
-   documentation/upstream ledger updates.
+   Apple target checks, fuzz coverage, and documentation/upstream ledger updates.
 
 No unrelated refactoring, new dependencies, or speculative public interfaces
 are allowed. Existing no-alloc/no-std configurations remain supported.
@@ -47,20 +46,19 @@ validity and observation time, accepts TSval zero, and expires stale state after
 
 ## Hosted time
 
-Backport upstream PR #1177's stable conversion from std::time::Instant. The
-shipping tunnel driver stops using wall-clock-backed smoltcp::time::Instant::now
-and supplies converted std::time::Instant samples for interface construction,
-poll_delay, and poll. Wall-clock conversion remains available only where its
-absolute-time semantics are explicitly requested.
+Use upstream PR #1177's stable referential for conversion from
+`std::time::Instant`, while preserving the order of samples taken before the
+referential initializes. Hosted callers can supply monotonic samples for
+interface construction, `poll_delay`, and `poll`. Wall-clock conversion remains
+available only where its absolute-time semantics are explicitly requested.
 
 ## Dynamic-buffer lifetime and memory model
 
 The borrowing Socket::recv interface remains source-compatible. Immediate
 reclamation is added through the smallest interface that can prove its return
 value does not borrow the socket buffer, or through a safe subsequent mutable
-boundary; the tunnel consumer uses that non-borrowing path without adding a
-copy. Terminal sockets must refund pool charge promptly after drained data is no
-longer borrowed.
+boundary. Terminal sockets must refund pool charge promptly after drained data
+is no longer borrowed. Consumer migration is outside this smoltcp-only landing.
 
 Pool accounting continues to bound steady-state logical socket capacity. The
 harness separately reports raw RSS, allocator deltas, and pool charge; it does
@@ -71,8 +69,10 @@ otherwise the accurate bound is documented and gated.
 
 ## Wire and platform behavior
 
-- 6LoWPAN NHC decompression preserves an inline UDP checksum and computes an
-  elided checksum once the complete IPv6/UDP payload is available.
+- 6LoWPAN NHC decompression preserves an inline UDP checksum and rejects
+  checksum elision because the stack has no upper-layer authorization and
+  verified-integrity contract for it; RFC 6282 section 4.3.2 requires that
+  case to be dropped.
 - SLAAC rejects Prefix Information lengths above 128 before CIDR construction.
 - IPv4 fragment offsets and lengths use checked arithmetic and reject totals
   beyond 65,535 bytes, including on 16-bit targets.
@@ -101,7 +101,8 @@ Required correctness gates include:
 - last-SACK-range partial ACK and PAWS zero/24-day-wrap cases;
 - borrowing and non-borrowing terminal dynamic receive cases with exact pool
   accounting;
-- fragmented/nonfragmented 6LoWPAN UDP delivery with default checksums;
+- fragmented/nonfragmented 6LoWPAN UDP delivery with valid inline checksums,
+  plus invalid, zero, and elided checksum rejection;
 - malformed SLAAC RA, 16-bit-independent fragment arithmetic, multi-record BPF,
   NA target, DAD, truncated MIC, and MLDv2 boundary cases;
 - no-default-features, no-alloc/no-std, MSRV, stable, nightly, 16-bit compile,
@@ -137,21 +138,19 @@ Traffic matrix:
   a mixed TCP/UDP constrained-memory shape;
 - legacy versus dynamic buffers at 300 and 1,000 idle flows;
 - NoControl, Reno, and CUBIC loss/buffer netsim sweeps;
-- downstream rss_budget_tcp, combined, slow-reader, RST, pool, TCP pressure, and
-  UDP pressure suites under the constrained Apple profile.
+- RST/unread-RX, pool pressure, and mixed TCP/UDP coverage under the constrained
+  Apple feature profile.
 
-Missing shapes are added to the existing profile_loopback or downstream RSS
-harness, not to a parallel benchmark framework. Machine-readable summaries may
-be added only where needed for reproducible comparison; human-readable output
-remains.
+Missing shapes are added to the existing `profile_loopback` harness, not to a
+parallel benchmark framework. Machine-readable summaries may be added only
+where needed for reproducible comparison; human-readable output remains.
 
 ## Landing sequence
 
 Work lands as small reviewed commits in dependency order: baseline/gates, TCP
-core, hosted time and consumer migration, dynamic lifetime, protocol/platform
-fixes, harness/CI improvements, then docs/upstream ledger. The smoltcp fork is
-pushed first; the tunnel consumer then updates its exact git pin and lockfile,
-runs its full constrained-memory matrix, and is pushed only after all gates pass.
+core, hosted time, dynamic lifetime, protocol/platform fixes, harness/CI
+improvements, then docs/upstream ledger. The smoltcp branch is pushed only after
+all in-repository gates pass.
 
 If a correctness fix cannot meet the performance/RSS gates, landing stops for a
 redesign; the defect is not hidden by weakening the gate or refreshing a

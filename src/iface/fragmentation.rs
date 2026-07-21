@@ -27,8 +27,7 @@ impl fmt::Display for AssemblerError {
     }
 }
 
-#[cfg(feature = "std")]
-impl std::error::Error for AssemblerError {}
+impl core::error::Error for AssemblerError {}
 
 /// Packet assembler is full
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
@@ -41,8 +40,7 @@ impl fmt::Display for AssemblerFullError {
     }
 }
 
-#[cfg(feature = "std")]
-impl std::error::Error for AssemblerFullError {}
+impl core::error::Error for AssemblerFullError {}
 
 pub(super) fn checked_fragment_end(offset: usize, len: usize) -> Result<usize, AssemblerError> {
     offset

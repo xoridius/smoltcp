@@ -1,12 +1,18 @@
 # smoltcp Correctness and Constrained-Memory Performance Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **Historical execution plan:** The unchecked boxes preserve the approved
+> implementation recipe; they are not live status. Completion evidence is in
+> `docs/perf/2026-07-18-after.md` and the landing commit.
 
-**Goal:** Fix the audited smoltcp correctness and compatibility defects, improve the constrained-memory evidence harness, update the Apple tunnel consumer, and land both repositories without a meaningful throughput or RSS regression.
+**Goal:** Fix the audited smoltcp correctness and compatibility defects, improve the constrained-memory evidence harness, and land smoltcp without a meaningful throughput or RSS regression.
+
+**Scope update (2026-07-20):** The landing was narrowed to `/root/smoltcp`.
+Downstream steps retained below as historical planning context are not part of
+this implementation or its acceptance evidence.
 
 **Architecture:** Keep protocol state inside the existing deep TCP, interface, wire, and PHY modules. Add only the canonical state required by the RFCs, preserve public compatibility, and reuse the existing profiling/RSS harnesses. Capture a matched baseline before production changes, implement every fix test-first, and compare repeated final measurements against that baseline.
 
-**Tech Stack:** Rust 1.91 MSRV/stable/nightly, no_std/alloc feature matrices, shell CI helpers, libFuzzer/ASan, insta netsim snapshots, Linux RSS plus macOS physical-footprint reporting, and the downstream `tunnel-lib-rust` user netstack.
+**Tech Stack:** Rust 1.91 MSRV/stable/nightly, no_std/alloc feature matrices, shell CI helpers, libFuzzer/ASan, insta netsim snapshots, and Linux RSS plus macOS physical-footprint reporting.
 
 ## Global Constraints
 
@@ -20,7 +26,7 @@
 - Median throughput may not regress by more than 2%; fairness remains Jain >= 0.95 and no flow may starve.
 - Do not refresh a snapshot until the deterministic behavior change is understood and documented.
 - Do not run live network devices; BPF verification uses pure synthetic record buffers.
-- Preserve unrelated user changes in both repositories.
+- Preserve unrelated user changes in the repository.
 
 ---
 
@@ -30,15 +36,14 @@
 - Create: `docs/perf/2026-07-18-before.md`
 - Modify: `examples/profile_loopback.rs` only if an existing shape cannot emit a required baseline metric
 - Read: `ci.sh`, `examples/dynbuf_memcompare.rs`
-- Read: `/root/tunnel-lib-rust/crates/netstack/tests/rss_budget_*.rs`
 
 **Interfaces:**
-- Consumes: fork commit `fd94836`, consumer commit `fc8193b7`.
+- Consumes: the recorded smoltcp control revision.
 - Produces: exact baseline commands, five matched samples for performance/RSS shapes, socket sizes, raw logs under `/tmp/smoltcp-perf-before`, and a summarized baseline document used by Task 10.
 
 - [ ] **Step 1: Record environment and pinned revisions**
 
-Run `df -h /root && free -h && nproc && rustc -Vv && git rev-parse HEAD` in `/root/smoltcp`, and the equivalent `git rev-parse HEAD` in `/root/tunnel-lib-rust`. Record output in the baseline document.
+Run `df -h /root && free -h && nproc && rustc -Vv && git rev-parse HEAD` in `/root/smoltcp`. Record output in the baseline document.
 
 - [ ] **Step 2: Capture exact static and correctness baselines**
 
@@ -61,9 +66,11 @@ Expected: ordinary suites and NoControl pass; record the known pre-change Reno/C
 
 For each software-checksum and `offload` variant, run one unrecorded warm-up followed by five release samples of `udp`, `firehose`, `pingpong`, `small`, `many_tcp 3 8`, `many_tcp_fair 3 8`, `many_udp 3 8`, `many_tcp 3 50`, `many_tcp_fair 3 50`, `many_udp 3 50`, `many_tcp 3 100`, `many_tcp_fair 3 100`, and `many_udp 3 100`. Run dynamic-buffer shapes `multi_tcp 3 2 50`, `multi_tcp_sink 3 2 50`, `churn 3 500`, `idle_hot 3 1000 0`, and `idle_hot 3 1000 10` in both software-checksum and `offload` variants with the same warm-up plus five-sample protocol. Save every raw output under `/tmp/smoltcp-perf-before/<shape>-<sample>.log` and record medians for throughput, raw RSS start/end, heap delta, allocations, fairness, active pool charge, pool charge after teardown, and fallback allocations. If a current shape omits a required metric, first add reporting-only instrumentation with a failing pure unit test and synchronization outside its timed steady-state loop; do not change its traffic or library behavior.
 
-- [ ] **Step 4: Capture idle socket and downstream constrained-memory baselines**
+- [ ] **Step 4: Capture idle-socket constrained-memory baselines**
 
-Run one warm-up plus five separate-process `dynbuf_memcompare` legacy/dynamic samples for 300 and 1,000 flows, recording raw RSS start/end as well as deltas. In `/root/tunnel-lib-rust`, run the focused release RSS suites registered as `rss_budget_tcp`, `rss_budget_combined`, `rss_budget_tcp_slow`, `rss_budget_tcp_rst`, `rss_budget_tcp_pressure`, `rss_budget_udp_pressure`, and `rss_budget_tcp_pool` using the repository's documented feature set. For each of the three absolute-RSS bodies, run one unrecorded warm-up followed by five fresh test-process samples and record the exact command plus raw before/after/delta medians; label Linux results supplemental rather than Apple jetsam truth. Record all platform-neutral passes and diagnostics.
+Run one warm-up plus five separate-process `dynbuf_memcompare` legacy/dynamic
+samples for 300 and 1,000 flows, recording raw RSS start/end as well as deltas.
+Label Linux results supplemental rather than Apple jetsam truth.
 
 - [ ] **Step 5: Verify and commit the baseline document**
 
@@ -172,16 +179,15 @@ Replace the zero sentinel with optional timestamp state and record the accepted 
 
 Run all timestamp/TCP tests and both sizechecks, then commit `tcp: expire stale PAWS timestamp state`.
 
-### Task 5: Add non-borrowing receive reclamation and migrate the consumer
+### Task 5: Add non-borrowing receive reclamation
 
 **Files:**
 - Modify: `src/socket/tcp.rs`
 - Test: `src/socket/tcp/test/dyn_buf.rs`
-- Modify: `/root/tunnel-lib-rust/crates/netstack/src/user/tcp_table.rs`
 
 **Interfaces:**
 - Produces: `Socket::recv_with<F, R>(&mut self, f: F) -> Result<R, RecvError>` where `F: for<'b> FnOnce(&'b mut [u8]) -> (usize, R)`; `R` cannot borrow from the RX slice and the method runs terminal dynamic release hooks before returning.
-- Preserves: existing borrowing `Socket::recv` and zero-copy consumer ring writes.
+- Preserves: existing borrowing `Socket::recv`.
 
 - [ ] **Step 1: Add a failing pool-reclamation regression**
 
@@ -195,20 +201,15 @@ Compile/run the focused dynamic-buffer test before the method exists; expected c
 
 Add `recv_with` with the higher-ranked signature above. Delegate dequeue behavior to `recv_impl`, then call both terminal release hooks. Do not duplicate receive error checks or add a new buffer type.
 
-- [ ] **Step 4: Migrate the tunnel consumer without a copy**
+- [ ] **Step 4: Verify memory/performance and commit**
 
-Change the generic closure receive call in `tcp_table.rs` to `recv_with`. Run the netstack focused tests and verify its ring-buffer write path and return value are unchanged.
+Run dynamic-buffer tests, `ios-gate`, `idle_hot`, `churn`, RST/unread-RX, and
+pool-pressure suites.
 
-- [ ] **Step 5: Verify memory/performance and commit in each repository**
-
-Run dynamic-buffer tests, `ios-gate`, `idle_hot`, `churn`, and downstream RST/slow-reader/pool RSS suites. Commit smoltcp first, then the consumer call-site change as a separate commit without updating the git pin yet.
-
-### Task 6: Backport monotonic time conversion and migrate hosted polling
+### Task 6: Backport monotonic time conversion
 
 **Files:**
 - Modify: `src/time.rs`
-- Modify: `/root/tunnel-lib-rust/crates/netstack/src/user/driver.rs`
-- Modify tests that construct/poll the user interface with `SmolInstant::now()` where they exercise hosted time.
 
 **Interfaces:**
 - Produces: stable `From<std::time::Instant> for smoltcp::time::Instant` using one process referential.
@@ -218,17 +219,16 @@ Run dynamic-buffer tests, `ios-gate`, `idle_hot`, `churn`, and downstream RST/sl
 
 Add tests that converting the same std instant twice is stable and that two ordered std instants remain ordered after conversion. Run them and observe failure.
 
-- [ ] **Step 2: Implement upstream's stable referential**
+- [ ] **Step 2: Implement a stable referential without collapsing earlier samples**
 
-Use `std::sync::LazyLock<std::time::Instant>` and `saturating_duration_since`, matching upstream commit `c541dce...`. Run time and full library tests.
+Use `std::sync::LazyLock<std::time::Instant>`, matching upstream commit
+`c541dce...`, and represent samples before the referential with negative
+microseconds so their order is preserved. Run time and full library tests.
 
-- [ ] **Step 3: Migrate the shipping driver**
+- [ ] **Step 3: Verify and commit**
 
-At interface construction, `poll_delay`, and `poll`, replace wall-clock `SmolInstant::now()` with `std::time::Instant::now().into()`. Keep one sampled instant per logical poll cycle where possible so timer decisions share a timestamp.
-
-- [ ] **Step 4: Verify and commit**
-
-Run smoltcp time/full tests and downstream user-netstack integration tests. Commit smoltcp as `time: make std instant conversion monotonic` and consumer as `netstack: drive smoltcp with a monotonic clock`.
+Run smoltcp time and full library tests. Commit as
+`time: make std instant conversion monotonic`.
 
 ### Task 7: Fix 6LoWPAN, SLAAC, and checked IPv4 reassembly
 
@@ -241,19 +241,31 @@ Run smoltcp time/full tests and downstream user-netstack integration tests. Comm
 - Test: `src/iface/interface/tests/sixlowpan.rs`, IPv6/SLAAC tests, fragmentation tests
 
 **Interfaces:**
-- Produces: default-capability 6LoWPAN UDP delivery, panic-free SLAAC validation, and checked fragmentation length helpers.
+- Produces: default-capability 6LoWPAN UDP delivery and checksum-elision
+  rejection, panic-free SLAAC validation, and checked fragmentation length
+  helpers.
 
 - [ ] **Step 1: Add failing end-to-end/proof tests**
 
-Add fragmented and nonfragmented compressed UDP delivery tests without disabling checksum verification; full ingress RAs with prefix lengths 129 and 255; and a host-width-independent checked helper test for maximum IPv4 fragment end.
+Add fragmented and nonfragmented compressed UDP delivery tests without
+disabling checksum verification, plus bad, zero, and elided checksum rejection;
+full ingress RAs with prefix lengths 129 and 255; and a host-width-independent
+checked helper test for maximum IPv4 fragment end.
 
 - [ ] **Step 2: Verify RED**
 
-Run each focused feature test. Expected: UDP delivery drops, RA panics, and checked fragment helper is missing.
+Run each focused feature test. Expected: valid inline-checksum UDP delivery
+drops, elision is not rejected at the decompression boundary, RA panics, and
+the checked fragment helper is missing.
 
 - [ ] **Step 3: Implement minimal wire/interface fixes**
 
-Carry inline NHC checksums into the reconstructed UDP header and compute elided checksums only once the full payload exists. Add `prefix_len <= 128` to Prefix Information validity. Centralize fragment-end checked arithmetic, reject overflow/over-65,535 totals before allocation/copy, and reuse it in total-size and add paths.
+Carry inline NHC checksums into the reconstructed UDP header. Reject elision
+because the stack cannot unambiguously identify and verify the additional
+integrity check required by RFC 6282 section 4.3.2. Add `prefix_len <= 128` to
+Prefix Information validity. Centralize fragment-end checked arithmetic,
+reject overflow/over-65,535 totals before allocation/copy, and reuse it in
+total-size and add paths.
 
 - [ ] **Step 4: Verify feature matrices and commit**
 
@@ -343,7 +355,11 @@ Observe the existing idle-hot test validates capacity subtraction. Replace it wi
 
 - [ ] **Step 3: Extend existing gates, not frameworks**
 
-Add an `ios-full-gate` command that runs dynamic tests, both sizechecks, 300/1,000 idle comparisons, idle-only, idle/hot, churn, multi TCP echo/sink, many TCP fair/stress, many UDP, software/offload variants, and all controller netsims serially. Reuse the downstream `rss_budget_combined`, `rss_budget_tcp_pressure`, and `rss_budget_udp_pressure` tests for mixed TCP/UDP and pressure shapes instead of duplicating them in smoltcp.
+Add an `ios-full-gate` command that runs dynamic tests, both sizechecks,
+300/1,000 idle comparisons, idle-only, idle/hot, churn, RST/unread-RX,
+pool-pressure, mixed TCP/UDP, multi TCP echo/sink, many TCP fair/stress, many
+UDP, software/offload variants, and all controller netsims serially. Add
+missing constrained-memory coverage to the existing smoltcp harness.
 
 - [ ] **Step 4: Make CI evidence mandatory**
 
@@ -357,16 +373,10 @@ Repeat every Task 1 command with the same host, build, duration, flow counts, an
 
 Write exact before/after tables including noise and known limitations. Correct README/FORK capability, upstream, pool-bound, controller, and harness claims. Commit `harness: gate constrained-memory traffic shapes` and `docs: record smoltcp fix performance results`.
 
-### Task 11: Update the consumer pin, run full verification, review, and land
-
-**Files:**
-- Modify: `/root/tunnel-lib-rust/Cargo.toml`
-- Modify: `/root/tunnel-lib-rust/Cargo.lock`
-- Modify downstream files from Tasks 5-6 already committed locally
+### Task 11: Run full verification, review, and land smoltcp
 
 **Interfaces:**
-- Consumes: final pushed smoltcp commit.
-- Produces: exact consumer dependency pin and fully verified/pushed main branches.
+- Produces: fully verified and pushed smoltcp `main`.
 
 - [ ] **Step 1: Run smoltcp's complete fresh verification**
 
@@ -374,24 +384,16 @@ Run format, diff check, MSRV/stable/nightly test/check matrices, clippy, 16-bit 
 
 - [ ] **Step 2: Dispatch broad final code review and fix every Critical/Important finding**
 
-Create the full review package from `fd94836` to final HEAD. The reviewer checks the approved spec, every task report, tests, public compatibility, RFC behavior, unsafe/FFI bounds, and performance evidence. One fix subagent handles the complete actionable list and reruns affected tests; re-review until clean.
+Create the full review package from the recorded start revision to final HEAD.
+The reviewer checks the approved spec, every task report, tests, public
+compatibility, RFC behavior, unsafe/FFI bounds, and performance evidence. One
+fix subagent handles the complete actionable list and reruns affected tests;
+re-review until clean.
 
 - [ ] **Step 3: Push smoltcp main and read back the remote SHA**
 
 Push only after the final review and gates. Verify `origin/main` equals local HEAD.
 
-- [ ] **Step 4: Update the downstream exact git pin and lockfile**
-
-Point the consumer dependency at the landed smoltcp main revision, update `Cargo.lock`, and verify the resolved source contains that exact SHA. Do not use a path override as final evidence.
-
-- [ ] **Step 5: Run downstream correctness and constrained-memory gates**
-
-Run `cargo test -p netstack --release --test rss_budget_tcp --test rss_budget_combined --test rss_budget_tcp_slow --test rss_budget_tcp_rst --test rss_budget_tcp_pressure --test rss_budget_udp_pressure --test rss_budget_tcp_pool`, the netstack unit/integration suites, Apple-facing feature checks, formatting, clippy, and the repository's required CI command. Repeat focused throughput/RSS samples affected by the clock/receive changes.
-
-- [ ] **Step 6: Commit, final-review, and push the consumer**
-
-Commit the call-site/clock changes and dependency pin intentionally, dispatch a final downstream diff review, fix actionable findings, push main, and verify remote readback.
-
-- [ ] **Step 7: Final result report**
+- [ ] **Step 4: Final result report**
 
 Report landed SHAs, all test counts/gates, before/after medians for every shape, socket sizes, RSS/allocation/pool outcomes, controller snapshot explanation, fuzz executions, Apple/16-bit coverage, and any explicitly unavailable live-device/Miri evidence.

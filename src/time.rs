@@ -108,8 +108,16 @@ impl From<::std::time::Instant> for Instant {
         static ORIGIN: ::std::sync::LazyLock<::std::time::Instant> =
             ::std::sync::LazyLock::new(::std::time::Instant::now);
 
-        let n = other.saturating_duration_since(*ORIGIN);
-        Self::from_micros(n.as_secs() as i64 * 1_000_000 + n.subsec_micros() as i64)
+        let micros = match other.checked_duration_since(*ORIGIN) {
+            Some(duration) => duration.as_micros().min(i64::MAX as u128) as i64,
+            None => {
+                -(ORIGIN
+                    .duration_since(other)
+                    .as_micros()
+                    .min(i64::MAX as u128) as i64)
+            }
+        };
+        Self::from_micros(micros)
     }
 }
 

@@ -628,7 +628,7 @@ impl Repr {
         }
     }
 
-    /// Parse an Internet Protocol packet and return an [IpRepr] containing either an Internet
+    /// Parse an Internet Protocol packet and return an [`IpRepr`](Repr) containing either an Internet
     /// Protocol version 4 or Internet Protocol version 6 packet. Delegates the parsing to the
     /// specific Internet Protocol parsing function. Includes [ChecksumCapabilities] to handle
     /// Internet Protocol version 4 parsing.

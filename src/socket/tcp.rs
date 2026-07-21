@@ -45,8 +45,7 @@ impl Display for ListenError {
     }
 }
 
-#[cfg(feature = "std")]
-impl std::error::Error for ListenError {}
+impl core::error::Error for ListenError {}
 
 /// Error returned by [`Socket::connect`]
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
@@ -65,8 +64,7 @@ impl Display for ConnectError {
     }
 }
 
-#[cfg(feature = "std")]
-impl std::error::Error for ConnectError {}
+impl core::error::Error for ConnectError {}
 
 /// Error returned by [`Socket::send`]
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
@@ -83,8 +81,7 @@ impl Display for SendError {
     }
 }
 
-#[cfg(feature = "std")]
-impl std::error::Error for SendError {}
+impl core::error::Error for SendError {}
 
 /// Error returned by [`Socket::recv`]
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
@@ -103,8 +100,7 @@ impl Display for RecvError {
     }
 }
 
-#[cfg(feature = "std")]
-impl std::error::Error for RecvError {}
+impl core::error::Error for RecvError {}
 
 /// A TCP socket ring buffer.
 pub type SocketBuffer<'a> = RingBuffer<'a, u8>;
@@ -540,11 +536,10 @@ pub struct Socket<'a> {
     /// connection — every consumer short-circuits on `is_empty`, so the
     /// hot path pays a single load+branch.
     sack_scoreboard: Assembler,
-    /// RFC 6582/6675 recovery point: SND.NXT at the moment fast retransmit
-    /// last triggered. While the cumulative ACK stays below it, ACKs that
-    /// advance SND.UNA are *partial ACKs*: they prove the next hole's
-    /// retransmission was lost too, and it is retransmitted immediately
-    /// instead of waiting for three fresh duplicate ACKs or the RTO.
+    /// RFC 6582/6675 recovery point: SND.NXT when fast recovery or RTO starts.
+    /// Fast-recovery partial ACKs retransmit the next hole immediately. After
+    /// RTO, ordinary ACKs resume congestion control; only fresh SACK evidence
+    /// redirects the conservative resend before this boundary is reached.
     /// Valid only while `RECOVERY_ACTIVE` is set.
     recovery_point: TcpSeqNumber,
     /// Packed bool flags. See the `Flags` bitflags struct below for
@@ -2268,28 +2263,33 @@ impl<'a> Socket<'a> {
         };
         let syn_was_transmitted = self.local_seq_next == self.local_seq_no + 1;
 
-        // RFC 7323 §5.3 R1: PAWS precedes generic ACK admission on synchronized
-        // connections. RST is exempt and must not age or mutate TS.Recent.
+        // RFC 7323 §3.2: after timestamp negotiation, silently drop non-RST
+        // segments without TSopt. Section 5.3 R1 puts PAWS before generic ACK
+        // admission. RST is exempt and must not age or mutate TS.Recent.
         if !matches!(self.state, State::Listen | State::SynSent)
             && repr.control != TcpControl::Rst
             && self.timestamp_active()
-            && let Some(timestamp) = repr.timestamp
-            && self.remote_tsval_is_older(timestamp.tsval)
         {
-            if self.remote_tsval_expired(cx.now()) {
-                // More than 24 days old: invalidate the saved serial value and
-                // let normal admission plus the in-sequence R3 rule refresh it.
-                self.set_remote_tsval(None);
-            } else {
-                let recent = self
-                    .remote_tsval()
-                    .expect("older comparison requires valid TS.Recent");
-                net_debug!(
-                    "PAWS reject: tsval={} < ts_recent={}",
-                    timestamp.tsval,
-                    recent
-                );
-                return self.challenge_ack_reply(cx, ip_repr, repr);
+            let Some(timestamp) = repr.timestamp else {
+                net_debug!("PAWS reject: missing negotiated timestamp");
+                return None;
+            };
+            if self.remote_tsval_is_older(timestamp.tsval) {
+                if self.remote_tsval_expired(cx.now()) {
+                    // More than 24 days old: invalidate the saved serial value and
+                    // let normal admission plus the in-sequence R3 rule refresh it.
+                    self.set_remote_tsval(None);
+                } else {
+                    let recent = self
+                        .remote_tsval()
+                        .expect("older comparison requires valid TS.Recent");
+                    net_debug!(
+                        "PAWS reject: tsval={} < ts_recent={}",
+                        timestamp.tsval,
+                        recent
+                    );
+                    return self.challenge_ack_reply(cx, ip_repr, repr);
+                }
             }
         }
 
@@ -3476,7 +3476,7 @@ impl<'a> Socket<'a> {
             // If a timeout expires, we should abort the connection.
             net_debug!("timeout exceeded");
             self.set_state(State::Closed);
-        } else if retransmit_due && !want_send {
+        } else if retransmit_due {
             // Octets in flight, measured before the cursor rewind below resets
             // flight_size() to zero — the congestion controller needs the real
             // value to size ssthresh.
@@ -7935,6 +7935,53 @@ mod test {
     }
 
     #[test]
+    fn rto_retransmit_precedes_unsent_data() {
+        let mut s = socket_established();
+        s.remote_mss = 6;
+        s.send_slice(b"abcdef123456").unwrap();
+
+        recv!(s, time 0, Ok(TcpRepr {
+            seq_number: LOCAL_SEQ + 1,
+            ack_number: Some(REMOTE_SEQ + 1),
+            payload:    &b"abcdef"[..],
+            ..RECV_TEMPL
+        }));
+        recv!(s, time 1000, Ok(TcpRepr {
+            seq_number: LOCAL_SEQ + 1,
+            ack_number: Some(REMOTE_SEQ + 1),
+            payload:    &b"abcdef"[..],
+            ..RECV_TEMPL
+        }));
+    }
+
+    #[test]
+    fn fast_retransmit_precedes_unsent_data() {
+        let mut s = socket_established();
+        s.remote_mss = 6;
+        s.send_slice(b"abcdef123456").unwrap();
+
+        recv!(s, time 0, Ok(TcpRepr {
+            seq_number: LOCAL_SEQ + 1,
+            ack_number: Some(REMOTE_SEQ + 1),
+            payload:    &b"abcdef"[..],
+            ..RECV_TEMPL
+        }));
+        for time in [10, 20, 30, 40] {
+            send!(s, time time, TcpRepr {
+                seq_number: REMOTE_SEQ + 1,
+                ack_number: Some(LOCAL_SEQ + 1),
+                ..SEND_TEMPL
+            });
+        }
+        recv!(s, time 40, Ok(TcpRepr {
+            seq_number: LOCAL_SEQ + 1,
+            ack_number: Some(REMOTE_SEQ + 1),
+            payload:    &b"abcdef"[..],
+            ..RECV_TEMPL
+        }));
+    }
+
+    #[test]
     fn test_data_retransmit_bursts() {
         let mut s = socket_established();
         s.remote_mss = 6;
@@ -11915,6 +11962,7 @@ mod test {
             TcpRepr {
                 seq_number: REMOTE_SEQ + 1,
                 ack_number: Some(LOCAL_SEQ + 1 + 6 + 6),
+                timestamp: Some(TcpTimestampRepr::new(500, 1)),
                 ..SEND_TEMPL
             }
         );
@@ -12249,6 +12297,56 @@ mod test {
 
         s.set_tsval_generator(Some(|| 100));
         assert!(!s.timestamp_active());
+    }
+
+    // =========================================================================================//
+    // Negotiated timestamps (RFC 7323 §3.2): non-RST segments without TSopt
+    // are silently dropped.
+    // =========================================================================================//
+    #[test]
+    fn negotiated_timestamps_drop_ack_without_tsopt() {
+        let mut s = socket_established_with_timestamps(|| 100);
+        s.send_slice(b"pending").unwrap();
+        recv(&mut s, Instant::ZERO, |_| {});
+        let send_queue = s.send_queue();
+        let remote_seq_no = s.remote_seq_no;
+        let local_seq_next = s.local_seq_next;
+
+        let reply = send(
+            &mut s,
+            Instant::ZERO,
+            &TcpRepr {
+                seq_number: remote_seq_no,
+                ack_number: Some(local_seq_next),
+                timestamp: None,
+                ..SEND_TEMPL
+            },
+        );
+
+        assert_eq!(reply, None);
+        assert_eq!(s.send_queue(), send_queue);
+    }
+
+    #[test]
+    fn negotiated_timestamps_drop_payload_without_tsopt() {
+        let mut s = socket_established_with_timestamps(|| 100);
+        let remote_seq_no = s.remote_seq_no;
+
+        let reply = send(
+            &mut s,
+            Instant::ZERO,
+            &TcpRepr {
+                seq_number: remote_seq_no,
+                ack_number: Some(LOCAL_SEQ + 1),
+                payload: b"missing timestamp",
+                timestamp: None,
+                ..SEND_TEMPL
+            },
+        );
+
+        assert_eq!(reply, None);
+        assert_eq!(s.remote_seq_no, remote_seq_no);
+        assert_eq!(s.recv_queue(), 0);
     }
 
     // =========================================================================================//

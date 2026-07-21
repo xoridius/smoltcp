@@ -2,19 +2,29 @@ pub(super) fn signed_delta(after: u64, before: u64) -> i128 {
     i128::from(after) - i128::from(before)
 }
 
-pub(super) fn process_memory_bytes() -> u64 {
+#[derive(Clone, Copy)]
+pub(super) struct ProcessMemorySample {
+    pub(super) current_bytes: u64,
+    pub(super) lifetime_peak_bytes: Option<u64>,
+}
+
+pub(super) fn process_memory_sample() -> ProcessMemorySample {
     #[cfg(target_vendor = "apple")]
     {
-        apple_phys_footprint_bytes().unwrap_or(0)
+        apple_process_memory_sample().expect("process-memory sampling is required")
     }
     #[cfg(all(not(target_vendor = "apple"), target_os = "linux"))]
     {
-        linux_rss_bytes().unwrap_or(0)
+        linux_process_memory_sample().expect("process-memory sampling is required")
     }
     #[cfg(not(any(target_vendor = "apple", target_os = "linux")))]
     {
-        0
+        panic!("process-memory sampling is required")
     }
+}
+
+pub(super) fn process_memory_bytes() -> u64 {
+    process_memory_sample().current_bytes
 }
 
 pub(super) const fn process_memory_label() -> &'static str {
@@ -33,62 +43,36 @@ pub(super) const fn process_memory_label() -> &'static str {
 }
 
 #[cfg(target_vendor = "apple")]
-#[repr(C)]
-#[derive(Default)]
-struct TaskVmInfo {
-    virtual_size: u64,
-    region_count: libc::integer_t,
-    page_size: libc::integer_t,
-    resident_size: u64,
-    resident_size_peak: u64,
-    device: u64,
-    device_peak: u64,
-    internal: u64,
-    internal_peak: u64,
-    external: u64,
-    external_peak: u64,
-    reusable: u64,
-    reusable_peak: u64,
-    purgeable_volatile_pmap: u64,
-    purgeable_volatile_resident: u64,
-    purgeable_volatile_virtual: u64,
-    compressed: u64,
-    compressed_peak: u64,
-    compressed_lifetime: u64,
-    phys_footprint: u64,
-}
-
-#[cfg(target_vendor = "apple")]
-fn apple_phys_footprint_bytes() -> Option<u64> {
-    const TASK_VM_INFO: libc::task_flavor_t = 22;
-    // Mach reports the buffer length in `natural_t` words through the last field read.
-    const TASK_VM_INFO_REV1_COUNT: libc::mach_msg_type_number_t =
-        ((core::mem::offset_of!(TaskVmInfo, phys_footprint) + core::mem::size_of::<u64>())
-            / core::mem::size_of::<libc::natural_t>()) as libc::mach_msg_type_number_t;
-
-    let mut info = TaskVmInfo::default();
-    let mut count = TASK_VM_INFO_REV1_COUNT;
-    // SAFETY: reading the current task port has no preconditions.
-    #[allow(deprecated)]
-    let task = unsafe { libc::mach_task_self() };
-    // SAFETY: `info` is a writable repr(C) buffer and `count` matches its populated prefix.
+fn apple_process_memory_sample() -> Option<ProcessMemorySample> {
+    let mut info = core::mem::MaybeUninit::<libc::rusage_info_v4>::uninit();
+    // SAFETY: `getpid` has no preconditions, and `info` is writable storage for
+    // the structure selected by `RUSAGE_INFO_V4`.
     let result = unsafe {
-        libc::task_info(
-            task,
-            TASK_VM_INFO,
-            (&mut info as *mut TaskVmInfo).cast::<libc::integer_t>(),
-            &mut count,
+        libc::proc_pid_rusage(
+            libc::getpid(),
+            libc::RUSAGE_INFO_V4,
+            info.as_mut_ptr().cast(),
         )
     };
-    if result != libc::KERN_SUCCESS || count < TASK_VM_INFO_REV1_COUNT {
+    if result != 0 {
         return None;
     }
-    Some(info.phys_footprint)
+    // SAFETY: a successful `proc_pid_rusage` call initialized the result.
+    let info = unsafe { info.assume_init() };
+    Some(ProcessMemorySample {
+        current_bytes: info.ri_phys_footprint,
+        lifetime_peak_bytes: Some(info.ri_lifetime_max_phys_footprint),
+    })
 }
 
 #[cfg(target_os = "linux")]
 fn linux_rss_bytes() -> Option<u64> {
-    let contents = std::fs::read_to_string("/proc/self/statm").ok()?;
+    use std::io::Read;
+
+    let mut file = std::fs::File::open("/proc/self/statm").ok()?;
+    let mut buffer = [0u8; 128];
+    let len = file.read(&mut buffer).ok()?;
+    let contents = core::str::from_utf8(&buffer[..len]).ok()?;
     let mut fields = contents.split_whitespace();
     let _size = fields.next()?;
     let resident_pages: u64 = fields.next()?.parse().ok()?;
@@ -97,7 +81,34 @@ fn linux_rss_bytes() -> Option<u64> {
     if page_size <= 0 {
         return None;
     }
-    Some(resident_pages.saturating_mul(page_size as u64))
+    resident_pages.checked_mul(page_size as u64)
+}
+
+#[cfg(target_os = "linux")]
+fn linux_lifetime_peak_bytes(current_bytes: u64, peak_kib: libc::c_long) -> Option<u64> {
+    u64::try_from(peak_kib)
+        .ok()?
+        .checked_mul(1024)
+        .map(|peak| peak.max(current_bytes))
+}
+
+#[cfg(target_os = "linux")]
+fn linux_process_memory_sample() -> Option<ProcessMemorySample> {
+    let current_bytes = linux_rss_bytes()?;
+    let mut usage = core::mem::MaybeUninit::<libc::rusage>::uninit();
+    // SAFETY: `usage` points to writable storage for the complete result.
+    let lifetime_peak_bytes =
+        if unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) } == 0 {
+            // SAFETY: a successful `getrusage` call initialized the result.
+            let usage = unsafe { usage.assume_init() };
+            linux_lifetime_peak_bytes(current_bytes, usage.ru_maxrss)
+        } else {
+            None
+        };
+    Some(ProcessMemorySample {
+        current_bytes,
+        lifetime_peak_bytes,
+    })
 }
 
 #[cfg(test)]
@@ -109,6 +120,25 @@ mod tests {
         assert_eq!(signed_delta(8, 4), 4);
         assert_eq!(signed_delta(4, 4), 0);
         assert_eq!(signed_delta(4, 8), -4);
+    }
+
+    #[test]
+    fn signed_delta_preserves_the_full_u64_domain() {
+        assert_eq!(signed_delta(u64::MAX, 0), i128::from(u64::MAX));
+        assert_eq!(signed_delta(0, u64::MAX), -i128::from(u64::MAX));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_peak_rss_converts_checked_signed_kibibytes() {
+        assert_eq!(super::linux_lifetime_peak_bytes(2048, 1), Some(2048));
+        assert_eq!(super::linux_lifetime_peak_bytes(1024, 2), Some(2048));
+        assert_eq!(super::linux_lifetime_peak_bytes(2048, -1), None);
+
+        let overflow = u64::MAX / 1024 + 1;
+        if let Ok(overflow) = libc::c_long::try_from(overflow) {
+            assert_eq!(super::linux_lifetime_peak_bytes(0, overflow), None);
+        }
     }
 
     #[cfg(any(target_vendor = "apple", target_os = "linux"))]

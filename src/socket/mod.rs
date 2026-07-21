@@ -48,13 +48,11 @@ pub(crate) enum PollAt {
 /// A network socket.
 ///
 /// This enumeration abstracts the various types of sockets based on the IP protocol.
-/// To downcast a `Socket` value to a concrete socket, use the [AnySocket] trait,
+/// To downcast a `Socket` value to a concrete socket, use the [`AnySocket`] trait,
 /// e.g. to get `udp::Socket`, call `udp::Socket::downcast(socket)`.
 ///
-/// It is usually more convenient to use [SocketSet::get] instead.
-///
-/// [AnySocket]: trait.AnySocket.html
-/// [SocketSet::get]: struct.SocketSet.html#method.get
+/// It is usually more convenient to use
+/// [`SocketSet::get`](crate::iface::SocketSet::get) instead.
 #[derive(Debug)]
 #[allow(clippy::large_enum_variant)]
 pub enum Socket<'a> {

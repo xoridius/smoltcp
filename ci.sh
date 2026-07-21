@@ -10,6 +10,8 @@ export DEFMT_LOG=trace
 
 MSRV="1.91.0"
 IOS_FEATURES="alloc,medium-ip,proto-ipv4,proto-ipv6,socket-udp,socket-tcp,socket-tcp-dynamic-buffer,socket-tcp-cubic"
+TUNNEL_STATIC_FEATURES="std,libc,log,medium-ip,proto-ipv4,proto-ipv4-fragmentation,proto-ipv6,proto-ipv6-fragmentation,socket-tcp,socket-udp,socket-tcp-cubic,auto-icmp-echo-reply"
+TUNNEL_DYNAMIC_FEATURES="$TUNNEL_STATIC_FEATURES,socket-tcp-dynamic-buffer"
 HOST_PHY_FEATURES="phy-raw_socket,phy-tuntap_interface,medium-ip,medium-ethernet,proto-ipv4,socket-raw"
 
 RUSTC_VERSIONS=(
@@ -66,13 +68,13 @@ Core commands:
   coverage                      cargo-llvm-cov matrix.
   netsim                        Stable NoControl, CUBIC, and Reno netsim sweeps.
   apple-check                   Cross-check macOS and iOS targets on stable.
-  all                           Core matrix above.
+  all                           Core matrix except cross-target Apple checks.
 
 Local fork evidence:
   quick                         Fast local smoke: fmt, iOS check, host phy check, iOS sizecheck.
   sizecheck                     Print default and iOS-shaped footprint numbers.
   ios-gate                      iOS Network Extension memory-shape proofs.
-  ios-full-gate                 Complete constrained-memory and traffic gate.
+  ios-full-gate                 smoltcp-side constrained-memory traffic matrix.
   profile-smoke [seconds]       Short throughput/fairness/RSS harness smoke.
   fuzz-build                    Build all fuzz targets on nightly.
   fuzz-smoke [seconds] [target] Short reproducibly seeded ASan smoke (LSan where supported); defaults to all targets.
@@ -104,10 +106,13 @@ apple_check() {
     cargo +stable check --target x86_64-apple-darwin \
         --lib --tests --examples \
         --features "socket-tcp-dynamic-buffer,socket-tcp-cubic,socket-tcp-reno"
+    cargo +stable check --target x86_64-apple-darwin \
+        --lib --examples --no-default-features \
+        --features "$TUNNEL_DYNAMIC_FEATURES"
 
     for target in aarch64-apple-ios aarch64-apple-ios-sim; do
         cargo +stable check --target "$target" --lib \
-            --no-default-features --features "$IOS_FEATURES"
+            --no-default-features --features "$TUNNEL_DYNAMIC_FEATURES"
     done
 }
 
@@ -193,47 +198,59 @@ quick() {
 }
 
 ios_gate() {
-    cargo test --release --lib --no-default-features --features "std,$IOS_FEATURES" dyn_buf -- --test-threads=1
+    cargo test --release --lib --no-default-features --features "$TUNNEL_DYNAMIC_FEATURES" dyn_buf -- --test-threads=1
     cargo test --release --test sizecheck --no-default-features --features "$IOS_FEATURES" -- --nocapture
-    cargo run --release --example dynbuf_memcompare --features socket-tcp-dynamic-buffer -- dynamic 300
+    cargo run --release --example dynbuf_memcompare --no-default-features \
+        --features "$TUNNEL_DYNAMIC_FEATURES" -- dynamic 300
 }
 
 run_profile_commands() {
-    local manifest=$1
+    local binary=$1
+    local manifest=$2
     local command
     local -a argv
 
     while IFS= read -r command || [[ -n "$command" ]]; do
         read -r -a argv <<< "$command" || return
-        target/release/examples/profile_loopback "${argv[@]}" || return
+        "$binary" "${argv[@]}" || return
     done < "$manifest"
 }
 
 ios_full_gate() {
-    cargo test --release --lib --no-default-features --features "std,$IOS_FEATURES" dyn_buf -- --test-threads=1
+    local target_dir="${CARGO_TARGET_DIR:-target}"
+
+    cargo test --release --lib --no-default-features --features "$TUNNEL_DYNAMIC_FEATURES" dyn_buf -- --test-threads=1
     sizecheck
     apple_check
 
-    cargo build --release --example dynbuf_memcompare --features socket-tcp-dynamic-buffer
+    cargo build --release --target-dir "$target_dir" --example dynbuf_memcompare \
+        --no-default-features --features "$TUNNEL_DYNAMIC_FEATURES"
     for flows in 300 1000; do
-        target/release/examples/dynbuf_memcompare legacy "$flows"
-        target/release/examples/dynbuf_memcompare dynamic "$flows"
+        "$target_dir/release/examples/dynbuf_memcompare" legacy "$flows"
+        "$target_dir/release/examples/dynbuf_memcompare" dynamic "$flows"
     done
 
-    cargo build --release --example profile_loopback
-    run_profile_commands ci/ios-full-gate-static.txt
+    cargo build --release --target-dir "$target_dir" --example profile_loopback \
+        --no-default-features --features "$TUNNEL_STATIC_FEATURES"
+    run_profile_commands "$target_dir/release/examples/profile_loopback" \
+        ci/ios-full-gate-static.txt
 
-    cargo build --release --example profile_loopback --features socket-tcp-dynamic-buffer
-    run_profile_commands ci/ios-full-gate-dynamic.txt
+    cargo build --release --target-dir "$target_dir" --example profile_loopback \
+        --no-default-features --features "$TUNNEL_DYNAMIC_FEATURES"
+    run_profile_commands "$target_dir/release/examples/profile_loopback" \
+        ci/ios-full-gate-dynamic.txt
 
     netsim
 }
 
 profile_smoke() {
     local seconds="${1:-1}"
-    cargo run --release --example profile_loopback -- --mode bench udp "$seconds"
-    cargo run --release --example profile_loopback -- --mode bench many_tcp_fair "$seconds" 8
-    cargo run --release --example profile_loopback --features socket-tcp-dynamic-buffer -- --mode bench idle_hot "$seconds" 50 2
+    cargo run --release --example profile_loopback --no-default-features \
+        --features "$TUNNEL_STATIC_FEATURES" -- --mode bench udp "$seconds"
+    cargo run --release --example profile_loopback --no-default-features \
+        --features "$TUNNEL_STATIC_FEATURES" -- --mode bench many_tcp_fair "$seconds" 8
+    cargo run --release --example profile_loopback --no-default-features \
+        --features "$TUNNEL_DYNAMIC_FEATURES" -- --mode bench idle_hot "$seconds" 50 2
 }
 
 fuzz_build() {

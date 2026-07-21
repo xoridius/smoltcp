@@ -11,43 +11,16 @@
 //!   * smoltcp Socket footprint of relevant sockets
 //!   * `cycles_estimate` per packet from a 2.4 GHz reference
 //!
-//! Designed to run under `perf record`, `valgrind --tool=massif`, or
-//! `heaptrack` with no external setup.
-//!
-//! Usage:
-//!   cargo run --release --example profile_loopback -- [--mode bench|trace] <shape> <seconds> [opts...]
-//!
-//! Shapes:
-//!   udp           - 1400B UDP packet forwarding (tunnel analogue)
-//!   small         - many small TCP segments, measures per-packet overhead
-//!   pingpong      - 128B request/response, latency-bound
-//!   firehose      - one-way TCP bulk transfer (cwnd-limited)
-//!   many_tcp      - N concurrent TCP echo flows; stresses throughput,
-//!                   memory growth, and starvation. Usage:
-//!                     profile_loopback many_tcp 5 200 [offload]
-//!   many_tcp_fair - N concurrent TCP flows with deterministic per-flow
-//!                   scheduling. Usage:
-//!                     profile_loopback many_tcp_fair 5 200 [offload]
-//!   many_udp      - N concurrent UDP flows; same fairness + memory metrics.
-//!                     profile_loopback many_udp 5 200 [offload]
-//!   multi_tcp     - dynamic-buffer multi-thread TCP echo workload.
-//!   multi_tcp_sink - dynamic-buffer multi-thread one-way TCP sink workload.
-//!   all           - runs udp + small + pingpong back-to-back
-//!
-//! Recommended profiling recipes:
-//!   perf record -F 999 --call-graph dwarf -- \
-//!     target/release/examples/profile_loopback udp 5
-//!   perf report --no-children --stdio --percent-limit 1
-//!   valgrind --tool=massif --pages-as-heap=no -- \
-//!     target/release/examples/profile_loopback udp 2
+//! Designed to run under `perf`, Massif, or Heaptrack without external setup.
+//! Detailed CLI examples live in the iOS gate manifests and `FORK.md`.
 
-use std::alloc::{GlobalAlloc, Layout, System};
-use std::cell::{RefCell, RefMut};
+#[cfg(not(feature = "dhat-heap"))]
+use std::alloc::System;
+use std::alloc::{GlobalAlloc, Layout};
 use std::collections::VecDeque;
 use std::env;
 use std::num::{NonZeroU64, NonZeroUsize};
 use std::process::ExitCode;
-use std::rc::Rc;
 use std::str::FromStr;
 #[cfg(feature = "socket-tcp-dynamic-buffer")]
 use std::sync::atomic::AtomicBool;
@@ -55,7 +28,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant as StdInstant};
 
 mod process_memory;
-use process_memory::{process_memory_bytes, process_memory_label, signed_delta};
+use process_memory::{
+    ProcessMemorySample, process_memory_bytes, process_memory_label, process_memory_sample,
+    signed_delta,
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum RunMode {
@@ -126,6 +102,19 @@ enum TrafficShape {
     #[cfg(feature = "socket-tcp-dynamic-buffer")]
     Churn {
         rate: NonZeroUsize,
+    },
+    #[cfg(feature = "socket-tcp-dynamic-buffer")]
+    RstUnreadRx {
+        flows: NonZeroUsize,
+    },
+    #[cfg(feature = "socket-tcp-dynamic-buffer")]
+    PoolPressure {
+        flows: NonZeroUsize,
+    },
+    #[cfg(feature = "socket-tcp-dynamic-buffer")]
+    MixedTcpUdp {
+        tcp_flows: NonZeroUsize,
+        udp_flows: NonZeroUsize,
     },
     #[cfg(feature = "socket-tcp-dynamic-buffer")]
     IdleHot {
@@ -204,6 +193,19 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Config, String> 
             rate: next_nonzero_usize(&mut args, "rate")?,
         },
         #[cfg(feature = "socket-tcp-dynamic-buffer")]
+        "rst_unread_rx" => TrafficShape::RstUnreadRx {
+            flows: next_nonzero_usize(&mut args, "flows")?,
+        },
+        #[cfg(feature = "socket-tcp-dynamic-buffer")]
+        "pool_pressure" => TrafficShape::PoolPressure {
+            flows: next_nonzero_usize(&mut args, "flows")?,
+        },
+        #[cfg(feature = "socket-tcp-dynamic-buffer")]
+        "mixed_tcp_udp" => TrafficShape::MixedTcpUdp {
+            tcp_flows: next_nonzero_usize(&mut args, "TCP flows")?,
+            udp_flows: next_nonzero_usize(&mut args, "UDP flows")?,
+        },
+        #[cfg(feature = "socket-tcp-dynamic-buffer")]
         "idle_hot" => {
             let idle = next_usize(&mut args, "idle flows")?;
             let active = next_usize(&mut args, "active flows")?;
@@ -213,7 +215,8 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Config, String> 
             TrafficShape::IdleHot { idle, active }
         }
         #[cfg(not(feature = "socket-tcp-dynamic-buffer"))]
-        "multi_tcp" | "multi_tcp_sink" | "churn" | "idle_hot" => {
+        "multi_tcp" | "multi_tcp_sink" | "churn" | "rst_unread_rx" | "pool_pressure"
+        | "mixed_tcp_udp" | "idle_hot" => {
             return Err(format!(
                 "traffic shape '{shape_name}' requires feature 'socket-tcp-dynamic-buffer'"
             ));
@@ -381,36 +384,127 @@ fn churn_interval_us(rate: usize) -> Result<u64, String> {
     Ok(interval.get())
 }
 
-/// Tracks every allocation routed through the global allocator. We only count
-/// counter atomics (Relaxed), so the overhead is two adds per alloc/free.
-#[allow(dead_code)] // unused when `dhat-heap` feature swaps the global allocator
+/// Tracks successful requested allocation bytes. Byte counters use relaxed
+/// atomics; dynamic phase ownership uses acquire/release, with begin and finish
+/// externally bracketed while workload workers are quiescent.
 struct CountingAlloc;
 static ALLOC_BYTES: AtomicU64 = AtomicU64::new(0);
 static ALLOC_COUNT: AtomicU64 = AtomicU64::new(0);
 static FREE_BYTES: AtomicU64 = AtomicU64::new(0);
 
-unsafe impl GlobalAlloc for CountingAlloc {
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        ALLOC_BYTES.fetch_add(layout.size() as u64, Ordering::Relaxed);
-        ALLOC_COUNT.fetch_add(1, Ordering::Relaxed);
-        unsafe { System.alloc(layout) }
+#[cfg(not(feature = "dhat-heap"))]
+static ALLOCATOR_BACKEND: System = System;
+#[cfg(feature = "dhat-heap")]
+static ALLOCATOR_BACKEND: dhat::Alloc = dhat::Alloc;
+
+#[cfg(feature = "socket-tcp-dynamic-buffer")]
+struct AllocatorTelemetry {
+    live: AtomicU64,
+    phase_peak: AtomicU64,
+    phase_active: AtomicBool,
+}
+
+#[cfg(feature = "socket-tcp-dynamic-buffer")]
+impl AllocatorTelemetry {
+    const fn new() -> Self {
+        Self {
+            live: AtomicU64::new(0),
+            phase_peak: AtomicU64::new(0),
+            phase_active: AtomicBool::new(false),
+        }
     }
-    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        FREE_BYTES.fetch_add(layout.size() as u64, Ordering::Relaxed);
-        unsafe { System.dealloc(ptr, layout) }
+
+    fn record_alloc(&self, bytes: u64) {
+        let live = self
+            .live
+            .fetch_add(bytes, Ordering::Relaxed)
+            .wrapping_add(bytes);
+        if self.phase_active.load(Ordering::Acquire) {
+            self.phase_peak.fetch_max(live, Ordering::Relaxed);
+        }
+    }
+
+    fn record_dealloc(&self, bytes: u64) {
+        self.live.fetch_sub(bytes, Ordering::Relaxed);
+    }
+
+    fn begin(&self) -> Result<AllocatorPhase<'_>, &'static str> {
+        self.phase_active
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .map_err(|_| "allocator phase is already active")?;
+        let live_start = self.live.load(Ordering::Relaxed);
+        self.phase_peak.store(live_start, Ordering::Relaxed);
+        Ok(AllocatorPhase {
+            telemetry: self,
+            live_start,
+            active: true,
+        })
     }
 }
 
-#[cfg(not(feature = "dhat-heap"))]
+#[cfg(feature = "socket-tcp-dynamic-buffer")]
+static ALLOCATOR_TELEMETRY: AllocatorTelemetry = AllocatorTelemetry::new();
+
+#[cfg(feature = "socket-tcp-dynamic-buffer")]
+#[derive(Debug, Eq, PartialEq)]
+struct AllocatorPeak {
+    live_start: u64,
+    live_end: u64,
+    live_peak: u64,
+}
+
+#[cfg(feature = "socket-tcp-dynamic-buffer")]
+struct AllocatorPhase<'a> {
+    telemetry: &'a AllocatorTelemetry,
+    live_start: u64,
+    active: bool,
+}
+
+#[cfg(feature = "socket-tcp-dynamic-buffer")]
+impl AllocatorPhase<'_> {
+    fn finish(mut self) -> AllocatorPeak {
+        self.telemetry.phase_active.store(false, Ordering::Release);
+        self.active = false;
+        AllocatorPeak {
+            live_start: self.live_start,
+            live_end: self.telemetry.live.load(Ordering::Relaxed),
+            live_peak: self.telemetry.phase_peak.load(Ordering::Relaxed),
+        }
+    }
+}
+
+#[cfg(feature = "socket-tcp-dynamic-buffer")]
+impl Drop for AllocatorPhase<'_> {
+    fn drop(&mut self) {
+        if self.active {
+            self.telemetry.phase_active.store(false, Ordering::Release);
+        }
+    }
+}
+
+unsafe impl GlobalAlloc for CountingAlloc {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        let ptr = unsafe { ALLOCATOR_BACKEND.alloc(layout) };
+        if !ptr.is_null() {
+            let bytes = layout.size() as u64;
+            ALLOC_BYTES.fetch_add(bytes, Ordering::Relaxed);
+            ALLOC_COUNT.fetch_add(1, Ordering::Relaxed);
+            #[cfg(feature = "socket-tcp-dynamic-buffer")]
+            ALLOCATOR_TELEMETRY.record_alloc(bytes);
+        }
+        ptr
+    }
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        let bytes = layout.size() as u64;
+        FREE_BYTES.fetch_add(bytes, Ordering::Relaxed);
+        #[cfg(feature = "socket-tcp-dynamic-buffer")]
+        ALLOCATOR_TELEMETRY.record_dealloc(bytes);
+        unsafe { ALLOCATOR_BACKEND.dealloc(ptr, layout) }
+    }
+}
+
 #[global_allocator]
 static A: CountingAlloc = CountingAlloc;
-
-// dhat::Alloc wraps System and captures per-callstack allocation attribution.
-// When this feature is on, CountingAlloc is unused (kept compiled so the rest
-// of the file still references its ALLOC_* counters; they just stay at zero).
-#[cfg(feature = "dhat-heap")]
-#[global_allocator]
-static A: dhat::Alloc = dhat::Alloc;
 
 /// Read voluntary + involuntary context-switch counts from
 /// /proc/self/status on Linux. macOS users should use Instruments System
@@ -527,8 +621,8 @@ impl Histo {
         let target = ((self.samples as f64 * p).ceil() as u64).max(1);
         let mut cum = 0u64;
         for (i, row) in self.buckets.iter().enumerate() {
-            for (j, &c) in row.iter().enumerate() {
-                cum += c;
+            for (j, &count) in row.iter().enumerate() {
+                cum += count;
                 if cum >= target {
                     return Self::upper(i, j).saturating_sub(1);
                 }
@@ -563,13 +657,7 @@ struct Fairness {
     /// Index of the flow with the largest byte count.
     max_flow: usize,
     mean: f64,
-    stddev: f64,
-    /// Coefficient of variation = stddev / mean.
-    cv: f64,
     jain: f64,
-    /// Per-flow byte counts, sorted ascending — used to print percentiles and
-    /// to identify starved flows.
-    sorted: Vec<u64>,
     /// Flows below 10% of the mean; nonzero values are a starvation flag.
     starved: usize,
     /// Flows that received zero bytes — a strong starvation signal.
@@ -591,17 +679,6 @@ impl Fairness {
             .max_by_key(|&(_, &v)| v)
             .unwrap_or((0, &0));
         let mean = total as f64 / n.max(1) as f64;
-        let var = if n == 0 {
-            0.0
-        } else {
-            per_flow
-                .iter()
-                .map(|&x| (x as f64 - mean).powi(2))
-                .sum::<f64>()
-                / n as f64
-        };
-        let stddev = var.sqrt();
-        let cv = if mean > 0.0 { stddev / mean } else { 0.0 };
         // Jain's fairness index.
         let sum_sq: f64 = per_flow.iter().map(|&x| (x as f64).powi(2)).sum();
         let jain = if sum_sq > 0.0 {
@@ -610,8 +687,6 @@ impl Fairness {
         } else {
             0.0
         };
-        let mut sorted = per_flow.to_vec();
-        sorted.sort_unstable();
         let starved = per_flow
             .iter()
             .filter(|&&x| (x as f64) < 0.1 * mean)
@@ -625,21 +700,10 @@ impl Fairness {
             min_flow,
             max_flow,
             mean,
-            stddev,
-            cv,
             jain,
-            sorted,
             starved,
             zero_flows,
         }
-    }
-
-    fn at(&self, p: f64) -> u64 {
-        if self.sorted.is_empty() {
-            return 0;
-        }
-        let idx = ((self.sorted.len() as f64 * p) as usize).min(self.sorted.len() - 1);
-        self.sorted[idx]
     }
 
     fn print(&self, label: &str) {
@@ -650,23 +714,10 @@ impl Fairness {
             self.n, self.total, self.mean
         );
         println!(
-            "    min:   {:>14} (flow #{:<5})  p10:   {:>14}  p50: {:>12}",
-            self.min,
-            self.min_flow,
-            self.at(0.10),
-            self.at(0.50)
+            "    min:   {:>14} (flow #{:<5})  max: {:>14} (flow #{})",
+            self.min, self.min_flow, self.max, self.max_flow
         );
-        println!(
-            "    p90:   {:>14}                  p99:   {:>14}  max: {:>12} (flow #{})",
-            self.at(0.90),
-            self.at(0.99),
-            self.max,
-            self.max_flow
-        );
-        println!(
-            "    stddev:{:>14.1}     CV:    {:>14.4}     Jain: {:>12.4}",
-            self.stddev, self.cv, self.jain
-        );
+        println!("    Jain:  {:>14.4}", self.jain);
         let fairness_verdict = if self.jain >= 0.95 {
             "FAIR"
         } else if self.jain >= 0.80 {
@@ -801,9 +852,8 @@ fn validate_fairness(shape: &str, fairness: &Fairness) -> Result<(), String> {
     Ok(())
 }
 
-/// Periodic process-memory samples paired with allocator activity show
-/// whether memory grows over a many-flow run
-/// (= leak) or plateaus (= bounded, healthy).
+/// Periodic process-memory trace for leak diagnosis. Landing RSS gates compare
+/// fresh-process matched samples instead of this short-run heuristic.
 struct MemTrace {
     samples: Vec<(u64, u64, u64)>, // (ms_since_start, memory_bytes, alloc_bytes_delta)
     start_wall: StdInstant,
@@ -811,9 +861,13 @@ struct MemTrace {
 }
 
 impl MemTrace {
-    fn start() -> Self {
+    fn start(mode: RunMode) -> Self {
         Self {
-            samples: Vec::with_capacity(64),
+            samples: if mode.sample_memory() {
+                Vec::with_capacity(64)
+            } else {
+                Vec::new()
+            },
             start_wall: StdInstant::now(),
             start_alloc: ALLOC_BYTES.load(Ordering::Relaxed),
         }
@@ -827,8 +881,12 @@ impl MemTrace {
         if self.samples.is_empty() || elapsed >= last + interval_ms {
             let memory = process_memory_bytes();
             let alloc_now = ALLOC_BYTES.load(Ordering::Relaxed);
-            self.samples
-                .push((elapsed, memory, alloc_now - self.start_alloc));
+            let sample = (elapsed, memory, alloc_now - self.start_alloc);
+            if self.samples.len() < self.samples.capacity() {
+                self.samples.push(sample);
+            } else if let Some(last) = self.samples.last_mut() {
+                *last = sample;
+            }
         }
     }
     fn print(&self) {
@@ -846,7 +904,7 @@ impl MemTrace {
         for (t, memory, alloc) in &self.samples {
             println!("    {t:>8}   {memory:>22}   {alloc:>10}");
         }
-        // Flag when the last sample is materially above the run's median.
+        // Flag a large late-run rise for follow-up profiling.
         let mut memory_sorted: Vec<u64> = self.samples.iter().map(|s| s.1).collect();
         memory_sorted.sort_unstable();
         let median = memory_sorted[memory_sorted.len() / 2];
@@ -899,7 +957,7 @@ impl SampledTimer {
     }
 }
 
-use smoltcp::iface::{Config as InterfaceConfig, Interface, SocketSet};
+use smoltcp::iface::{Config as InterfaceConfig, Interface, SocketHandle, SocketSet};
 use smoltcp::phy::{self, ChecksumCapabilities, Device, DeviceCapabilities, Medium};
 use smoltcp::socket::{tcp, udp};
 use smoltcp::time::Instant;
@@ -994,16 +1052,6 @@ impl Lane {
     }
 }
 
-type LaneRc = Rc<RefCell<Lane>>;
-
-fn collect_lane_stats(lanes: &[&LaneRc]) -> LaneStats {
-    let mut stats = LaneStats::default();
-    for lane in lanes {
-        stats.merge(lane.borrow().stats());
-    }
-    stats
-}
-
 fn print_lane_stats(label: &str, stats: LaneStats) {
     println!();
     println!("  lane stats ({label}):");
@@ -1053,13 +1101,74 @@ mod tests {
         }
     }
 
-    fn assert_manifest_commands_parse(manifest: &str, expected_count: usize) {
-        assert_eq!(manifest.lines().count(), expected_count);
-        for (line, command) in manifest.lines().enumerate() {
-            assert!(!command.trim().is_empty(), "blank line {}", line + 1);
-            let result = parse_args(command.split_ascii_whitespace().map(str::to_owned));
-            assert!(result.is_ok(), "command {command:?}: {result:?}");
-        }
+    fn manifest_configurations(manifest: &str) -> Vec<Config> {
+        manifest
+            .lines()
+            .enumerate()
+            .map(|(line, command)| {
+                assert!(!command.trim().is_empty(), "blank line {}", line + 1);
+                parse_args(command.split_ascii_whitespace().map(str::to_owned))
+                    .unwrap_or_else(|error| panic!("command {command:?}: {error}"))
+            })
+            .collect()
+    }
+
+    fn gate_configs(shapes: impl IntoIterator<Item = TrafficShape>) -> Vec<Config> {
+        shapes
+            .into_iter()
+            .flat_map(|shape| {
+                [
+                    config(RunMode::Bench, 3, shape, false),
+                    config(RunMode::Bench, 3, shape, true),
+                ]
+            })
+            .collect()
+    }
+
+    fn static_gate_configs() -> Vec<Config> {
+        let single = [
+            TrafficShape::Udp,
+            TrafficShape::Firehose,
+            TrafficShape::PingPong,
+            TrafficShape::Small,
+        ];
+        let many = [8, 50, 100].into_iter().flat_map(|flows| {
+            [
+                TrafficShape::ManyTcp { flows: nz(flows) },
+                TrafficShape::ManyTcpFair { flows: nz(flows) },
+                TrafficShape::ManyUdp { flows: nz(flows) },
+            ]
+        });
+        gate_configs(single.into_iter().chain(many))
+    }
+
+    #[cfg(feature = "socket-tcp-dynamic-buffer")]
+    fn dynamic_gate_configs() -> Vec<Config> {
+        gate_configs([
+            TrafficShape::MultiTcp {
+                threads: nz(2),
+                flows_per_thread: nz(50),
+            },
+            TrafficShape::MultiTcpSink {
+                threads: nz(2),
+                flows_per_thread: nz(50),
+            },
+            TrafficShape::Churn { rate: nz(500) },
+            TrafficShape::RstUnreadRx { flows: nz(100) },
+            TrafficShape::PoolPressure { flows: nz(50) },
+            TrafficShape::MixedTcpUdp {
+                tcp_flows: nz(50),
+                udp_flows: nz(50),
+            },
+            TrafficShape::IdleHot {
+                idle: 1000,
+                active: 0,
+            },
+            TrafficShape::IdleHot {
+                idle: 1000,
+                active: 10,
+            },
+        ])
     }
 
     fn assert_errors(cases: Vec<(Vec<&str>, &str)>) {
@@ -1162,6 +1271,36 @@ mod tests {
                 config(RunMode::Bench, 7, TrafficShape::Churn { rate: nz(8) }, true),
             ),
             (
+                &["rst_unread_rx", "8", "9"],
+                config(
+                    RunMode::Bench,
+                    8,
+                    TrafficShape::RstUnreadRx { flows: nz(9) },
+                    false,
+                ),
+            ),
+            (
+                &["pool_pressure", "9", "10", "offload"],
+                config(
+                    RunMode::Bench,
+                    9,
+                    TrafficShape::PoolPressure { flows: nz(10) },
+                    true,
+                ),
+            ),
+            (
+                &["mixed_tcp_udp", "10", "11", "12"],
+                config(
+                    RunMode::Bench,
+                    10,
+                    TrafficShape::MixedTcpUdp {
+                        tcp_flows: nz(11),
+                        udp_flows: nz(12),
+                    },
+                    false,
+                ),
+            ),
+            (
                 &["idle_hot", "9", "10", "0", "true"],
                 config(
                     RunMode::Bench,
@@ -1235,14 +1374,24 @@ mod tests {
     }
 
     #[test]
-    fn full_gate_static_command_list_has_26_parseable_commands() {
-        assert_manifest_commands_parse(include_str!("../ci/ios-full-gate-static.txt"), 26);
+    fn full_gate_static_command_list_matches_26_cell_matrix() {
+        let expected = static_gate_configs();
+        assert_eq!(expected.len(), 26);
+        assert_eq!(
+            manifest_configurations(include_str!("../ci/ios-full-gate-static.txt")),
+            expected
+        );
     }
 
     #[cfg(feature = "socket-tcp-dynamic-buffer")]
     #[test]
-    fn full_gate_dynamic_command_list_has_10_parseable_commands() {
-        assert_manifest_commands_parse(include_str!("../ci/ios-full-gate-dynamic.txt"), 10);
+    fn full_gate_dynamic_command_list_matches_16_cell_matrix() {
+        let expected = dynamic_gate_configs();
+        assert_eq!(expected.len(), 16);
+        assert_eq!(
+            manifest_configurations(include_str!("../ci/ios-full-gate-dynamic.txt")),
+            expected
+        );
     }
 
     #[test]
@@ -1323,6 +1472,24 @@ mod tests {
             (vec!["churn", "1"], "missing rate"),
             (vec!["churn", "1", "0"], "rate must be non-zero"),
             (vec!["churn", "1", "nope"], "invalid rate 'nope'"),
+            (vec!["rst_unread_rx", "1"], "missing flows"),
+            (vec!["rst_unread_rx", "1", "0"], "flows must be non-zero"),
+            (vec!["pool_pressure", "1"], "missing flows"),
+            (vec!["pool_pressure", "1", "0"], "flows must be non-zero"),
+            (vec!["mixed_tcp_udp", "1"], "missing TCP flows"),
+            (
+                vec!["mixed_tcp_udp", "1", "0", "2"],
+                "TCP flows must be non-zero",
+            ),
+            (vec!["mixed_tcp_udp", "1", "2"], "missing UDP flows"),
+            (
+                vec!["mixed_tcp_udp", "1", "2", "0"],
+                "UDP flows must be non-zero",
+            ),
+            (
+                vec!["mixed_tcp_udp", "1", "2", "nope"],
+                "invalid UDP flows 'nope'",
+            ),
             (vec!["idle_hot", "1"], "missing idle flows"),
             (vec!["idle_hot", "1", "2"], "missing active flows"),
             (
@@ -1347,7 +1514,15 @@ mod tests {
     #[cfg(not(feature = "socket-tcp-dynamic-buffer"))]
     #[test]
     fn parse_args_reports_the_required_feature_for_dynamic_shapes() {
-        for shape in ["multi_tcp", "multi_tcp_sink", "churn", "idle_hot"] {
+        for shape in [
+            "multi_tcp",
+            "multi_tcp_sink",
+            "churn",
+            "rst_unread_rx",
+            "pool_pressure",
+            "mixed_tcp_udp",
+            "idle_hot",
+        ] {
             let input = [shape, "1", "1", "1"];
             assert_eq!(
                 args(&input),
@@ -1390,27 +1565,17 @@ mod tests {
 
     #[test]
     fn extreme_static_workloads_return_errors_without_panicking() {
-        use std::panic::{AssertUnwindSafe, catch_unwind};
-
-        for outcome in [
-            catch_unwind(AssertUnwindSafe(|| shape_firehose(u64::MAX, false))),
-            catch_unwind(AssertUnwindSafe(|| shape_small(u64::MAX, false))),
-            catch_unwind(AssertUnwindSafe(|| shape_pingpong(u64::MAX, false))),
-            catch_unwind(AssertUnwindSafe(|| {
-                shape_many_tcp_fair(1, usize::MAX, false, RunMode::Bench)
-            })),
-            catch_unwind(AssertUnwindSafe(|| {
-                shape_many_udp(1, usize::MAX, false, RunMode::Bench)
-            })),
-            catch_unwind(AssertUnwindSafe(|| {
-                shape_many_tcp(1, usize::MAX, false, RunMode::Bench)
-            })),
-            catch_unwind(AssertUnwindSafe(|| shape_udp_firehose(u64::MAX, false))),
-            catch_unwind(AssertUnwindSafe(|| {
-                run_config(config(RunMode::Bench, u64::MAX, TrafficShape::All, false))
-            })),
+        for result in [
+            shape_firehose(u64::MAX, false),
+            shape_small(u64::MAX, false),
+            shape_pingpong(u64::MAX, false),
+            shape_many_tcp_fair(1, usize::MAX, false, RunMode::Bench),
+            shape_many_udp(1, usize::MAX, false, RunMode::Bench),
+            shape_many_tcp(1, usize::MAX, false, RunMode::Bench),
+            shape_udp_firehose(u64::MAX, false),
+            run_config(config(RunMode::Bench, u64::MAX, TrafficShape::All, false)),
         ] {
-            assert!(matches!(outcome, Ok(Err(_))), "outcome: {outcome:?}");
+            assert!(result.is_err(), "result: {result:?}");
         }
         assert!(validate_unique_flow_count("many_tcp", MAX_UNIQUE_FLOWS).is_ok());
         assert!(validate_unique_flow_count("many_tcp", MAX_UNIQUE_FLOWS + 1).is_err());
@@ -1427,6 +1592,17 @@ mod tests {
         ] {
             assert!(result.is_err());
         }
+    }
+
+    #[test]
+    fn memory_trace_keeps_a_bounded_current_tail_sample() {
+        let mut trace = MemTrace::start(RunMode::Bench);
+        let capacity = trace.samples.capacity();
+        trace.samples.resize(capacity, (0, u64::MAX, 0));
+        trace.maybe_sample(0);
+        assert_eq!(trace.samples.len(), capacity);
+        assert_eq!(trace.samples.capacity(), capacity);
+        assert_ne!(trace.samples.last().unwrap().1, u64::MAX);
     }
 
     #[test]
@@ -1464,78 +1640,112 @@ mod tests {
 
     #[cfg(feature = "socket-tcp-dynamic-buffer")]
     #[test]
-    fn multi_tcp_validation_gates_workers_and_pool_boundaries() {
+    fn multi_tcp_validation_gates_workers() {
         let workers = [Ok(worker_stats(100)), Ok(worker_stats(100))];
-        assert!(validate_multi_tcp_workers("multi_tcp", &workers, 100, 100, 0).is_ok());
+        assert!(validate_multi_tcp_workers("multi_tcp", &workers).is_ok());
 
         let mut incomplete = worker_stats(100);
         incomplete.established = 1;
         let invalid = [Err("listen failed".to_owned()), Ok(worker_stats(100))];
-        assert!(validate_multi_tcp_workers("multi_tcp", &invalid, 100, 100, 0).is_err());
+        assert!(validate_multi_tcp_workers("multi_tcp", &invalid).is_err());
         let invalid = [Ok(incomplete), Ok(worker_stats(100))];
-        assert!(validate_multi_tcp_workers("multi_tcp", &invalid, 100, 100, 0).is_err());
+        assert!(validate_multi_tcp_workers("multi_tcp", &invalid).is_err());
         assert!(
-            validate_multi_tcp_workers(
-                "multi_tcp",
-                &[Ok(worker_stats(0)), Ok(worker_stats(0))],
-                100,
-                100,
-                0,
-            )
-            .is_err()
+            validate_multi_tcp_workers("multi_tcp", &[Ok(worker_stats(0)), Ok(worker_stats(0))])
+                .is_err()
         );
         assert!(
-            validate_multi_tcp_workers(
-                "multi_tcp",
-                &[Ok(worker_stats(1)), Ok(worker_stats(100))],
-                100,
-                100,
-                0,
-            )
-            .is_err()
+            validate_multi_tcp_workers("multi_tcp", &[Ok(worker_stats(1)), Ok(worker_stats(100))])
+                .is_err()
         );
-        assert!(validate_multi_tcp_workers("multi_tcp", &workers, 101, 100, 0).is_err());
-        assert!(validate_multi_tcp_workers("multi_tcp", &workers, 100, 100, 1).is_err());
     }
 
     #[cfg(feature = "socket-tcp-dynamic-buffer")]
     #[test]
-    fn work_counter_and_pool_validation_rejects_empty_or_unbounded_runs() {
-        assert!(validate_nonzero_counters("churn", &[("opened", 1), ("closed", 1)]).is_ok());
-        assert!(validate_nonzero_counters("churn", &[("opened", 0)]).is_err());
-        assert!(validate_pool_boundaries("churn", 100, 100, 0).is_ok());
-        assert!(validate_pool_boundaries("churn", 101, 100, 0).is_err());
-        assert!(validate_pool_boundaries("churn", 100, 100, 1).is_err());
+    fn rst_unread_rx_validation_requires_retention_drain_and_refund() {
+        assert!(validate_rst_unread_rx(2, 2, 2048, 2048, 16384, 0, 0).is_ok());
+        for result in [
+            validate_rst_unread_rx(2, 1, 2048, 2048, 16384, 0, 0),
+            validate_rst_unread_rx(2, 2, 0, 0, 16384, 0, 0),
+            validate_rst_unread_rx(2, 2, 2048, 1024, 16384, 0, 0),
+            validate_rst_unread_rx(2, 2, 2048, 2048, 0, 0, 0),
+            validate_rst_unread_rx(2, 2, 2048, 2048, 16384, 1, 0),
+            validate_rst_unread_rx(2, 2, 2048, 2048, 16384, 0, 1),
+        ] {
+            assert!(result.is_err());
+        }
+    }
+
+    #[cfg(feature = "socket-tcp-dynamic-buffer")]
+    #[test]
+    fn pool_pressure_validation_requires_saturation_backpressure_and_fair_progress() {
+        let received = [2048, 2048];
+        let fair = fairness_after_prefill(&received, 1024);
+        assert!(validate_pool_pressure(2, 65536, 65536, 8192, &fair, 0).is_ok());
+        for result in [
+            validate_pool_pressure(1, 65536, 65536, 8192, &fair, 0),
+            validate_pool_pressure(2, 61440, 65536, 8192, &fair, 0),
+            validate_pool_pressure(2, 65536, 65536, 0, &fair, 0),
+            validate_pool_pressure(
+                2,
+                65536,
+                65536,
+                8192,
+                &fairness_after_prefill(&[1024, 1024], 1024),
+                0,
+            ),
+            validate_pool_pressure(
+                2,
+                65536,
+                65536,
+                8192,
+                &fairness_after_prefill(&[2048, 1024], 1024),
+                0,
+            ),
+            validate_pool_pressure(2, 65536, 65536, 8192, &fair, 1),
+        ] {
+            assert!(result.is_err());
+        }
+    }
+
+    #[cfg(feature = "socket-tcp-dynamic-buffer")]
+    #[test]
+    fn churn_validation_requires_95_percent_of_target() {
+        assert!(validate_churn_rate(500, 3.0, 1_425, 1_425).is_ok());
+        assert!(validate_churn_rate(500, 3.0, 1_424, 1_425).is_err());
+        assert!(validate_churn_rate(500, 3.0, 1_500, 1_424).is_err());
+        assert!(validate_churn_rate(500, 3.0, 1_500, 1_501).is_err());
+    }
+
+    #[cfg(feature = "socket-tcp-dynamic-buffer")]
+    #[test]
+    fn idle_hot_link_capacity_depends_only_on_active_flows() {
+        assert_eq!(idle_hot_queue_depth(0), Ok(2));
+        assert_eq!(idle_hot_queue_depth(1), Ok(64));
+        assert_eq!(idle_hot_queue_depth(10), Ok(160));
+        assert_eq!(idle_hot_queue_depth(100), Ok(1600));
+        assert_eq!(idle_hot_queue_depth(1000), Ok(16000));
+        assert!(idle_hot_queue_depth(usize::MAX).is_err());
     }
 
     #[cfg(feature = "socket-tcp-dynamic-buffer")]
     #[test]
     fn extreme_dynamic_workloads_return_errors_without_panicking() {
-        use std::panic::{AssertUnwindSafe, catch_unwind};
-
-        let outcomes = [
-            catch_unwind(AssertUnwindSafe(|| {
-                shape_multi_tcp(1, usize::MAX, 1, false)
-            })),
-            catch_unwind(AssertUnwindSafe(|| {
-                shape_multi_tcp_sink(1, 1, usize::MAX, false)
-            })),
-            catch_unwind(AssertUnwindSafe(|| {
-                shape_idle_hot(1, usize::MAX, 1, false, RunMode::Bench)
-            })),
-            catch_unwind(AssertUnwindSafe(|| {
-                shape_churn(1, usize::MAX, false, RunMode::Bench)
-            })),
-            catch_unwind(AssertUnwindSafe(|| shape_multi_tcp(u64::MAX, 1, 1, false))),
-            catch_unwind(AssertUnwindSafe(|| {
-                shape_churn(u64::MAX, 1, false, RunMode::Bench)
-            })),
-            catch_unwind(AssertUnwindSafe(|| {
-                shape_idle_hot(u64::MAX, 1, 0, false, RunMode::Bench)
-            })),
+        let results = [
+            shape_multi_tcp(1, usize::MAX, 1, false),
+            shape_multi_tcp_sink(1, 1, usize::MAX, false),
+            shape_rst_unread_rx(1, usize::MAX, false, RunMode::Bench),
+            shape_pool_pressure(1, usize::MAX, false, RunMode::Bench),
+            shape_mixed_tcp_udp(1, usize::MAX, 1, false, RunMode::Bench),
+            shape_mixed_tcp_udp(1, 1, usize::MAX, false, RunMode::Bench),
+            shape_idle_hot(1, usize::MAX, 1, false, RunMode::Bench),
+            shape_churn(1, usize::MAX, false, RunMode::Bench),
+            shape_multi_tcp(u64::MAX, 1, 1, false),
+            shape_churn(u64::MAX, 1, false, RunMode::Bench),
+            shape_idle_hot(u64::MAX, 1, 0, false, RunMode::Bench),
         ];
-        for outcome in outcomes {
-            assert!(matches!(outcome, Ok(Err(_))), "outcome: {outcome:?}");
+        for result in results {
+            assert!(result.is_err(), "result: {result:?}");
         }
         assert!(validate_unique_worker_count("multi_tcp", MAX_UNIQUE_WORKERS).is_ok());
         assert!(validate_unique_worker_count("multi_tcp", MAX_UNIQUE_WORKERS + 1).is_err());
@@ -1553,12 +1763,11 @@ mod tests {
         assert_eq!(duplicate, misplaced);
     }
 
-    fn lane(mtu: usize, depth: usize) -> LaneRc {
-        Rc::new(RefCell::new(Lane::new(mtu, depth)))
+    fn link(mtu: usize, depth: usize) -> PairedLink {
+        PairedLink::new(mtu, depth, false)
     }
 
-    fn queue_packet(lane: &LaneRc, bytes: &[u8]) {
-        let mut lane = lane.borrow_mut();
+    fn queue_packet(lane: &mut Lane, bytes: &[u8]) {
         let mut packet = lane
             .try_take_packet()
             .expect("packet pool exhausted in test setup");
@@ -1567,53 +1776,45 @@ mod tests {
         lane.queue_pkt(packet);
     }
 
-    fn device(tx: &LaneRc, rx: &LaneRc, mtu: usize) -> PairedDevice {
-        PairedDevice::new(tx.clone(), rx.clone(), mtu, false)
-    }
-
     #[test]
     fn transmit_token_construction_preserves_lane() {
-        let tx = lane(64, 2);
-        let rx = lane(64, 2);
-        let mut device = device(&tx, &rx, 64);
+        let mut link = link(64, 2);
+        let mut stats = DeviceStats::default();
+        let mut device = link.device(LinkEndpoint::A, &mut stats);
 
         let token = device.transmit(Instant::from_millis(0)).unwrap();
 
-        assert_eq!(tx.borrow().pool.len(), 2);
-        assert!(tx.borrow().queue.is_empty());
         drop(token);
-        assert_eq!(tx.borrow().pool.len(), 2);
-        assert!(tx.borrow().queue.is_empty());
+        assert_eq!(link.a_to_b.pool.len(), 2);
+        assert!(link.a_to_b.queue.is_empty());
     }
 
     #[test]
     fn standalone_transmit_preserves_last_response_credit() {
-        let tx = lane(64, 2);
-        let rx = lane(64, 2);
-        queue_packet(&tx, &[1]);
-        let mut device = device(&tx, &rx, 64);
+        let mut link = link(64, 2);
+        queue_packet(&mut link.a_to_b, &[1]);
+        let mut stats = DeviceStats::default();
+        let mut device = link.device(LinkEndpoint::A, &mut stats);
 
         assert!(device.transmit(Instant::from_millis(0)).is_none());
-        assert_eq!(tx.borrow().pool.len(), 1);
-        assert_eq!(tx.borrow().queue.len(), 1);
-        assert_eq!(tx.borrow().stats.tx_backpressure, 1);
+        assert_eq!(link.a_to_b.pool.len(), 1);
+        assert_eq!(link.a_to_b.queue.len(), 1);
+        assert_eq!(link.a_to_b.stats.tx_backpressure, 1);
     }
 
     #[test]
     fn transmit_consume_reuses_preallocated_packet_and_queue_storage() {
-        let tx = lane(64, 2);
-        let rx = lane(64, 2);
-        let mut device = device(&tx, &rx, 64);
-        let packet_buffer = tx.borrow().pool.last().unwrap().buf.as_ptr();
-        let packet_capacity = tx.borrow().pool.last().unwrap().buf.capacity();
-        let queue_capacity = tx.borrow().queue.capacity();
+        let mut link = link(64, 2);
+        let packet_buffer = link.a_to_b.pool.last().unwrap().buf.as_ptr();
+        let packet_capacity = link.a_to_b.pool.last().unwrap().buf.capacity();
+        let queue_capacity = link.a_to_b.queue.capacity();
+        let mut stats = DeviceStats::default();
+        let mut device = link.device(LinkEndpoint::A, &mut stats);
         let token = device.transmit(Instant::from_millis(0)).unwrap();
-
-        assert_eq!(tx.borrow().pool.len(), 2);
 
         phy::TxToken::consume(token, 4, |buffer| buffer.copy_from_slice(&[1, 2, 3, 4]));
 
-        let tx = tx.borrow();
+        let tx = &link.a_to_b;
         assert_eq!(tx.pool.len(), 1);
         assert_eq!(tx.queue.capacity(), queue_capacity);
         assert_eq!(tx.queue[0].buf.as_ptr(), packet_buffer);
@@ -1623,18 +1824,22 @@ mod tests {
 
     #[test]
     fn paired_receive_backpressure_leaves_rx_queued() {
-        let tx = lane(64, 1);
-        let rx = lane(64, 2);
-        queue_packet(&rx, &[1]);
-        queue_packet(&rx, &[2]);
-        let reserved = tx.borrow_mut().try_take_packet().unwrap();
-        let mut device = device(&tx, &rx, 64);
+        let mut link = link(64, 1);
+        *link.b_to_a = Lane::new(64, 2);
+        queue_packet(&mut link.b_to_a, &[1]);
+        queue_packet(&mut link.b_to_a, &[2]);
+        let reserved = link.a_to_b.try_take_packet().unwrap();
+        let mut stats = DeviceStats::default();
 
-        assert!(device.receive(Instant::from_millis(0)).is_none());
-        assert_eq!(rx.borrow().queue.len(), 2);
-        assert_eq!(tx.borrow().stats.rx_backpressure, 1);
+        {
+            let mut device = link.device(LinkEndpoint::A, &mut stats);
+            assert!(device.receive(Instant::from_millis(0)).is_none());
+        }
+        assert_eq!(link.b_to_a.queue.len(), 2);
+        assert_eq!(link.a_to_b.stats.rx_backpressure, 1);
 
-        tx.borrow_mut().return_pkt(reserved);
+        link.a_to_b.return_pkt(reserved);
+        let mut device = link.device(LinkEndpoint::A, &mut stats);
         let (rx_token, tx_token) = device.receive(Instant::from_millis(0)).unwrap();
         assert_eq!(phy::RxToken::consume(rx_token, |bytes| bytes[0]), 1);
         drop(tx_token);
@@ -1645,45 +1850,41 @@ mod tests {
 
     #[test]
     fn paired_receive_tx_token_construction_preserves_tx_pool() {
-        let tx = lane(64, 1);
-        let rx = lane(64, 1);
-        queue_packet(&rx, &[1, 2, 3]);
-        let mut device = device(&tx, &rx, 64);
+        let mut link = link(64, 1);
+        queue_packet(&mut link.b_to_a, &[1, 2, 3]);
+        let mut stats = DeviceStats::default();
+        let mut device = link.device(LinkEndpoint::A, &mut stats);
 
         let (rx_token, tx_token) = device.receive(Instant::from_millis(0)).unwrap();
-        assert_eq!(tx.borrow().pool.len(), 1);
-        assert!(rx.borrow().queue.is_empty());
-
         phy::RxToken::consume(rx_token, |bytes| assert_eq!(bytes, [1, 2, 3]));
         drop(tx_token);
 
-        assert_eq!(tx.borrow().pool.len(), 1);
-        assert_eq!(rx.borrow().pool.len(), 1);
+        assert_eq!(link.a_to_b.pool.len(), 1);
+        assert_eq!(link.b_to_a.pool.len(), 1);
     }
 
     #[test]
     fn paired_response_consumes_final_credit() {
-        let tx = lane(64, 1);
-        let rx = lane(64, 1);
-        queue_packet(&rx, &[1]);
-        let mut device = device(&tx, &rx, 64);
+        let mut link = link(64, 1);
+        queue_packet(&mut link.b_to_a, &[1]);
+        let mut stats = DeviceStats::default();
+        let mut device = link.device(LinkEndpoint::A, &mut stats);
 
         let (rx_token, tx_token) = device.receive(Instant::from_millis(0)).unwrap();
-        assert_eq!(tx.borrow().pool.len(), 1);
         phy::RxToken::consume(rx_token, |_| ());
         phy::TxToken::consume(tx_token, 1, |buffer| buffer[0] = 2);
 
-        assert!(tx.borrow().pool.is_empty());
-        assert_eq!(&tx.borrow().queue[0].buf[..1], &[2]);
+        assert!(link.a_to_b.pool.is_empty());
+        assert_eq!(&link.a_to_b.queue[0].buf[..1], &[2]);
     }
 
     #[test]
     fn oversized_transmit_panics_and_preserves_credit() {
         use std::panic::{AssertUnwindSafe, catch_unwind};
 
-        let tx = lane(64, 2);
-        let rx = lane(64, 2);
-        let mut device = device(&tx, &rx, 64);
+        let mut link = link(64, 2);
+        let mut stats = DeviceStats::default();
+        let mut device = link.device(LinkEndpoint::A, &mut stats);
         let token = device.transmit(Instant::from_millis(0)).unwrap();
 
         let result = catch_unwind(AssertUnwindSafe(|| {
@@ -1691,17 +1892,17 @@ mod tests {
         }));
 
         assert!(result.is_err());
-        assert_eq!(tx.borrow().pool.len(), 2);
-        assert!(tx.borrow().queue.is_empty());
+        assert_eq!(link.a_to_b.pool.len(), 2);
+        assert!(link.a_to_b.queue.is_empty());
     }
 
     #[test]
     fn transmit_callback_panic_returns_checked_out_packet() {
         use std::panic::{AssertUnwindSafe, catch_unwind};
 
-        let tx = lane(64, 2);
-        let rx = lane(64, 2);
-        let mut device = device(&tx, &rx, 64);
+        let mut link = link(64, 2);
+        let mut stats = DeviceStats::default();
+        let mut device = link.device(LinkEndpoint::A, &mut stats);
         let token = device.transmit(Instant::from_millis(0)).unwrap();
 
         let result = catch_unwind(AssertUnwindSafe(|| {
@@ -1712,52 +1913,48 @@ mod tests {
         }));
 
         assert!(result.is_err());
-        assert_eq!(tx.borrow().pool.len(), 2);
-        assert!(tx.borrow().queue.is_empty());
-    }
-
-    #[test]
-    fn packet_ownership_is_conserved_across_token_and_queue() {
-        let tx = lane(64, 2);
-        let rx = lane(64, 2);
-        let mut device = device(&tx, &rx, 64);
-
-        let token = device.transmit(Instant::from_millis(0)).unwrap();
-        assert_eq!(tx.borrow().pool.len() + tx.borrow().queue.len(), 2);
-
-        phy::TxToken::consume(token, 1, |buffer| buffer[0] = 1);
-        assert_eq!(tx.borrow().pool.len() + tx.borrow().queue.len(), 2);
+        assert_eq!(link.a_to_b.pool.len(), 2);
+        assert!(link.a_to_b.queue.is_empty());
     }
 
     #[test]
     fn symmetrically_saturated_lanes_make_response_progress() {
-        let lane_a = lane(64, 2);
-        let lane_b = lane(64, 2);
-        queue_packet(&lane_a, &[1]);
-        queue_packet(&lane_b, &[2]);
-        let mut device_a = device(&lane_a, &lane_b, 64);
-        let mut device_b = device(&lane_b, &lane_a, 64);
+        let mut link = link(64, 2);
+        queue_packet(&mut link.a_to_b, &[1]);
+        queue_packet(&mut link.b_to_a, &[2]);
+        let mut stats_a = DeviceStats::default();
+        let mut stats_b = DeviceStats::default();
 
-        assert!(device_a.transmit(Instant::from_millis(0)).is_none());
-        assert!(device_b.transmit(Instant::from_millis(0)).is_none());
+        {
+            let mut device = link.device(LinkEndpoint::A, &mut stats_a);
+            assert!(device.transmit(Instant::from_millis(0)).is_none());
+        }
+        {
+            let mut device = link.device(LinkEndpoint::B, &mut stats_b);
+            assert!(device.transmit(Instant::from_millis(0)).is_none());
+        }
+        {
+            let mut device = link.device(LinkEndpoint::A, &mut stats_a);
+            let (rx, tx) = device.receive(Instant::from_millis(0)).unwrap();
+            assert_eq!(phy::RxToken::consume(rx, |bytes| bytes[0]), 2);
+            phy::TxToken::consume(tx, 1, |buffer| buffer[0] = 3);
+        }
+        {
+            let mut device = link.device(LinkEndpoint::B, &mut stats_b);
+            let (rx, tx) = device.receive(Instant::from_millis(0)).unwrap();
+            assert_eq!(phy::RxToken::consume(rx, |bytes| bytes[0]), 1);
+            drop(tx);
+        }
 
-        let (rx_a, tx_a) = device_a.receive(Instant::from_millis(0)).unwrap();
-        assert_eq!(phy::RxToken::consume(rx_a, |bytes| bytes[0]), 2);
-        phy::TxToken::consume(tx_a, 1, |buffer| buffer[0] = 3);
-
-        let (rx_b, tx_b) = device_b.receive(Instant::from_millis(0)).unwrap();
-        assert_eq!(phy::RxToken::consume(rx_b, |bytes| bytes[0]), 1);
-        drop(tx_b);
-
-        assert_eq!(lane_a.borrow().pool.len(), 1);
-        assert_eq!(lane_b.borrow().pool.len(), 2);
+        assert_eq!(link.a_to_b.pool.len(), 1);
+        assert_eq!(link.b_to_a.pool.len(), 2);
     }
 
     #[test]
     fn lane_stats_reports_reserved_packet_memory() {
         let lane = Lane::new(1500, 3);
         let stats = lane.stats();
-        let payload_bytes = lane.pool.iter().map(|packet| packet.buf.capacity()).sum();
+        let payload_bytes: usize = lane.pool.iter().map(|packet| packet.buf.capacity()).sum();
         let packet_slot_bytes =
             (lane.queue.capacity() + lane.pool.capacity()) * core::mem::size_of::<Packet>();
 
@@ -1773,38 +1970,183 @@ mod tests {
 
     #[cfg(feature = "socket-tcp-dynamic-buffer")]
     #[test]
-    fn multi_tcp_memory_report_keeps_active_and_teardown_boundaries() {
+    fn allocator_phase_tracks_and_resets_requested_live_peak() {
+        let telemetry = AllocatorTelemetry::new();
+        telemetry.record_alloc(8);
+
+        let phase = telemetry.begin().unwrap();
+        telemetry.record_alloc(16);
+        telemetry.record_dealloc(8);
+        assert_eq!(
+            phase.finish(),
+            AllocatorPeak {
+                live_start: 8,
+                live_end: 16,
+                live_peak: 24,
+            }
+        );
+
+        let phase = telemetry.begin().unwrap();
+        telemetry.record_alloc(4);
+        assert_eq!(
+            phase.finish(),
+            AllocatorPeak {
+                live_start: 16,
+                live_end: 20,
+                live_peak: 20,
+            }
+        );
+    }
+
+    #[cfg(feature = "socket-tcp-dynamic-buffer")]
+    #[test]
+    fn allocator_phase_has_single_raii_owner() {
+        let telemetry = AllocatorTelemetry::new();
+        let phase = telemetry.begin().unwrap();
+        assert!(telemetry.begin().is_err());
+        drop(phase);
+        assert!(telemetry.begin().is_ok());
+    }
+
+    #[cfg(feature = "socket-tcp-dynamic-buffer")]
+    #[test]
+    fn dynamic_memory_report_keeps_distinct_memory_boundaries() {
         let before = AllocSnap {
             alloc_bytes: 1_000,
             alloc_count: 10,
             free_bytes: 400,
-            process_memory: 8_192,
+            process_memory: ProcessMemorySample {
+                current_bytes: 8_192,
+                lifetime_peak_bytes: Some(8_192),
+            },
             ctxsw_voluntary: 0,
             ctxsw_nonvoluntary: 0,
             cpu_ns: 0,
-            tsc: 0,
         };
         let after = AllocSnap {
             alloc_bytes: 1_600,
             alloc_count: 14,
             free_bytes: 850,
-            process_memory: 12_288,
+            process_memory: ProcessMemorySample {
+                current_bytes: 12_288,
+                lifetime_peak_bytes: Some(16_384),
+            },
             ctxsw_voluntary: 0,
             ctxsw_nonvoluntary: 0,
             cpu_ns: 0,
-            tsc: 0,
         };
 
-        let report = MultiTcpMemoryReport::from_snapshots(before, after, 65_536, 0);
+        let report = DynamicMemoryReport::from_snapshots(
+            before,
+            after,
+            AllocatorPeak {
+                live_start: 2_000,
+                live_end: 2_150,
+                live_peak: 67_536,
+            },
+            PoolUsage {
+                start: 0,
+                end: 65_536,
+                budget: 65_536,
+                after_teardown: 0,
+            },
+        )
+        .unwrap();
 
         assert_eq!(report.process_memory_start, 8_192);
         assert_eq!(report.process_memory_end, 12_288);
+        assert_eq!(report.process_memory_lifetime_peak, Some(16_384));
         assert_eq!(report.bytes_allocated, 600);
         assert_eq!(report.bytes_freed, 450);
         assert_eq!(report.net_heap_delta, 150);
         assert_eq!(report.allocation_count, 4);
-        assert_eq!(report.pool_active, 65_536);
-        assert_eq!(report.pool_after_teardown, 0);
+        assert_eq!(report.allocator_live_start, 2_000);
+        assert_eq!(report.allocator_live_end, 2_150);
+        assert_eq!(report.allocator_peak_live, 67_536);
+        assert_eq!(report.allocator_peak_growth, 65_536);
+        assert_eq!(report.allocator_peak_bound, 131_072);
+    }
+
+    #[cfg(feature = "socket-tcp-dynamic-buffer")]
+    #[test]
+    fn dynamic_memory_report_rejects_invalid_peak_and_pool_boundaries() {
+        let snapshot = AllocSnap {
+            alloc_bytes: 0,
+            alloc_count: 0,
+            free_bytes: 0,
+            process_memory: ProcessMemorySample {
+                current_bytes: 1,
+                lifetime_peak_bytes: Some(1),
+            },
+            ctxsw_voluntary: 0,
+            ctxsw_nonvoluntary: 0,
+            cpu_ns: 0,
+        };
+        let peak = |live_start, live_end, live_peak| AllocatorPeak {
+            live_start,
+            live_end,
+            live_peak,
+        };
+        let pool = |start, end, budget, after_teardown| PoolUsage {
+            start,
+            end,
+            budget,
+            after_teardown,
+        };
+
+        assert!(
+            DynamicMemoryReport::from_snapshots(
+                snapshot,
+                snapshot,
+                peak(10, 10, 9),
+                pool(0, 0, 100, 0),
+            )
+            .is_err()
+        );
+        assert!(
+            DynamicMemoryReport::from_snapshots(
+                snapshot,
+                snapshot,
+                peak(0, 201, 201),
+                pool(0, 100, 100, 0),
+            )
+            .is_err()
+        );
+        assert!(
+            DynamicMemoryReport::from_snapshots(
+                snapshot,
+                snapshot,
+                peak(0, 0, 0),
+                pool(0, 0, usize::MAX, 0),
+            )
+            .is_err()
+        );
+        assert!(
+            DynamicMemoryReport::from_snapshots(
+                snapshot,
+                snapshot,
+                peak(0, 0, 0),
+                pool(0, 101, 100, 0),
+            )
+            .is_err()
+        );
+        assert!(
+            DynamicMemoryReport::from_snapshots(
+                snapshot,
+                snapshot,
+                peak(0, 0, 0),
+                pool(0, 0, 100, 1),
+            )
+            .is_err()
+        );
+    }
+
+    #[cfg(feature = "socket-tcp-dynamic-buffer")]
+    #[test]
+    fn active_dynamic_shapes_require_pool_growth() {
+        assert!(validate_pool_growth("multi_tcp", 0, 1).is_ok());
+        assert!(validate_pool_growth("multi_tcp", 1, 1).is_err());
+        assert!(validate_pool_growth("idle_hot", 1, 0).is_err());
     }
 
     #[cfg(feature = "socket-tcp-dynamic-buffer")]
@@ -1834,8 +2176,9 @@ mod tests {
                 })
                 .unwrap();
                 workers.wait_ready().unwrap();
+                let mut results = std::iter::repeat_with(|| None).take(2).collect::<Vec<_>>();
                 workers.start();
-                let _ = workers.wait_finished();
+                workers.wait_finished(&mut results);
                 workers.release_and_join();
             }));
             let _ = completed_tx.send(outcome);
@@ -1900,8 +2243,9 @@ mod tests {
                 })
                 .unwrap();
                 workers.wait_ready().unwrap();
+                let mut results = std::iter::repeat_with(|| None).take(2).collect::<Vec<_>>();
                 workers.start();
-                let _ = workers.wait_finished();
+                workers.wait_finished(&mut results);
                 workers.release_and_join();
             }));
             let _ = completed_tx.send((started.elapsed(), outcome));
@@ -1952,55 +2296,85 @@ mod tests {
         assert!(!work_started.load(Ordering::Relaxed));
         assert_eq!(dropped.load(Ordering::Relaxed), 2);
     }
+}
 
-    #[cfg(feature = "socket-tcp-dynamic-buffer")]
-    #[test]
-    fn worker_thread_creation_uses_a_fallible_result() {
-        let mut workers = MultiTcpWorkers::<()>::spawn(1, |_worker_id, mut phases| {
-            if !phases.ready(Ok(())) {
-                return;
-            }
-            let _ = phases.finished(());
-        })
-        .unwrap();
-        workers.wait_ready().unwrap();
-        workers.start();
-        assert_eq!(workers.wait_finished().len(), 1);
-        workers.release_and_join();
+#[derive(Clone, Copy)]
+enum LinkEndpoint {
+    A,
+    B,
+}
+
+#[derive(Default)]
+struct DeviceStats {
+    tx_bytes: u64,
+    tx_packets: u64,
+}
+
+/// Two unidirectional lanes forming a back-to-back link.
+struct PairedLink {
+    // Keep queue state out of the large shape-runner stack frames.
+    a_to_b: Box<Lane>,
+    b_to_a: Box<Lane>,
+    mtu: usize,
+    offload_checksums: bool,
+}
+
+impl PairedLink {
+    fn new(mtu: usize, depth: usize, offload_checksums: bool) -> Self {
+        Self {
+            a_to_b: Box::new(Lane::new(mtu, depth)),
+            b_to_a: Box::new(Lane::new(mtu, depth)),
+            mtu,
+            offload_checksums,
+        }
+    }
+
+    fn device<'a>(
+        &'a mut self,
+        endpoint: LinkEndpoint,
+        stats: &'a mut DeviceStats,
+    ) -> PairedDevice<'a> {
+        let (tx, rx) = match endpoint {
+            LinkEndpoint::A => (&mut self.a_to_b, &mut self.b_to_a),
+            LinkEndpoint::B => (&mut self.b_to_a, &mut self.a_to_b),
+        };
+        PairedDevice {
+            tx,
+            rx,
+            mtu: self.mtu,
+            offload_checksums: self.offload_checksums,
+            stats,
+        }
+    }
+
+    fn stats(&self) -> LaneStats {
+        let mut stats = self.a_to_b.stats();
+        stats.merge(self.b_to_a.stats());
+        stats
     }
 }
 
-/// A `Device` that sends to one queue and receives from another. Two of these
-/// (with the queues swapped) form a paired link between two `Interface`s.
-struct PairedDevice {
-    tx: LaneRc,
-    rx: LaneRc,
+/// A short-lived `Device` view of one endpoint on a [`PairedLink`].
+struct PairedDevice<'a> {
+    tx: &'a mut Lane,
+    rx: &'a mut Lane,
     mtu: usize,
     /// If true, the device advertises checksum offload so smoltcp skips
     /// IPv4/UDP/TCP checksum emit+verify (mimicking a hardware NIC, or
     /// e.g. an iOS NEPacketTunnelFlow where the OS already verified them).
     offload_checksums: bool,
-    /// Bytes pushed through this device's TX path (i.e., what we emitted).
-    tx_bytes: u64,
-    tx_packets: u64,
+    stats: &'a mut DeviceStats,
 }
 
-impl PairedDevice {
-    fn new(tx: LaneRc, rx: LaneRc, mtu: usize, offload_checksums: bool) -> Self {
-        Self {
-            tx,
-            rx,
-            mtu,
-            offload_checksums,
-            tx_bytes: 0,
-            tx_packets: 0,
-        }
-    }
-}
-
-impl Device for PairedDevice {
-    type RxToken<'a> = PairedRx<'a>;
-    type TxToken<'a> = PairedTx<'a>;
+impl Device for PairedDevice<'_> {
+    type RxToken<'a>
+        = PairedRx<'a>
+    where
+        Self: 'a;
+    type TxToken<'a>
+        = PairedTx<'a>
+    where
+        Self: 'a;
 
     fn capabilities(&self) -> DeviceCapabilities {
         let mut caps = DeviceCapabilities::default();
@@ -2015,56 +2389,48 @@ impl Device for PairedDevice {
     }
 
     fn receive(&mut self, _ts: Instant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
-        let mut rx = self.rx.borrow_mut();
-        if rx.queue.is_empty() {
+        if self.rx.queue.is_empty() {
             return None;
         }
 
-        {
-            let mut tx = self.tx.borrow_mut();
-            if tx.pool.is_empty() {
-                tx.stats.rx_backpressure += 1;
-                return None;
-            }
+        if self.tx.pool.is_empty() {
+            self.tx.stats.rx_backpressure += 1;
+            return None;
         }
-        let rx_packet = rx
+        let rx_packet = self
+            .rx
             .queue
             .pop_front()
             .expect("RX queue changed after paired TX availability check");
         Some((
             PairedRx {
                 pkt: Some(rx_packet),
-                rx: &self.rx,
+                rx: self.rx,
             },
             PairedTx {
-                tx: &self.tx,
+                tx: self.tx,
                 mtu: self.mtu,
-                tx_bytes: &mut self.tx_bytes,
-                tx_packets: &mut self.tx_packets,
+                stats: self.stats,
             },
         ))
     }
 
     fn transmit(&mut self, _ts: Instant) -> Option<Self::TxToken<'_>> {
-        {
-            let mut tx = self.tx.borrow_mut();
-            if tx.pool.len() <= 1 {
-                tx.stats.tx_backpressure += 1;
-                return None;
-            }
+        if self.tx.pool.len() <= 1 {
+            self.tx.stats.tx_backpressure += 1;
+            return None;
         }
         Some(PairedTx {
-            tx: &self.tx,
+            tx: self.tx,
             mtu: self.mtu,
-            tx_bytes: &mut self.tx_bytes,
-            tx_packets: &mut self.tx_packets,
+            stats: self.stats,
         })
     }
 }
 
 struct PairedRx<'a> {
     pkt: Option<Packet>,
-    rx: &'a LaneRc,
+    rx: &'a mut Lane,
 }
 
 impl<'a> phy::RxToken for PairedRx<'a> {
@@ -2076,7 +2442,7 @@ impl<'a> phy::RxToken for PairedRx<'a> {
             let packet = self.pkt.as_ref().unwrap();
             f(&packet.buf[..packet.len])
         };
-        self.rx.borrow_mut().return_pkt(self.pkt.take().unwrap());
+        self.rx.return_pkt(self.pkt.take().unwrap());
         result
     }
 }
@@ -2084,16 +2450,47 @@ impl<'a> phy::RxToken for PairedRx<'a> {
 impl Drop for PairedRx<'_> {
     fn drop(&mut self) {
         if let Some(packet) = self.pkt.take() {
-            self.rx.borrow_mut().return_pkt(packet);
+            refund_packet(self.rx, packet);
         }
     }
 }
 
 struct PairedTx<'a> {
-    tx: &'a LaneRc,
+    tx: &'a mut Lane,
     mtu: usize,
-    tx_bytes: &'a mut u64,
-    tx_packets: &'a mut u64,
+    stats: &'a mut DeviceStats,
+}
+
+struct CheckedOutPacket<'a> {
+    tx: &'a mut Lane,
+    packet: Option<Packet>,
+}
+
+impl CheckedOutPacket<'_> {
+    fn payload_mut(&mut self, len: usize) -> &mut [u8] {
+        &mut self.packet.as_mut().unwrap().buf[..len]
+    }
+
+    fn commit(mut self, len: usize, stats: &mut DeviceStats) {
+        let mut packet = self.packet.take().unwrap();
+        packet.len = len;
+        stats.tx_bytes += len as u64;
+        stats.tx_packets += 1;
+        self.tx.queue_pkt(packet);
+    }
+}
+
+#[cold]
+fn refund_packet(lane: &mut Lane, packet: Packet) {
+    lane.return_pkt(packet);
+}
+
+impl Drop for CheckedOutPacket<'_> {
+    fn drop(&mut self) {
+        if let Some(packet) = self.packet.take() {
+            refund_packet(self.tx, packet);
+        }
+    }
 }
 
 impl<'a> phy::TxToken for PairedTx<'a> {
@@ -2101,56 +2498,52 @@ impl<'a> phy::TxToken for PairedTx<'a> {
     where
         F: FnOnce(&mut [u8]) -> R,
     {
-        struct CheckedOutPacket<'a> {
-            tx: RefMut<'a, Lane>,
-            packet: Option<Packet>,
-        }
-
-        impl Drop for CheckedOutPacket<'_> {
-            fn drop(&mut self) {
-                if let Some(packet) = self.packet.take() {
-                    self.tx.return_pkt(packet);
-                }
-            }
-        }
-
         assert!(
             len <= self.mtu,
             "transmit length {len} exceeds MTU {}",
             self.mtu
         );
-        let mut tx = self.tx.borrow_mut();
-        let packet = tx
+        let packet = self
+            .tx
             .try_take_packet()
             .expect("TX credit disappeared after token construction");
         let mut packet = CheckedOutPacket {
-            tx,
+            tx: self.tx,
             packet: Some(packet),
         };
-        let result = f(&mut packet.packet.as_mut().unwrap().buf[..len]);
-        let mut queued = packet.packet.take().unwrap();
-        queued.len = len;
-        *self.tx_bytes += len as u64;
-        *self.tx_packets += 1;
-        packet.tx.queue_pkt(queued);
+        let result = f(packet.payload_mut(len));
+        packet.commit(len, self.stats);
         result
     }
 }
 
 struct Endpoint<'a> {
     iface: Interface,
-    device: PairedDevice,
     sockets: SocketSet<'a>,
+    link_endpoint: LinkEndpoint,
+    device_stats: DeviceStats,
+}
+
+struct PairedEndpoints {
+    server: Endpoint<'static>,
+    client: Endpoint<'static>,
+    link: PairedLink,
+}
+
+impl Endpoint<'_> {
+    fn poll(&mut self, now: Instant, link: &mut PairedLink) -> smoltcp::iface::PollResult {
+        let mut device = link.device(self.link_endpoint, &mut self.device_stats);
+        self.iface.poll(now, &mut device, &mut self.sockets)
+    }
 }
 
 fn make_endpoint(
     addr: IpAddress,
-    mtu: usize,
-    tx: LaneRc,
-    rx: LaneRc,
-    offload_checksums: bool,
+    link: &mut PairedLink,
+    link_endpoint: LinkEndpoint,
 ) -> Endpoint<'static> {
-    let mut device = PairedDevice::new(tx, rx, mtu, offload_checksums);
+    let mut device_stats = DeviceStats::default();
+    let mut device = link.device(link_endpoint, &mut device_stats);
     let mut config = InterfaceConfig::new(HardwareAddress::Ip);
     config.random_seed = 0xdead_beef;
     let mut iface = Interface::new(config, &mut device, Instant::from_millis(0));
@@ -2159,14 +2552,15 @@ fn make_endpoint(
     });
     Endpoint {
         iface,
-        device,
         sockets: SocketSet::new(vec![]),
+        link_endpoint,
+        device_stats,
     }
 }
 
 /// Build a back-to-back server/client `Endpoint` pair joined by two
 /// `Lane`s, with the server at `subnet.1` and the client at `subnet.2`. The
-/// returned lane handles let callers report packet-pool
+/// returned link lets callers poll either endpoint and report packet-pool
 /// backpressure and fixed reservation size.
 #[cfg_attr(not(feature = "socket-tcp-dynamic-buffer"), allow(dead_code))]
 fn setup_paired_endpoints(
@@ -2174,24 +2568,23 @@ fn setup_paired_endpoints(
     mtu: usize,
     queue_depth: usize,
     offload: bool,
-) -> (Endpoint<'static>, Endpoint<'static>, LaneRc, LaneRc) {
-    let lane_a: LaneRc = Rc::new(RefCell::new(Lane::new(mtu, queue_depth)));
-    let lane_b: LaneRc = Rc::new(RefCell::new(Lane::new(mtu, queue_depth)));
+) -> PairedEndpoints {
+    let mut link = PairedLink::new(mtu, queue_depth, offload);
     let server = make_endpoint(
         IpAddress::v4(subnet[0], subnet[1], subnet[2], 1),
-        mtu,
-        lane_a.clone(),
-        lane_b.clone(),
-        offload,
+        &mut link,
+        LinkEndpoint::A,
     );
     let client = make_endpoint(
         IpAddress::v4(subnet[0], subnet[1], subnet[2], 2),
-        mtu,
-        lane_b.clone(),
-        lane_a.clone(),
-        offload,
+        &mut link,
+        LinkEndpoint::B,
     );
-    (server, client, lane_a, lane_b)
+    PairedEndpoints {
+        server,
+        client,
+        link,
+    }
 }
 
 fn add_tcp_socket(ep: &mut Endpoint<'static>, buf_size: usize) -> smoltcp::iface::SocketHandle {
@@ -2199,6 +2592,38 @@ fn add_tcp_socket(ep: &mut Endpoint<'static>, buf_size: usize) -> smoltcp::iface
     let tx = tcp::SocketBuffer::new(vec![0u8; buf_size]);
     let socket = tcp::Socket::new(rx, tx);
     ep.sockets.add(socket)
+}
+
+fn establish_tcp_flows(
+    server: &mut Endpoint<'_>,
+    client: &mut Endpoint<'_>,
+    link: &mut PairedLink,
+    server_handles: &[SocketHandle],
+    client_handles: &[SocketHandle],
+    wall_origin: StdInstant,
+    deadline: StdInstant,
+) -> usize {
+    loop {
+        let now = Instant::from_micros(wall_origin.elapsed().as_micros() as i64);
+        server.poll(now, link);
+        client.poll(now, link);
+        let established = client_handles
+            .iter()
+            .zip(server_handles)
+            .filter(|&(&client_handle, &server_handle)| {
+                matches!(
+                    client.sockets.get::<tcp::Socket>(client_handle).state(),
+                    tcp::State::Established
+                ) && matches!(
+                    server.sockets.get::<tcp::Socket>(server_handle).state(),
+                    tcp::State::Established
+                )
+            })
+            .count();
+        if established == client_handles.len() || StdInstant::now() >= deadline {
+            return established;
+        }
+    }
 }
 
 /// Pool-backed dynamic-buffer variant. Buffers start at 0 and grow on
@@ -2220,34 +2645,66 @@ fn add_tcp_socket_dyn(
     ep.sockets.add(socket)
 }
 
-/// Snapshot of allocator counters and process memory at one instant. Take two and
-/// `diff()` them to see what happened during a phase.
+#[cfg(feature = "socket-tcp-dynamic-buffer")]
+fn add_dynamic_tcp_flows(
+    shape: &str,
+    server: &mut Endpoint<'static>,
+    client: &mut Endpoint<'static>,
+    flows: usize,
+    max_buf: u32,
+    pool: &tcp::MemoryPool,
+) -> Result<(Vec<SocketHandle>, Vec<SocketHandle>), String> {
+    validate_unique_flow_count(shape, flows)?;
+    let mut server_handles = Vec::with_capacity(flows);
+    let mut client_handles = Vec::with_capacity(flows);
+    for flow in 0..flows {
+        let server_handle = add_tcp_socket_dyn(server, max_buf, pool);
+        let client_handle = add_tcp_socket_dyn(client, max_buf, pool);
+        let (server_port, client_port) = flow_ports(shape, flow)?;
+
+        let socket = server.sockets.get_mut::<tcp::Socket>(server_handle);
+        socket.set_ack_delay(None);
+        socket.set_nagle_enabled(false);
+        socket
+            .listen(server_port)
+            .map_err(|error| format!("{shape}: flow {flow} listen failed: {error:?}"))?;
+
+        let socket = client.sockets.get_mut::<tcp::Socket>(client_handle);
+        socket.set_ack_delay(None);
+        socket.set_nagle_enabled(false);
+        socket
+            .connect(
+                client.iface.context(),
+                (IpAddress::v4(10, 0, 0, 1), server_port),
+                client_port,
+            )
+            .map_err(|error| format!("{shape}: flow {flow} connect failed: {error:?}"))?;
+
+        server_handles.push(server_handle);
+        client_handles.push(client_handle);
+    }
+    Ok((server_handles, client_handles))
+}
+
+/// Snapshot of allocator counters and process memory at one instant.
 #[derive(Copy, Clone)]
 struct AllocSnap {
     alloc_bytes: u64,
     alloc_count: u64,
     /// Live bytes = alloc_bytes - free_bytes, used to show net heap growth.
     free_bytes: u64,
-    process_memory: u64,
+    process_memory: ProcessMemorySample,
     /// Voluntary context switches — process blocked or yielded.
     /// Hot-loop shapes should see this stay tiny.
     ctxsw_voluntary: u64,
     /// Involuntary context switches — preempted by the scheduler.
     /// Proportional to wall_time / scheduling_quantum × runnable_threads.
     ctxsw_nonvoluntary: u64,
-    /// Calling-thread user CPU time, nanoseconds. Pairs with the TSC
-    /// snapshot below to estimate the effective CPU frequency we ran
-    /// at, which the `Report` then uses to convert cachegrind's
-    /// instruction count into an IPC ratio.
+    /// Calling-thread CPU time, nanoseconds.
     cpu_ns: u64,
-    /// Time-stamp counter snapshot. On x86 this is rdtsc; on other
-    /// archs it's zero (we just skip the IPC calculation).
-    tsc: u64,
 }
 
-/// `CLOCK_THREAD_CPUTIME_ID` in nanoseconds. Caller thread's user CPU
-/// time only. Returns 0 on unsupported platforms; we just skip the
-/// IPC line in that case.
+/// `CLOCK_THREAD_CPUTIME_ID` in nanoseconds. Returns zero when unsupported.
 fn thread_cpu_ns() -> u64 {
     #[cfg(target_os = "linux")]
     {
@@ -2263,20 +2720,6 @@ fn thread_cpu_ns() -> u64 {
     }
 }
 
-/// Read the x86 timestamp counter. Each tick is one core cycle (modulo
-/// invariant-TSC behavior, which has been ubiquitous since ~2010).
-/// Cheap (~20 cycles), so safe to call at run boundaries.
-fn read_tsc() -> u64 {
-    #[cfg(target_arch = "x86_64")]
-    {
-        unsafe { core::arch::x86_64::_rdtsc() }
-    }
-    #[cfg(not(target_arch = "x86_64"))]
-    {
-        0
-    }
-}
-
 impl AllocSnap {
     fn now() -> Self {
         let (cv, cn) = ctxsw_counts();
@@ -2284,17 +2727,16 @@ impl AllocSnap {
             alloc_bytes: ALLOC_BYTES.load(Ordering::Relaxed),
             alloc_count: ALLOC_COUNT.load(Ordering::Relaxed),
             free_bytes: FREE_BYTES.load(Ordering::Relaxed),
-            process_memory: process_memory_bytes(),
+            process_memory: process_memory_sample(),
             ctxsw_voluntary: cv,
             ctxsw_nonvoluntary: cn,
             cpu_ns: thread_cpu_ns(),
-            tsc: read_tsc(),
         }
     }
 }
 
 #[cfg(feature = "socket-tcp-dynamic-buffer")]
-fn alloc_counters_with_memory(process_memory: u64) -> AllocSnap {
+fn alloc_counters_with_memory(process_memory: ProcessMemorySample) -> AllocSnap {
     AllocSnap {
         alloc_bytes: ALLOC_BYTES.load(Ordering::Relaxed),
         alloc_count: ALLOC_COUNT.load(Ordering::Relaxed),
@@ -2303,56 +2745,106 @@ fn alloc_counters_with_memory(process_memory: u64) -> AllocSnap {
         ctxsw_voluntary: 0,
         ctxsw_nonvoluntary: 0,
         cpu_ns: 0,
-        tsc: 0,
     }
 }
 
 #[cfg(feature = "socket-tcp-dynamic-buffer")]
-struct MultiTcpMemoryReport {
+#[derive(Clone, Copy)]
+struct PoolUsage {
+    start: usize,
+    end: usize,
+    budget: usize,
+    after_teardown: usize,
+}
+
+#[cfg(feature = "socket-tcp-dynamic-buffer")]
+struct DynamicMemoryReport {
     process_memory_start: u64,
     process_memory_end: u64,
+    process_memory_lifetime_peak: Option<u64>,
     bytes_allocated: u64,
     bytes_freed: u64,
     net_heap_delta: i128,
     allocation_count: u64,
-    pool_active: usize,
-    pool_after_teardown: usize,
+    allocator_live_start: u64,
+    allocator_live_end: u64,
+    allocator_peak_live: u64,
+    allocator_peak_growth: u64,
+    allocator_peak_bound: u64,
 }
 
 #[cfg(feature = "socket-tcp-dynamic-buffer")]
-impl MultiTcpMemoryReport {
+impl DynamicMemoryReport {
     fn from_snapshots(
         before: AllocSnap,
         after: AllocSnap,
-        pool_active: usize,
-        pool_after_teardown: usize,
-    ) -> Self {
+        allocator: AllocatorPeak,
+        pool: PoolUsage,
+    ) -> Result<Self, String> {
+        let allocator_peak_bound = pool
+            .budget
+            .checked_mul(2)
+            .and_then(|bytes| u64::try_from(bytes).ok())
+            .ok_or_else(|| "dynamic pool transient bound overflowed".to_owned())?;
+        let allocator_peak_growth = allocator
+            .live_peak
+            .checked_sub(allocator.live_start)
+            .ok_or_else(|| "allocator peak was below phase start".to_owned())?;
+        if allocator.live_peak < allocator.live_end {
+            return Err("allocator peak was below phase end".to_owned());
+        }
+        if allocator_peak_growth > allocator_peak_bound {
+            return Err(format!(
+                "allocator peak growth {allocator_peak_growth} exceeded transient bound {allocator_peak_bound}"
+            ));
+        }
+        if pool.start > pool.budget {
+            return Err(format!(
+                "starting pool use {} exceeded budget {}",
+                pool.start, pool.budget
+            ));
+        }
+        if pool.end > pool.budget {
+            return Err(format!(
+                "active pool use {} exceeded budget {}",
+                pool.end, pool.budget
+            ));
+        }
+        if pool.after_teardown != 0 {
+            return Err(format!(
+                "pool use after teardown was {}, expected 0",
+                pool.after_teardown
+            ));
+        }
         let bytes_allocated = after.alloc_bytes.saturating_sub(before.alloc_bytes);
         let bytes_freed = after.free_bytes.saturating_sub(before.free_bytes);
-        Self {
-            process_memory_start: before.process_memory,
-            process_memory_end: after.process_memory,
+        Ok(Self {
+            process_memory_start: before.process_memory.current_bytes,
+            process_memory_end: after.process_memory.current_bytes,
+            process_memory_lifetime_peak: after.process_memory.lifetime_peak_bytes,
             bytes_allocated,
             bytes_freed,
-            net_heap_delta: bytes_allocated as i128 - bytes_freed as i128,
+            net_heap_delta: signed_delta(bytes_allocated, bytes_freed),
             allocation_count: after.alloc_count.saturating_sub(before.alloc_count),
-            pool_active,
-            pool_after_teardown,
-        }
+            allocator_live_start: allocator.live_start,
+            allocator_live_end: allocator.live_end,
+            allocator_peak_live: allocator.live_peak,
+            allocator_peak_growth,
+            allocator_peak_bound,
+        })
     }
 
     fn print(&self) {
-        println!("  pool used active end:   {} KiB", self.pool_active / 1024);
-        println!(
-            "  pool used after teardown: {} KiB",
-            self.pool_after_teardown / 1024
-        );
-        println!();
-        println!("  steady-state allocations:");
+        println!("  phase allocations:");
         println!("    bytes allocated:       {}", self.bytes_allocated);
         println!("    bytes freed:           {}", self.bytes_freed);
         println!("    net heap delta:        {}", self.net_heap_delta);
         println!("    allocation count:      {}", self.allocation_count);
+        println!("    requested live start:  {}", self.allocator_live_start);
+        println!("    requested live end:    {}", self.allocator_live_end);
+        println!("    requested live peak:   {}", self.allocator_peak_live);
+        println!("    requested peak growth: {}", self.allocator_peak_growth);
+        println!("    requested peak bound:  {}", self.allocator_peak_bound);
         println!();
         println!("  process memory:");
         let metric = process_memory_label();
@@ -2371,6 +2863,13 @@ impl MultiTcpMemoryReport {
             "    {metric} delta:         {delta:+}  ({:+.1} MiB)",
             delta as f64 / (1024.0 * 1024.0)
         );
+        match self.process_memory_lifetime_peak {
+            Some(peak) => println!(
+                "    {metric} lifetime peak: {peak}  ({:.1} MiB)",
+                peak as f64 / (1024.0 * 1024.0)
+            ),
+            None => println!("    {metric} lifetime peak: unavailable"),
+        }
     }
 }
 
@@ -2379,15 +2878,13 @@ impl MultiTcpMemoryReport {
 struct Report<'a> {
     name: &'a str,
     elapsed: f64,
-    #[allow(dead_code)]
-    app_bytes_sent: u64,
     app_bytes_recvd: u64,
     /// Total wire packets emitted by both peers.
     wire_packets: u64,
     /// Total wire bytes emitted by both peers (incl. headers).
     wire_bytes: u64,
     /// Latency histogram of poll cycles (one pump of both endpoints).
-    poll_lat: Histo,
+    poll_lat: &'a Histo,
     /// Allocator state before and after the steady-state loop. The diff is
     /// the allocator load attributable to the loop body.
     alloc_before: AllocSnap,
@@ -2423,7 +2920,7 @@ impl<'a> Report<'a> {
         let alloc_bytes = self.alloc_after.alloc_bytes - self.alloc_before.alloc_bytes;
         let alloc_count = self.alloc_after.alloc_count - self.alloc_before.alloc_count;
         let free_bytes = self.alloc_after.free_bytes - self.alloc_before.free_bytes;
-        let net_heap = alloc_bytes as i64 - free_bytes as i64;
+        let net_heap = signed_delta(alloc_bytes, free_bytes);
         let bytes_per_pkt = if self.wire_packets == 0 {
             0.0
         } else {
@@ -2442,7 +2939,7 @@ impl<'a> Report<'a> {
         );
         println!("  packet rate:            {mpps:>8.3} Mpps     (avg {avg_pkt:.1} bytes/pkt)");
         println!(
-            "  per-packet:             {ns_per_pkt:>8.1} ns   (~{:.0} cycles @ {} GHz)",
+            "  per-packet:             {ns_per_pkt:>8.1} ns   (~{:.0} reference cycles @ {} GHz)",
             cyc_per_pkt, REF_CPU_GHZ
         );
         println!(
@@ -2453,7 +2950,7 @@ impl<'a> Report<'a> {
             self.unit_label
         );
         println!(
-            "  wire packets:           {:>8}   (use for IPC: cachegrind I refs / this = I/pkt)",
+            "  wire packets:           {:>8}   (cachegrind I refs / this = instructions/pkt)",
             self.wire_packets,
         );
         println!();
@@ -2485,23 +2982,30 @@ impl<'a> Report<'a> {
         println!("  process memory:");
         let metric = process_memory_label();
         let memory_delta = signed_delta(
-            self.alloc_after.process_memory,
-            self.alloc_before.process_memory,
+            self.alloc_after.process_memory.current_bytes,
+            self.alloc_before.process_memory.current_bytes,
         );
         println!(
             "    {metric} start:        {:>10}  ({:.1} MiB)",
-            self.alloc_before.process_memory,
-            self.alloc_before.process_memory as f64 / (1024.0 * 1024.0)
+            self.alloc_before.process_memory.current_bytes,
+            self.alloc_before.process_memory.current_bytes as f64 / (1024.0 * 1024.0)
         );
         println!(
             "    {metric} end:          {:>10}  ({:.1} MiB)",
-            self.alloc_after.process_memory,
-            self.alloc_after.process_memory as f64 / (1024.0 * 1024.0)
+            self.alloc_after.process_memory.current_bytes,
+            self.alloc_after.process_memory.current_bytes as f64 / (1024.0 * 1024.0)
         );
         println!(
             "    {metric} delta:        {memory_delta:>+10}  ({:+.1} MiB)",
             memory_delta as f64 / (1024.0 * 1024.0)
         );
+        match self.alloc_after.process_memory.lifetime_peak_bytes {
+            Some(peak) => println!(
+                "    {metric} lifetime peak: {peak:>10}  ({:.1} MiB)",
+                peak as f64 / (1024.0 * 1024.0)
+            ),
+            None => println!("    {metric} lifetime peak: unavailable"),
+        }
 
         let cv = self.alloc_after.ctxsw_voluntary - self.alloc_before.ctxsw_voluntary;
         let cn = self.alloc_after.ctxsw_nonvoluntary - self.alloc_before.ctxsw_nonvoluntary;
@@ -2515,60 +3019,35 @@ impl<'a> Report<'a> {
             );
         }
 
-        // CPU-time + TSC: lets us compute an effective CPU frequency
-        // (cycles/sec) and report cycles-per-packet alongside the
-        // wall-clock ns/packet number. Cachegrind already has the
-        // instruction count; combining the two yields IPC.
         let cpu_ns = self
             .alloc_after
             .cpu_ns
             .saturating_sub(self.alloc_before.cpu_ns);
-        let tsc_d = self.alloc_after.tsc.saturating_sub(self.alloc_before.tsc);
-        if cpu_ns > 0 && tsc_d > 0 {
-            let eff_ghz = tsc_d as f64 / cpu_ns as f64;
+        if cpu_ns > 0 {
             println!("  CPU:");
             println!(
-                "    user time:            {:>10.3} s   ({:.3}% of wall)",
+                "    thread time:          {:>10.3} s   ({:.3}% of wall)",
                 cpu_ns as f64 / 1e9,
                 (cpu_ns as f64 / 1e9) / self.elapsed * 100.0,
             );
-            println!(
-                "    TSC ticks:            {:>10}   (~{eff_ghz:.3} GHz effective)",
-                tsc_d
-            );
-            if self.wire_packets > 0 {
-                let cycles_per_pkt = tsc_d as f64 / self.wire_packets as f64;
-                println!(
-                    "    cycles/pkt:            {cycles_per_pkt:>9.1}  (use cachegrind I refs / this for IPC)"
-                );
-            }
         }
     }
 }
 
+// Keep the large workload frame out of the dispatcher.
+#[inline(never)]
 fn shape_firehose(seconds: u64, offload: bool) -> Result<(), String> {
     const BUF: usize = 256 * 1024;
     let duration = checked_run_duration("firehose", seconds)?;
-    let lane_a: LaneRc = Rc::new(RefCell::new(Lane::new(1500, 256)));
-    let lane_b: LaneRc = Rc::new(RefCell::new(Lane::new(1500, 256)));
+    let mut endpoints = setup_paired_endpoints([10, 0, 0], 1500, 256, offload);
+    let PairedEndpoints {
+        server,
+        client,
+        link,
+    } = &mut endpoints;
 
-    let mut server = make_endpoint(
-        IpAddress::v4(10, 0, 0, 1),
-        1500,
-        lane_a.clone(),
-        lane_b.clone(),
-        offload,
-    );
-    let mut client = make_endpoint(
-        IpAddress::v4(10, 0, 0, 2),
-        1500,
-        lane_b.clone(),
-        lane_a.clone(),
-        offload,
-    );
-
-    let srv_h = add_tcp_socket(&mut server, BUF);
-    let cli_h = add_tcp_socket(&mut client, BUF);
+    let srv_h = add_tcp_socket(server, BUF);
+    let cli_h = add_tcp_socket(client, BUF);
 
     // We want to measure smoltcp's per-packet CPU cost, not its delayed-ACK behaviour.
     // Suppressing delayed ACK + Nagle keeps the pipeline saturated.
@@ -2596,12 +3075,8 @@ fn shape_firehose(seconds: u64, offload: bool) -> Result<(), String> {
     // Pump until ESTABLISHED.
     for _ in 0..1000 {
         let n = now_smol();
-        server
-            .iface
-            .poll(n, &mut server.device, &mut server.sockets);
-        client
-            .iface
-            .poll(n, &mut client.device, &mut client.sockets);
+        server.poll(n, link);
+        client.poll(n, link);
         if client.sockets.get::<tcp::Socket>(cli_h).may_send()
             && server.sockets.get::<tcp::Socket>(srv_h).may_recv()
         {
@@ -2654,12 +3129,8 @@ fn shape_firehose(seconds: u64, offload: bool) -> Result<(), String> {
         let mut cli_state = smoltcp::iface::PollResult::None;
         let mut srv_state = smoltcp::iface::PollResult::None;
         poll_lat.measure(|| {
-            cli_state = client
-                .iface
-                .poll(n, &mut client.device, &mut client.sockets);
-            srv_state = server
-                .iface
-                .poll(n, &mut server.device, &mut server.sockets);
+            cli_state = client.poll(n, link);
+            srv_state = server.poll(n, link);
         });
 
         // Server drains its receive buffer.
@@ -2688,18 +3159,17 @@ fn shape_firehose(seconds: u64, offload: bool) -> Result<(), String> {
     Report {
         name: "firehose (TCP bulk, both peers smoltcp)",
         elapsed,
-        app_bytes_sent: sent,
         app_bytes_recvd: recvd,
-        wire_packets: client.device.tx_packets + server.device.tx_packets,
-        wire_bytes: client.device.tx_bytes + server.device.tx_bytes,
-        poll_lat: poll_lat.histo,
+        wire_packets: client.device_stats.tx_packets + server.device_stats.tx_packets,
+        wire_bytes: client.device_stats.tx_bytes + server.device_stats.tx_bytes,
+        poll_lat: &poll_lat.histo,
         alloc_before,
         alloc_after,
         work_units: idle_spins,
         unit_label: "idle-spins",
     }
     .print();
-    print_lane_stats("firehose", collect_lane_stats(&[&lane_a, &lane_b]));
+    print_lane_stats("firehose", link.stats());
     validate_tcp_transfer(
         "firehose",
         client_established,
@@ -2714,26 +3184,20 @@ fn shape_small(seconds: u64, offload: bool) -> Result<(), String> {
     // client never fills more than a single small write at a time.
     const BUF: usize = 4 * 1024;
     let duration = checked_run_duration("small", seconds)?;
-    let lane_a: LaneRc = Rc::new(RefCell::new(Lane::new(1500, 256)));
-    let lane_b: LaneRc = Rc::new(RefCell::new(Lane::new(1500, 256)));
+    let mut endpoints = setup_paired_endpoints([10, 0, 0], 1500, 256, offload);
+    let PairedEndpoints {
+        server,
+        client,
+        link,
+    } = &mut endpoints;
 
-    let mut server = make_endpoint(
-        IpAddress::v4(10, 0, 0, 1),
-        1500,
-        lane_a.clone(),
-        lane_b.clone(),
-        offload,
-    );
-    let mut client = make_endpoint(
-        IpAddress::v4(10, 0, 0, 2),
-        1500,
-        lane_b.clone(),
-        lane_a.clone(),
-        offload,
-    );
+    let srv_h = add_tcp_socket(server, BUF);
+    let cli_h = add_tcp_socket(client, BUF);
 
-    let srv_h = add_tcp_socket(&mut server, BUF);
-    let cli_h = add_tcp_socket(&mut client, BUF);
+    client
+        .sockets
+        .get_mut::<tcp::Socket>(cli_h)
+        .set_nagle_enabled(false);
 
     let _ = server.sockets.get_mut::<tcp::Socket>(srv_h).listen(1234);
     let _ = client.sockets.get_mut::<tcp::Socket>(cli_h).connect(
@@ -2745,12 +3209,8 @@ fn shape_small(seconds: u64, offload: bool) -> Result<(), String> {
     let mut t_ms: i64 = 0;
     for _ in 0..200 {
         let n = Instant::from_millis(t_ms);
-        server
-            .iface
-            .poll(n, &mut server.device, &mut server.sockets);
-        client
-            .iface
-            .poll(n, &mut client.device, &mut client.sockets);
+        server.poll(n, link);
+        client.poll(n, link);
         if matches!(
             client.sockets.get::<tcp::Socket>(cli_h).state(),
             tcp::State::Established
@@ -2794,12 +3254,8 @@ fn shape_small(seconds: u64, offload: bool) -> Result<(), String> {
             sent += w as u64;
         }
         poll_lat.measure(|| {
-            client
-                .iface
-                .poll(n, &mut client.device, &mut client.sockets);
-            server
-                .iface
-                .poll(n, &mut server.device, &mut server.sockets);
+            client.poll(n, link);
+            server.poll(n, link);
         });
 
         let ss = server.sockets.get_mut::<tcp::Socket>(srv_h);
@@ -2817,44 +3273,32 @@ fn shape_small(seconds: u64, offload: bool) -> Result<(), String> {
     Report {
         name: "small (TCP 64B segments)",
         elapsed,
-        app_bytes_sent: sent,
         app_bytes_recvd: recvd,
-        wire_packets: client.device.tx_packets + server.device.tx_packets,
-        wire_bytes: client.device.tx_bytes + server.device.tx_bytes,
-        poll_lat: poll_lat.histo,
+        wire_packets: client.device_stats.tx_packets + server.device_stats.tx_packets,
+        wire_bytes: client.device_stats.tx_bytes + server.device_stats.tx_bytes,
+        poll_lat: &poll_lat.histo,
         alloc_before,
         alloc_after,
         work_units: recvd,
         unit_label: "bytes",
     }
     .print();
-    print_lane_stats("small", collect_lane_stats(&[&lane_a, &lane_b]));
+    print_lane_stats("small", link.stats());
     validate_tcp_transfer("small", client_established, server_established, sent, recvd)
 }
 
 fn shape_pingpong(seconds: u64, offload: bool) -> Result<(), String> {
     const BUF: usize = 16 * 1024;
     let duration = checked_run_duration("pingpong", seconds)?;
-    let lane_a: LaneRc = Rc::new(RefCell::new(Lane::new(1500, 256)));
-    let lane_b: LaneRc = Rc::new(RefCell::new(Lane::new(1500, 256)));
+    let mut endpoints = setup_paired_endpoints([10, 0, 0], 1500, 256, offload);
+    let PairedEndpoints {
+        server,
+        client,
+        link,
+    } = &mut endpoints;
 
-    let mut server = make_endpoint(
-        IpAddress::v4(10, 0, 0, 1),
-        1500,
-        lane_a.clone(),
-        lane_b.clone(),
-        offload,
-    );
-    let mut client = make_endpoint(
-        IpAddress::v4(10, 0, 0, 2),
-        1500,
-        lane_b.clone(),
-        lane_a.clone(),
-        offload,
-    );
-
-    let srv_h = add_tcp_socket(&mut server, BUF);
-    let cli_h = add_tcp_socket(&mut client, BUF);
+    let srv_h = add_tcp_socket(server, BUF);
+    let cli_h = add_tcp_socket(client, BUF);
 
     let _ = server.sockets.get_mut::<tcp::Socket>(srv_h).listen(1234);
     let _ = client.sockets.get_mut::<tcp::Socket>(cli_h).connect(
@@ -2866,12 +3310,8 @@ fn shape_pingpong(seconds: u64, offload: bool) -> Result<(), String> {
     let mut t_ms: i64 = 0;
     for _ in 0..200 {
         let n = Instant::from_millis(t_ms);
-        server
-            .iface
-            .poll(n, &mut server.device, &mut server.sockets);
-        client
-            .iface
-            .poll(n, &mut client.device, &mut client.sockets);
+        server.poll(n, link);
+        client.poll(n, link);
         if matches!(
             client.sockets.get::<tcp::Socket>(cli_h).state(),
             tcp::State::Established
@@ -2912,12 +3352,8 @@ fn shape_pingpong(seconds: u64, offload: bool) -> Result<(), String> {
             let _ = cs.send_slice(&msg);
         }
         poll_lat.measure(|| {
-            client
-                .iface
-                .poll(n, &mut client.device, &mut client.sockets);
-            server
-                .iface
-                .poll(n, &mut server.device, &mut server.sockets);
+            client.poll(n, link);
+            server.poll(n, link);
         });
 
         // Server echoes.
@@ -2931,12 +3367,8 @@ fn shape_pingpong(seconds: u64, offload: bool) -> Result<(), String> {
             let _ = ss.send_slice(&sink[..r]);
         }
         poll_lat.measure(|| {
-            server
-                .iface
-                .poll(n, &mut server.device, &mut server.sockets);
-            client
-                .iface
-                .poll(n, &mut client.device, &mut client.sockets);
+            server.poll(n, link);
+            client.poll(n, link);
         });
 
         // Client receives echo.
@@ -2955,18 +3387,17 @@ fn shape_pingpong(seconds: u64, offload: bool) -> Result<(), String> {
     Report {
         name: "pingpong (TCP 128B req/resp)",
         elapsed,
-        app_bytes_sent: roundtrips * msg.len() as u64,
         app_bytes_recvd: roundtrips * msg.len() as u64,
-        wire_packets: client.device.tx_packets + server.device.tx_packets,
-        wire_bytes: client.device.tx_bytes + server.device.tx_bytes,
-        poll_lat: poll_lat.histo,
+        wire_packets: client.device_stats.tx_packets + server.device_stats.tx_packets,
+        wire_bytes: client.device_stats.tx_bytes + server.device_stats.tx_bytes,
+        poll_lat: &poll_lat.histo,
         alloc_before,
         alloc_after,
         work_units: roundtrips,
         unit_label: "roundtrips",
     }
     .print();
-    print_lane_stats("pingpong", collect_lane_stats(&[&lane_a, &lane_b]));
+    print_lane_stats("pingpong", link.stats());
     validate_pingpong(client_established, server_established, roundtrips)
 }
 
@@ -2976,23 +3407,12 @@ fn shape_udp_firehose(seconds: u64, offload: bool) -> Result<(), String> {
     const PAYLOAD: usize = 1400;
     const META_SLOTS: usize = 256;
     let duration = checked_run_duration("udp", seconds)?;
-    let lane_a: LaneRc = Rc::new(RefCell::new(Lane::new(1500, 256)));
-    let lane_b: LaneRc = Rc::new(RefCell::new(Lane::new(1500, 256)));
-
-    let mut server = make_endpoint(
-        IpAddress::v4(10, 0, 0, 1),
-        1500,
-        lane_a.clone(),
-        lane_b.clone(),
-        offload,
-    );
-    let mut client = make_endpoint(
-        IpAddress::v4(10, 0, 0, 2),
-        1500,
-        lane_b.clone(),
-        lane_a.clone(),
-        offload,
-    );
+    let mut endpoints = setup_paired_endpoints([10, 0, 0], 1500, 256, offload);
+    let PairedEndpoints {
+        server,
+        client,
+        link,
+    } = &mut endpoints;
 
     let mk_buf = || -> (udp::PacketBuffer<'static>, udp::PacketBuffer<'static>) {
         let rx_meta = vec![udp::PacketMetadata::EMPTY; META_SLOTS];
@@ -3048,12 +3468,8 @@ fn shape_udp_firehose(seconds: u64, offload: bool) -> Result<(), String> {
             sent += PAYLOAD as u64;
         }
         poll_lat.measure(|| {
-            client
-                .iface
-                .poll(n, &mut client.device, &mut client.sockets);
-            server
-                .iface
-                .poll(n, &mut server.device, &mut server.sockets);
+            client.poll(n, link);
+            server.poll(n, link);
         });
 
         let ss = server.sockets.get_mut::<udp::Socket>(srv_h);
@@ -3072,19 +3488,68 @@ fn shape_udp_firehose(seconds: u64, offload: bool) -> Result<(), String> {
     Report {
         name: "udp_firehose (1400B UDP)",
         elapsed,
-        app_bytes_sent: sent,
         app_bytes_recvd: recvd,
-        wire_packets: client.device.tx_packets + server.device.tx_packets,
-        wire_bytes: client.device.tx_bytes + server.device.tx_bytes,
-        poll_lat: poll_lat.histo,
+        wire_packets: client.device_stats.tx_packets + server.device_stats.tx_packets,
+        wire_bytes: client.device_stats.tx_bytes + server.device_stats.tx_bytes,
+        poll_lat: &poll_lat.histo,
         alloc_before,
         alloc_after,
         work_units: (recvd / PAYLOAD as u64),
         unit_label: "pkts-recvd",
     }
     .print();
-    print_lane_stats("udp", collect_lane_stats(&[&lane_a, &lane_b]));
+    print_lane_stats("udp", link.stats());
     validate_udp_transfer("udp", server_bound, client_bound, sent, recvd)
+}
+
+fn packet_queue_depth(shape: &str, flows: usize) -> Result<usize, String> {
+    flows
+        .checked_mul(16)
+        .map(|depth| depth.clamp(1024, 16384))
+        .ok_or_else(|| format!("{shape}: packet queue size overflowed"))
+}
+
+#[cfg(feature = "socket-tcp-dynamic-buffer")]
+fn idle_hot_queue_depth(active_flows: usize) -> Result<usize, String> {
+    active_flows
+        .checked_mul(16)
+        .map(|depth| {
+            if active_flows == 0 {
+                2
+            } else {
+                depth.clamp(64, 16384)
+            }
+        })
+        .ok_or_else(|| "idle_hot: packet queue size overflowed".to_owned())
+}
+
+struct TcpResources {
+    queue_depth: usize,
+    socket_bytes: usize,
+    per_flow_bytes: usize,
+    total_bytes: usize,
+}
+
+fn checked_many_tcp_resources(
+    shape: &str,
+    flows: usize,
+    buffer_bytes: usize,
+) -> Result<TcpResources, String> {
+    let queue_depth = packet_queue_depth(shape, flows)?;
+    let socket_bytes = core::mem::size_of::<tcp::Socket>();
+    let per_flow_bytes = socket_bytes
+        .checked_add(2 * buffer_bytes)
+        .ok_or_else(|| format!("{shape}: per-flow socket footprint overflowed"))?;
+    let total_bytes = flows
+        .checked_mul(2)
+        .and_then(|sockets| sockets.checked_mul(per_flow_bytes))
+        .ok_or_else(|| format!("{shape}: total socket footprint overflowed"))?;
+    Ok(TcpResources {
+        queue_depth,
+        socket_bytes,
+        per_flow_bytes,
+        total_bytes,
+    })
 }
 
 /// `n` concurrent TCP echo flows between two smoltcp endpoints. Each flow has
@@ -3092,7 +3557,8 @@ fn shape_udp_firehose(seconds: u64, offload: bool) -> Result<(), String> {
 ///
 /// Verifies two properties:
 ///   * memory stays bounded (process-memory trace + net heap delta)
-///   * no flow is starved (Jain index + per-flow percentiles)
+///   * no flow is starved (Jain index + per-flow bounds)
+#[inline(never)] // Keep the large workload frame out of the dispatcher.
 fn shape_many_tcp(seconds: u64, n: usize, offload: bool, mode: RunMode) -> Result<(), String> {
     // Per-flow buffer sized small enough to keep total memory reasonable
     // even at N=1000: 1000 flows × 2 (rx+tx) × 4 KiB × 2 (server+client) ≈ 16 MiB.
@@ -3103,43 +3569,26 @@ fn shape_many_tcp(seconds: u64, n: usize, offload: bool, mode: RunMode) -> Resul
     // iteration order get systematically starved.
     let duration = checked_run_duration("many_tcp", seconds)?;
     validate_unique_flow_count("many_tcp", n)?;
-    let qd = n
-        .checked_mul(16)
-        .ok_or_else(|| "many_tcp: packet queue size overflowed".to_owned())?
-        .clamp(1024, 16384);
-    let tcp_socket_bytes = core::mem::size_of::<tcp::Socket>();
-    let per_flow_bytes = tcp_socket_bytes
-        .checked_add(2 * BUF)
-        .ok_or_else(|| "many_tcp: per-flow socket footprint overflowed".to_owned())?;
-    let total_bytes = n
-        .checked_mul(2)
-        .and_then(|sockets| sockets.checked_mul(per_flow_bytes))
-        .ok_or_else(|| "many_tcp: total socket footprint overflowed".to_owned())?;
+    let TcpResources {
+        queue_depth,
+        socket_bytes,
+        per_flow_bytes,
+        total_bytes,
+    } = checked_many_tcp_resources("many_tcp", n, BUF)?;
 
-    let lane_a: LaneRc = Rc::new(RefCell::new(Lane::new(1500, qd)));
-    let lane_b: LaneRc = Rc::new(RefCell::new(Lane::new(1500, qd)));
-
-    let mut server = make_endpoint(
-        IpAddress::v4(10, 0, 0, 1),
-        1500,
-        lane_a.clone(),
-        lane_b.clone(),
-        offload,
-    );
-    let mut client = make_endpoint(
-        IpAddress::v4(10, 0, 0, 2),
-        1500,
-        lane_b.clone(),
-        lane_a.clone(),
-        offload,
-    );
+    let mut endpoints = setup_paired_endpoints([10, 0, 0], 1500, queue_depth, offload);
+    let PairedEndpoints {
+        server,
+        client,
+        link,
+    } = &mut endpoints;
 
     let mut srv_handles = Vec::with_capacity(n);
     let mut cli_handles = Vec::with_capacity(n);
 
     for i in 0..n {
-        let h_srv = add_tcp_socket(&mut server, BUF);
-        let h_cli = add_tcp_socket(&mut client, BUF);
+        let h_srv = add_tcp_socket(server, BUF);
+        let h_cli = add_tcp_socket(client, BUF);
 
         let (dst_port, src_port) = flow_ports("many_tcp", i)?;
 
@@ -3177,44 +3626,15 @@ fn shape_many_tcp(seconds: u64, n: usize, offload: bool, mode: RunMode) -> Resul
         StdInstant::now(),
         Duration::from_secs(seconds.min(5)),
     )?;
-    loop {
-        let now = smol_now();
-        server
-            .iface
-            .poll(now, &mut server.device, &mut server.sockets);
-        client
-            .iface
-            .poll(now, &mut client.device, &mut client.sockets);
-        let all_ready = cli_handles
-            .iter()
-            .zip(srv_handles.iter())
-            .all(|(&hc, &hs)| {
-                matches!(
-                    client.sockets.get::<tcp::Socket>(hc).state(),
-                    tcp::State::Established
-                ) && matches!(
-                    server.sockets.get::<tcp::Socket>(hs).state(),
-                    tcp::State::Established
-                )
-            });
-        if all_ready || StdInstant::now() >= connect_deadline {
-            break;
-        }
-    }
-
-    let established = cli_handles
-        .iter()
-        .zip(srv_handles.iter())
-        .filter(|&(&hc, &hs)| {
-            matches!(
-                client.sockets.get::<tcp::Socket>(hc).state(),
-                tcp::State::Established
-            ) && matches!(
-                server.sockets.get::<tcp::Socket>(hs).state(),
-                tcp::State::Established
-            )
-        })
-        .count();
+    let established = establish_tcp_flows(
+        server,
+        client,
+        link,
+        &srv_handles,
+        &cli_handles,
+        wall0,
+        connect_deadline,
+    );
     if established < n {
         eprintln!(
             "warning: only {established}/{n} flows established within {} s",
@@ -3231,7 +3651,7 @@ fn shape_many_tcp(seconds: u64, n: usize, offload: bool, mode: RunMode) -> Resul
     let start = StdInstant::now();
     let alloc_before = AllocSnap::now();
     let mut poll_lat = SampledTimer::new();
-    let mut mem_trace = MemTrace::start();
+    let mut mem_trace = MemTrace::start(mode);
     let mut iters: u64 = 0;
 
     loop {
@@ -3251,12 +3671,8 @@ fn shape_many_tcp(seconds: u64, n: usize, offload: bool, mode: RunMode) -> Resul
         }
 
         poll_lat.measure(|| {
-            client
-                .iface
-                .poll(now, &mut client.device, &mut client.sockets);
-            server
-                .iface
-                .poll(now, &mut server.device, &mut server.sockets);
+            client.poll(now, link);
+            server.poll(now, link);
         });
 
         // Server: drain RX completely, then echo as much as TX has room for.
@@ -3280,12 +3696,8 @@ fn shape_many_tcp(seconds: u64, n: usize, offload: bool, mode: RunMode) -> Resul
         }
 
         poll_lat.measure(|| {
-            server
-                .iface
-                .poll(now, &mut server.device, &mut server.sockets);
-            client
-                .iface
-                .poll(now, &mut client.device, &mut client.sockets);
+            server.poll(now, link);
+            client.poll(now, link);
         });
 
         // Client: drain echo completely on every flow.
@@ -3312,11 +3724,10 @@ fn shape_many_tcp(seconds: u64, n: usize, offload: bool, mode: RunMode) -> Resul
     Report {
         name: "many_tcp",
         elapsed,
-        app_bytes_sent: sent.iter().sum(),
         app_bytes_recvd: recvd.iter().sum(),
-        wire_packets: client.device.tx_packets + server.device.tx_packets,
-        wire_bytes: client.device.tx_bytes + server.device.tx_bytes,
-        poll_lat: poll_lat.histo,
+        wire_packets: client.device_stats.tx_packets + server.device_stats.tx_packets,
+        wire_bytes: client.device_stats.tx_bytes + server.device_stats.tx_bytes,
+        poll_lat: &poll_lat.histo,
         alloc_before,
         alloc_after,
         work_units: n as u64,
@@ -3363,7 +3774,7 @@ fn shape_many_tcp(seconds: u64, n: usize, offload: bool, mode: RunMode) -> Resul
     }
 
     mem_trace.print();
-    print_lane_stats("many_tcp", collect_lane_stats(&[&lane_a, &lane_b]));
+    print_lane_stats("many_tcp", link.stats());
 
     // Per-flow socket footprint estimate. Useful for sizing per-flow
     // budgets in downstream consumers that admit many concurrent flows.
@@ -3372,7 +3783,7 @@ fn shape_many_tcp(seconds: u64, n: usize, offload: bool, mode: RunMode) -> Resul
     println!(
         "    per-flow:           {} bytes (Socket {} + 2 × {} KiB buf)",
         per_flow_bytes,
-        tcp_socket_bytes,
+        socket_bytes,
         BUF / 1024,
     );
     println!(
@@ -3386,47 +3797,31 @@ fn shape_many_tcp(seconds: u64, n: usize, offload: bool, mode: RunMode) -> Resul
 /// Deterministic fairness variant for TCP flows. Each round gives every flow
 /// one bounded client send and server drain opportunity, then rotates the
 /// start index so flow 0 does not always go first.
+#[inline(never)] // Keep the large workload frame out of the dispatcher.
 fn shape_many_tcp_fair(seconds: u64, n: usize, offload: bool, mode: RunMode) -> Result<(), String> {
     const BUF: usize = 4 * 1024;
     const PAYLOAD: usize = 256;
     let duration = checked_run_duration("many_tcp_fair", seconds)?;
     validate_unique_flow_count("many_tcp_fair", n)?;
-    let qd = n
-        .checked_mul(16)
-        .ok_or_else(|| "many_tcp_fair: packet queue size overflowed".to_owned())?
-        .clamp(1024, 16384);
-    let tcp_socket_bytes = core::mem::size_of::<tcp::Socket>();
-    let per_flow_bytes = tcp_socket_bytes
-        .checked_add(2 * BUF)
-        .ok_or_else(|| "many_tcp_fair: per-flow socket footprint overflowed".to_owned())?;
-    let total_bytes = n
-        .checked_mul(2)
-        .and_then(|sockets| sockets.checked_mul(per_flow_bytes))
-        .ok_or_else(|| "many_tcp_fair: total socket footprint overflowed".to_owned())?;
+    let TcpResources {
+        queue_depth,
+        socket_bytes,
+        per_flow_bytes,
+        total_bytes,
+    } = checked_many_tcp_resources("many_tcp_fair", n, BUF)?;
 
-    let lane_a: LaneRc = Rc::new(RefCell::new(Lane::new(1500, qd)));
-    let lane_b: LaneRc = Rc::new(RefCell::new(Lane::new(1500, qd)));
-
-    let mut server = make_endpoint(
-        IpAddress::v4(10, 0, 0, 1),
-        1500,
-        lane_a.clone(),
-        lane_b.clone(),
-        offload,
-    );
-    let mut client = make_endpoint(
-        IpAddress::v4(10, 0, 0, 2),
-        1500,
-        lane_b.clone(),
-        lane_a.clone(),
-        offload,
-    );
+    let mut endpoints = setup_paired_endpoints([10, 0, 0], 1500, queue_depth, offload);
+    let PairedEndpoints {
+        server,
+        client,
+        link,
+    } = &mut endpoints;
 
     let mut srv_handles = Vec::with_capacity(n);
     let mut cli_handles = Vec::with_capacity(n);
     for i in 0..n {
-        let h_srv = add_tcp_socket(&mut server, BUF);
-        let h_cli = add_tcp_socket(&mut client, BUF);
+        let h_srv = add_tcp_socket(server, BUF);
+        let h_cli = add_tcp_socket(client, BUF);
         let (dst_port, src_port) = flow_ports("many_tcp_fair", i)?;
 
         {
@@ -3457,44 +3852,15 @@ fn shape_many_tcp_fair(seconds: u64, n: usize, offload: bool, mode: RunMode) -> 
         StdInstant::now(),
         Duration::from_secs(seconds.min(5)),
     )?;
-    loop {
-        let now = smol_now();
-        server
-            .iface
-            .poll(now, &mut server.device, &mut server.sockets);
-        client
-            .iface
-            .poll(now, &mut client.device, &mut client.sockets);
-        let all_ready = cli_handles
-            .iter()
-            .zip(srv_handles.iter())
-            .all(|(&hc, &hs)| {
-                matches!(
-                    client.sockets.get::<tcp::Socket>(hc).state(),
-                    tcp::State::Established
-                ) && matches!(
-                    server.sockets.get::<tcp::Socket>(hs).state(),
-                    tcp::State::Established
-                )
-            });
-        if all_ready || StdInstant::now() >= connect_deadline {
-            break;
-        }
-    }
-
-    let established = cli_handles
-        .iter()
-        .zip(srv_handles.iter())
-        .filter(|&(&hc, &hs)| {
-            matches!(
-                client.sockets.get::<tcp::Socket>(hc).state(),
-                tcp::State::Established
-            ) && matches!(
-                server.sockets.get::<tcp::Socket>(hs).state(),
-                tcp::State::Established
-            )
-        })
-        .count();
+    let established = establish_tcp_flows(
+        server,
+        client,
+        link,
+        &srv_handles,
+        &cli_handles,
+        wall0,
+        connect_deadline,
+    );
     if established < n {
         eprintln!(
             "warning: only {established}/{n} flows established within {} s",
@@ -3511,7 +3877,7 @@ fn shape_many_tcp_fair(seconds: u64, n: usize, offload: bool, mode: RunMode) -> 
     let start = StdInstant::now();
     let alloc_before = AllocSnap::now();
     let mut poll_lat = SampledTimer::new();
-    let mut mem_trace = MemTrace::start();
+    let mut mem_trace = MemTrace::start(mode);
     let mut start_flow = 0usize;
     let mut rounds = 0u64;
     let poll_budget = n.saturating_mul(6).clamp(16, 1024);
@@ -3531,12 +3897,8 @@ fn shape_many_tcp_fair(seconds: u64, n: usize, offload: bool, mode: RunMode) -> 
             for _ in 0..poll_budget {
                 let now = smol_now();
                 poll_lat.measure(|| {
-                    client
-                        .iface
-                        .poll(now, &mut client.device, &mut client.sockets);
-                    server
-                        .iface
-                        .poll(now, &mut server.device, &mut server.sockets);
+                    client.poll(now, link);
+                    server.poll(now, link);
                 });
                 if server.sockets.get::<tcp::Socket>(srv_handles[i]).can_recv() {
                     break;
@@ -3555,12 +3917,8 @@ fn shape_many_tcp_fair(seconds: u64, n: usize, offload: bool, mode: RunMode) -> 
             // opportunity for this flow.
             let now = smol_now();
             poll_lat.measure(|| {
-                server
-                    .iface
-                    .poll(now, &mut server.device, &mut server.sockets);
-                client
-                    .iface
-                    .poll(now, &mut client.device, &mut client.sockets);
+                server.poll(now, link);
+                client.poll(now, link);
             });
         }
 
@@ -3576,11 +3934,10 @@ fn shape_many_tcp_fair(seconds: u64, n: usize, offload: bool, mode: RunMode) -> 
     Report {
         name: "many_tcp_fair",
         elapsed,
-        app_bytes_sent: sent.iter().sum(),
         app_bytes_recvd: recvd.iter().sum(),
-        wire_packets: client.device.tx_packets + server.device.tx_packets,
-        wire_bytes: client.device.tx_bytes + server.device.tx_bytes,
-        poll_lat: poll_lat.histo,
+        wire_packets: client.device_stats.tx_packets + server.device_stats.tx_packets,
+        wire_bytes: client.device_stats.tx_bytes + server.device_stats.tx_bytes,
+        poll_lat: &poll_lat.histo,
         alloc_before,
         alloc_after,
         work_units: rounds,
@@ -3623,14 +3980,14 @@ fn shape_many_tcp_fair(seconds: u64, n: usize, offload: bool, mode: RunMode) -> 
     }
 
     mem_trace.print();
-    print_lane_stats("many_tcp_fair", collect_lane_stats(&[&lane_a, &lane_b]));
+    print_lane_stats("many_tcp_fair", link.stats());
 
     println!();
     println!("  socket-state footprint (without lane pool):");
     println!(
         "    per-flow:           {} bytes (Socket {} + 2 x {} KiB buf)",
         per_flow_bytes,
-        tcp_socket_bytes,
+        socket_bytes,
         BUF / 1024,
     );
     println!(
@@ -3645,6 +4002,7 @@ fn shape_many_tcp_fair(seconds: u64, n: usize, offload: bool, mode: RunMode) -> 
 /// `n` concurrent UDP echo flows. Same metrics as `many_tcp`. UDP has no
 /// flow control or cwnd so per-flow throughput is bounded only by the rate
 /// at which the runner pumps bytes through.
+#[inline(never)] // Keep the large workload frame out of the dispatcher.
 fn shape_many_udp(seconds: u64, n: usize, offload: bool, mode: RunMode) -> Result<(), String> {
     const PAYLOAD: usize = 256;
     // Per-flow UDP socket buffer: a small ring with ~32 metadata slots is
@@ -3666,23 +4024,12 @@ fn shape_many_udp(seconds: u64, n: usize, offload: bool, mode: RunMode) -> Resul
         .and_then(|sockets| sockets.checked_mul(per_flow_bytes))
         .ok_or_else(|| "many_udp: total socket footprint overflowed".to_owned())?;
 
-    let lane_a: LaneRc = Rc::new(RefCell::new(Lane::new(1500, qd)));
-    let lane_b: LaneRc = Rc::new(RefCell::new(Lane::new(1500, qd)));
-
-    let mut server = make_endpoint(
-        IpAddress::v4(10, 0, 0, 1),
-        1500,
-        lane_a.clone(),
-        lane_b.clone(),
-        offload,
-    );
-    let mut client = make_endpoint(
-        IpAddress::v4(10, 0, 0, 2),
-        1500,
-        lane_b.clone(),
-        lane_a.clone(),
-        offload,
-    );
+    let mut endpoints = setup_paired_endpoints([10, 0, 0], 1500, qd, offload);
+    let PairedEndpoints {
+        server,
+        client,
+        link,
+    } = &mut endpoints;
 
     let mk_udp = || -> (udp::PacketBuffer<'static>, udp::PacketBuffer<'static>) {
         let rx_meta = vec![udp::PacketMetadata::EMPTY; META_SLOTS];
@@ -3739,7 +4086,7 @@ fn shape_many_udp(seconds: u64, n: usize, offload: bool, mode: RunMode) -> Resul
     let start = StdInstant::now();
     let alloc_before = AllocSnap::now();
     let mut poll_lat = SampledTimer::new();
-    let mut mem_trace = MemTrace::start();
+    let mut mem_trace = MemTrace::start(mode);
     let mut iters: u64 = 0;
 
     loop {
@@ -3757,12 +4104,8 @@ fn shape_many_udp(seconds: u64, n: usize, offload: bool, mode: RunMode) -> Resul
         }
 
         poll_lat.measure(|| {
-            client
-                .iface
-                .poll(now, &mut client.device, &mut client.sockets);
-            server
-                .iface
-                .poll(now, &mut server.device, &mut server.sockets);
+            client.poll(now, link);
+            server.poll(now, link);
         });
 
         // Drain every server flow.
@@ -3787,11 +4130,10 @@ fn shape_many_udp(seconds: u64, n: usize, offload: bool, mode: RunMode) -> Resul
     Report {
         name: "many_udp",
         elapsed,
-        app_bytes_sent: sent.iter().sum(),
         app_bytes_recvd: recvd.iter().sum(),
-        wire_packets: client.device.tx_packets + server.device.tx_packets,
-        wire_bytes: client.device.tx_bytes + server.device.tx_bytes,
-        poll_lat: poll_lat.histo,
+        wire_packets: client.device_stats.tx_packets + server.device_stats.tx_packets,
+        wire_bytes: client.device_stats.tx_bytes + server.device_stats.tx_bytes,
+        poll_lat: &poll_lat.histo,
         alloc_before,
         alloc_after,
         work_units: n as u64,
@@ -3803,7 +4145,7 @@ fn shape_many_udp(seconds: u64, n: usize, offload: bool, mode: RunMode) -> Resul
     let recvd_stats = Fairness::from(&recvd);
     recvd_stats.print("recvd");
     mem_trace.print();
-    print_lane_stats("many_udp", collect_lane_stats(&[&lane_a, &lane_b]));
+    print_lane_stats("many_udp", link.stats());
 
     println!();
     println!("  socket-state footprint (without lane pool):");
@@ -3848,7 +4190,7 @@ fn set_multi_tcp_worker_state(gate: &MultiTcpWorkerGate, state: MultiTcpWorkerSt
 enum MultiTcpWorkerEvent<R> {
     Ready(usize, Result<(), String>),
     Finished(usize, R),
-    Failed(usize, MultiTcpPanic),
+    Failed(MultiTcpPanic),
 }
 
 #[cfg(feature = "socket-tcp-dynamic-buffer")]
@@ -3856,7 +4198,7 @@ struct MultiTcpWorkerPhases<R> {
     worker_id: usize,
     gate: MultiTcpWorkerGate,
     cancelled: std::sync::Arc<AtomicBool>,
-    events: std::sync::mpsc::Sender<MultiTcpWorkerEvent<R>>,
+    events: std::sync::mpsc::SyncSender<MultiTcpWorkerEvent<R>>,
 }
 
 #[cfg(feature = "socket-tcp-dynamic-buffer")]
@@ -3920,7 +4262,7 @@ impl<R> MultiTcpWorkers<R> {
             std::sync::Condvar::new(),
         ));
         let cancelled = std::sync::Arc::new(AtomicBool::new(false));
-        let (event_tx, events) = std::sync::mpsc::channel();
+        let (event_tx, events) = std::sync::mpsc::sync_channel(worker_count);
         let worker = std::sync::Arc::new(worker);
         let mut handles = Vec::with_capacity(worker_count);
 
@@ -3946,7 +4288,7 @@ impl<R> MultiTcpWorkers<R> {
                     if let Err(panic) = outcome {
                         panic_cancelled.store(true, Ordering::Relaxed);
                         set_multi_tcp_worker_state(&panic_gate, MultiTcpWorkerState::Cancelled);
-                        let _ = events.send(MultiTcpWorkerEvent::Failed(worker_id, panic));
+                        let _ = events.send(MultiTcpWorkerEvent::Failed(panic));
                     }
                 });
 
@@ -3990,7 +4332,7 @@ impl<R> MultiTcpWorkers<R> {
                     if let Err(error) = setup {
                         self.cancel();
                         let join_panic = self.join_all();
-                        if let Some((_, panic)) = self.take_worker_panic() {
+                        if let Some(panic) = self.take_worker_panic() {
                             std::panic::resume_unwind(panic);
                         }
                         if let Some(panic) = join_panic {
@@ -4005,9 +4347,7 @@ impl<R> MultiTcpWorkers<R> {
                 MultiTcpWorkerEvent::Finished(worker_id, _) => self.abort_with_message(&format!(
                     "worker {worker_id} finished before the steady phase"
                 )),
-                MultiTcpWorkerEvent::Failed(worker_id, panic) => {
-                    self.abort_worker_panic(worker_id, panic)
-                }
+                MultiTcpWorkerEvent::Failed(panic) => self.abort_worker_panic(panic),
             }
         }
         Ok(())
@@ -4017,10 +4357,10 @@ impl<R> MultiTcpWorkers<R> {
         set_multi_tcp_worker_state(&self.gate, MultiTcpWorkerState::Running);
     }
 
-    fn wait_finished(&mut self) -> Vec<R> {
-        let mut results: Vec<Option<R>> = std::iter::repeat_with(|| None)
-            .take(self.worker_count)
-            .collect();
+    fn wait_finished(&mut self, results: &mut [Option<R>]) {
+        if results.len() != self.worker_count {
+            self.abort_with_message("worker result slot count did not match worker count");
+        }
         let mut finished_count = 0;
         while finished_count < self.worker_count {
             let event = match self.events.recv() {
@@ -4039,18 +4379,15 @@ impl<R> MultiTcpWorkers<R> {
                 )),
                 MultiTcpWorkerEvent::Ready(worker_id, _) => self
                     .abort_with_message(&format!("duplicate ready event from worker {worker_id}")),
-                MultiTcpWorkerEvent::Failed(worker_id, panic) => {
-                    self.abort_worker_panic(worker_id, panic)
-                }
+                MultiTcpWorkerEvent::Failed(panic) => self.abort_worker_panic(panic),
             }
         }
-        results.into_iter().map(Option::unwrap).collect()
     }
 
     fn release_and_join(mut self) {
         set_multi_tcp_worker_state(&self.gate, MultiTcpWorkerState::Released);
         let join_panic = self.join_all();
-        if let Some((_, panic)) = self.take_worker_panic() {
+        if let Some(panic) = self.take_worker_panic() {
             std::panic::resume_unwind(panic);
         }
         if let Some(panic) = join_panic {
@@ -4058,7 +4395,7 @@ impl<R> MultiTcpWorkers<R> {
         }
     }
 
-    fn abort_worker_panic(&mut self, _worker_id: usize, panic: MultiTcpPanic) -> ! {
+    fn abort_worker_panic(&mut self, panic: MultiTcpPanic) -> ! {
         self.cancel();
         let _ = self.join_all();
         std::panic::resume_unwind(panic);
@@ -4067,7 +4404,7 @@ impl<R> MultiTcpWorkers<R> {
     fn abort_with_message(&mut self, message: &str) -> ! {
         self.cancel();
         let join_panic = self.join_all();
-        if let Some((_, panic)) = self.take_worker_panic() {
+        if let Some(panic) = self.take_worker_panic() {
             std::panic::resume_unwind(panic);
         }
         if let Some(panic) = join_panic {
@@ -4093,9 +4430,9 @@ impl<R> MultiTcpWorkers<R> {
         first_panic
     }
 
-    fn take_worker_panic(&self) -> Option<(usize, MultiTcpPanic)> {
+    fn take_worker_panic(&self) -> Option<MultiTcpPanic> {
         self.events.try_iter().find_map(|event| match event {
-            MultiTcpWorkerEvent::Failed(worker_id, panic) => Some((worker_id, panic)),
+            MultiTcpWorkerEvent::Failed(panic) => Some(panic),
             _ => None,
         })
     }
@@ -4159,32 +4496,113 @@ fn validate_nonzero_counters(shape: &str, counters: &[(&str, u64)]) -> Result<()
 }
 
 #[cfg(feature = "socket-tcp-dynamic-buffer")]
-fn validate_pool_boundaries(
-    shape: &str,
-    active: usize,
-    budget: usize,
-    after_teardown: usize,
+fn validate_churn_rate(
+    target_per_second: usize,
+    elapsed_seconds: f64,
+    opened: u64,
+    closed: u64,
 ) -> Result<(), String> {
-    if active > budget {
+    const MIN_RATIO: f64 = 0.95;
+
+    if closed > opened {
         return Err(format!(
-            "{shape}: active pool use {active} exceeded budget {budget}"
+            "churn: closed {closed} connections after opening {opened}"
         ));
     }
-    if after_teardown != 0 {
+    let minimum = target_per_second as f64 * elapsed_seconds * MIN_RATIO;
+    if opened as f64 >= minimum && closed as f64 >= minimum {
+        Ok(())
+    } else {
+        Err(format!(
+            "churn: opened {opened} and closed {closed}; expected at least {minimum:.0} of each"
+        ))
+    }
+}
+
+#[cfg(feature = "socket-tcp-dynamic-buffer")]
+fn validate_pool_growth(shape: &str, start: usize, end: usize) -> Result<(), String> {
+    if end <= start {
         return Err(format!(
-            "{shape}: pool use after teardown was {after_teardown}, expected 0"
+            "{shape}: active pool use did not grow ({start} -> {end})"
         ));
     }
     Ok(())
 }
 
 #[cfg(feature = "socket-tcp-dynamic-buffer")]
+fn validate_rst_unread_rx(
+    flows: usize,
+    closed: usize,
+    queued: u64,
+    drained: u64,
+    retained_pool: usize,
+    pool_after_drain: usize,
+    pool_after_teardown: usize,
+) -> Result<(), String> {
+    if closed != flows {
+        return Err(format!("rst_unread_rx: reset {closed}/{flows} flows"));
+    }
+    if queued == 0 || drained != queued {
+        return Err(format!(
+            "rst_unread_rx: queued {queued} bytes, drained {drained}"
+        ));
+    }
+    if retained_pool == 0 {
+        return Err("rst_unread_rx: unread data retained no pool charge".to_owned());
+    }
+    if pool_after_drain != 0 || pool_after_teardown != 0 {
+        return Err(format!(
+            "rst_unread_rx: pool after drain/teardown was {pool_after_drain}/{pool_after_teardown}"
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(feature = "socket-tcp-dynamic-buffer")]
+fn fairness_after_prefill(received: &[u64], prefill_per_flow: u64) -> Fairness {
+    let progress: Vec<_> = received
+        .iter()
+        .map(|bytes| bytes.saturating_sub(prefill_per_flow))
+        .collect();
+    Fairness::from(&progress)
+}
+
+#[cfg(feature = "socket-tcp-dynamic-buffer")]
+fn validate_pool_pressure(
+    established: usize,
+    pool_used: usize,
+    pool_budget: usize,
+    pending_bytes: usize,
+    received: &Fairness,
+    pool_after_teardown: usize,
+) -> Result<(), String> {
+    let flows = received.n;
+    if established != flows {
+        return Err(format!(
+            "pool_pressure: established {established}/{flows} flows"
+        ));
+    }
+    if pool_used != pool_budget {
+        return Err(format!(
+            "pool_pressure: used {pool_used} of {pool_budget} pool bytes"
+        ));
+    }
+    if pending_bytes == 0 {
+        return Err("pool_pressure: saturation applied no sender backpressure".to_owned());
+    }
+    if pool_after_teardown != 0 {
+        return Err(format!(
+            "pool_pressure: pool after teardown was {pool_after_teardown}"
+        ));
+    }
+    validate_flow_stats("pool_pressure", received)?;
+    validate_fairness("pool_pressure", received)
+}
+
+#[cfg(feature = "socket-tcp-dynamic-buffer")]
 fn validate_multi_tcp_workers(
     shape: &str,
     workers: &[Result<MultiTcpWorkerStats, String>],
-    pool_active: usize,
-    pool_budget: usize,
-    pool_after_teardown: usize,
 ) -> Result<(), String> {
     let mut sent = 0u64;
     let mut received = Vec::with_capacity(workers.len());
@@ -4206,8 +4624,7 @@ fn validate_multi_tcp_workers(
     let received = Fairness::from(&received);
     validate_nonzero_counters(shape, &[("aggregate sent bytes", sent)])?;
     validate_flow_stats(shape, &received)?;
-    validate_fairness(shape, &received)?;
-    validate_pool_boundaries(shape, pool_active, pool_budget, pool_after_teardown)
+    validate_fairness(shape, &received)
 }
 
 #[cfg(feature = "socket-tcp-dynamic-buffer")]
@@ -4250,8 +4667,6 @@ fn shape_multi_tcp_impl(
     offload: bool,
     workload: MultiTcpWorkload,
 ) -> Result<(), String> {
-    use std::time::Instant as StdInstant;
-
     const MAX_BUF: u32 = 32 * 1024;
     const PAYLOAD: usize = 1024;
     let shape_name = workload.shape_name();
@@ -4268,10 +4683,7 @@ fn shape_multi_tcp_impl(
         .checked_mul(2)
         .and_then(|sockets| sockets.checked_mul(MAX_BUF as usize))
         .ok_or_else(|| format!("{shape_name}: pool budget overflowed"))?;
-    let qd = flows_per_thread
-        .checked_mul(16)
-        .ok_or_else(|| format!("{shape_name}: packet queue size overflowed"))?
-        .clamp(1024, 16384);
+    let qd = packet_queue_depth(shape_name, flows_per_thread)?;
     let pool = tcp::MemoryPool::new(pool_bytes);
 
     let (vol_before, nvol_before) = ctxsw_counts();
@@ -4288,8 +4700,12 @@ fn shape_multi_tcp_impl(
                     return;
                 }
             };
-            let (mut server, mut client, lane_a, lane_b) =
-                setup_paired_endpoints(subnet, 1500, qd, offload);
+            let mut endpoints = setup_paired_endpoints(subnet, 1500, qd, offload);
+            let PairedEndpoints {
+                server,
+                client,
+                link,
+            } = &mut endpoints;
 
             let mut srv_handles = Vec::with_capacity(flows_per_thread);
             let mut cli_handles = Vec::with_capacity(flows_per_thread);
@@ -4298,8 +4714,8 @@ fn shape_multi_tcp_impl(
                 if i & 0xff == 0 && phases.is_cancelled() {
                     break;
                 }
-                let h_srv = add_tcp_socket_dyn(&mut server, MAX_BUF, &pool);
-                let h_cli = add_tcp_socket_dyn(&mut client, MAX_BUF, &pool);
+                let h_srv = add_tcp_socket_dyn(server, MAX_BUF, &pool);
+                let h_cli = add_tcp_socket_dyn(client, MAX_BUF, &pool);
                 let (dst_port, src_port) = match flow_ports(shape_name, i) {
                     Ok(ports) => ports,
                     Err(error) => {
@@ -4351,12 +4767,8 @@ fn shape_multi_tcp_impl(
             if let Some(connect_deadline) = connect_deadline {
                 loop {
                     let now = smol_now(w0);
-                    server
-                        .iface
-                        .poll(now, &mut server.device, &mut server.sockets);
-                    client
-                        .iface
-                        .poll(now, &mut client.device, &mut client.sockets);
+                    server.poll(now, link);
+                    client.poll(now, link);
                     let all_ready = cli_handles
                         .iter()
                         .zip(srv_handles.iter())
@@ -4393,6 +4805,9 @@ fn shape_multi_tcp_impl(
                 });
             }
 
+            let payload = vec![0xa5u8; PAYLOAD];
+            let mut sink = vec![0u8; PAYLOAD];
+
             // Setup and start coordination stays outside the timed traffic loop.
             let setup = match setup_error {
                 Some(error) => Err(error),
@@ -4405,8 +4820,6 @@ fn shape_multi_tcp_impl(
 
             let mut sent: u64 = 0;
             let mut recvd: u64 = 0;
-            let payload = vec![0xa5u8; PAYLOAD];
-            let mut sink = vec![0u8; PAYLOAD];
             let deadline = match checked_deadline(shape_name, steady_start, duration) {
                 Ok(deadline) => deadline,
                 Err(error) => {
@@ -4431,12 +4844,8 @@ fn shape_multi_tcp_impl(
                                 sent += n as u64;
                             }
                         }
-                        client
-                            .iface
-                            .poll(now, &mut client.device, &mut client.sockets);
-                        server
-                            .iface
-                            .poll(now, &mut server.device, &mut server.sockets);
+                        client.poll(now, link);
+                        server.poll(now, link);
                         for &h in &srv_handles {
                             let s = server.sockets.get_mut::<tcp::Socket>(h);
                             while s.can_recv() {
@@ -4451,12 +4860,8 @@ fn shape_multi_tcp_impl(
                                 }
                             }
                         }
-                        server
-                            .iface
-                            .poll(now, &mut server.device, &mut server.sockets);
-                        client
-                            .iface
-                            .poll(now, &mut client.device, &mut client.sockets);
+                        server.poll(now, link);
+                        client.poll(now, link);
                         for &h in &cli_handles {
                             let s = client.sockets.get_mut::<tcp::Socket>(h);
                             while s.can_recv() {
@@ -4488,12 +4893,8 @@ fn shape_multi_tcp_impl(
                                 sent += wrote as u64;
                             }
                         }
-                        client
-                            .iface
-                            .poll(now, &mut client.device, &mut client.sockets);
-                        server
-                            .iface
-                            .poll(now, &mut server.device, &mut server.sockets);
+                        client.poll(now, link);
+                        server.poll(now, link);
                         for &h in &srv_handles {
                             let s = server.sockets.get_mut::<tcp::Socket>(h);
                             while s.can_recv() {
@@ -4506,17 +4907,13 @@ fn shape_multi_tcp_impl(
                                 }
                             }
                         }
-                        server
-                            .iface
-                            .poll(now, &mut server.device, &mut server.sockets);
-                        client
-                            .iface
-                            .poll(now, &mut client.device, &mut client.sockets);
+                        server.poll(now, link);
+                        client.poll(now, link);
                     }
                 }
             }
             let elapsed_us = steady_start.elapsed().as_micros() as u64;
-            let lane_stats = collect_lane_stats(&[&lane_a, &lane_b]);
+            let lane_stats = link.stats();
             // Keep every worker's sockets alive until the main thread samples
             // the active-end memory and pool boundaries.
             let _ = phases.finished(Ok(MultiTcpWorkerStats {
@@ -4542,21 +4939,39 @@ fn shape_multi_tcp_impl(
         }
         return Err(format!("{shape_name}: {error}"));
     }
-    let memory_start = process_memory_bytes();
+    let mut result_slots = std::iter::repeat_with(|| None)
+        .take(n_threads)
+        .collect::<Vec<_>>();
+    let pool_used_start = pool.used();
+    let memory_start = process_memory_sample();
     let alloc_before = alloc_counters_with_memory(memory_start);
+    let allocator_phase = ALLOCATOR_TELEMETRY
+        .begin()
+        .map_err(|error| format!("{shape_name}: {error}"))?;
     workers.start();
-    let results = workers.wait_finished();
-    let mut alloc_after = alloc_counters_with_memory(0);
-    let pool_active = pool.used();
-    alloc_after.process_memory = process_memory_bytes();
+    workers.wait_finished(&mut result_slots);
+    let allocator_peak = allocator_phase.finish();
+    let memory_end = process_memory_sample();
+    let alloc_after = alloc_counters_with_memory(memory_end);
+    let pool_used_end = pool.used();
     workers.release_and_join();
     let pool_after_teardown = pool.used();
-    let memory_report = MultiTcpMemoryReport::from_snapshots(
+    let memory_report = DynamicMemoryReport::from_snapshots(
         alloc_before,
         alloc_after,
-        pool_active,
-        pool_after_teardown,
-    );
+        allocator_peak,
+        PoolUsage {
+            start: pool_used_start,
+            end: pool_used_end,
+            budget: pool_bytes,
+            after_teardown: pool_after_teardown,
+        },
+    )
+    .map_err(|error| format!("{shape_name}: {error}"))?;
+    let results = result_slots
+        .into_iter()
+        .map(Option::unwrap)
+        .collect::<Vec<_>>();
     let total_elapsed_us = results
         .iter()
         .filter_map(|result| result.as_ref().ok())
@@ -4623,6 +5038,13 @@ fn shape_multi_tcp_impl(
         "  threads:                {n_threads}   flows/thread: {flows_per_thread}   total flows: {total_flows}"
     );
     println!("  pool budget:            {} KiB", pool_bytes / 1024);
+    println!("  pool used active start: {} KiB", pool_used_start / 1024);
+    println!("  pool used active end:   {} KiB", pool_used_end / 1024);
+    println!(
+        "  pool used after teardown: {} KiB",
+        pool_after_teardown / 1024
+    );
+    println!();
     memory_report.print();
     println!("  elapsed:                {:.3}s", total_secs);
     println!(
@@ -4661,13 +5083,615 @@ fn shape_multi_tcp_impl(
         cas_retries as f64 / n_threads as f64 / total_secs
     );
     print_lane_stats(shape_name, lane_stats);
-    validate_multi_tcp_workers(
-        shape_name,
-        &results,
-        pool_active,
-        pool_bytes,
+    validate_pool_growth(shape_name, pool_used_start, pool_used_end)?;
+    validate_multi_tcp_workers(shape_name, &results)
+}
+
+/// Retain unread bytes across a reset, hold them resident, then drain them
+/// through the public receive API and require an exact pool refund.
+#[cfg(feature = "socket-tcp-dynamic-buffer")]
+#[inline(never)]
+fn shape_rst_unread_rx(
+    seconds: u64,
+    flows: usize,
+    offload: bool,
+    mode: RunMode,
+) -> Result<(), String> {
+    const MAX_BUF: u32 = 32 * 1024;
+    const PAYLOAD: usize = 1024;
+
+    let duration = checked_run_duration("rst_unread_rx", seconds)?;
+    let queue_depth = packet_queue_depth("rst_unread_rx", flows)?;
+    let pool_bytes = flows
+        .checked_mul(4 * MAX_BUF as usize)
+        .ok_or_else(|| "rst_unread_rx: pool budget overflowed".to_owned())?;
+    let pool = tcp::MemoryPool::new(pool_bytes);
+    let mut endpoints = setup_paired_endpoints([10, 0, 0], 1500, queue_depth, offload);
+    let PairedEndpoints {
+        server,
+        client,
+        link,
+    } = &mut endpoints;
+    let (server_handles, client_handles) =
+        add_dynamic_tcp_flows("rst_unread_rx", server, client, flows, MAX_BUF, &pool)?;
+
+    let wall_origin = StdInstant::now();
+    let connect_deadline = checked_deadline(
+        "rst_unread_rx",
+        wall_origin,
+        Duration::from_secs(seconds.min(5)),
+    )?;
+    let established = establish_tcp_flows(
+        server,
+        client,
+        link,
+        &server_handles,
+        &client_handles,
+        wall_origin,
+        connect_deadline,
+    );
+    if established != flows {
+        return Err(format!(
+            "rst_unread_rx: established {established}/{flows} flows"
+        ));
+    }
+    let payload = [0x5a; PAYLOAD];
+    for (flow, &handle) in server_handles.iter().enumerate() {
+        let sent = server
+            .sockets
+            .get_mut::<tcp::Socket>(handle)
+            .send_slice(&payload)
+            .map_err(|error| format!("rst_unread_rx: flow {flow} send failed: {error:?}"))?;
+        if sent != PAYLOAD {
+            return Err(format!(
+                "rst_unread_rx: flow {flow} queued {sent}/{PAYLOAD} bytes"
+            ));
+        }
+    }
+
+    let receive_deadline = checked_deadline(
+        "rst_unread_rx",
+        StdInstant::now(),
+        Duration::from_secs(seconds.min(5)),
+    )?;
+    loop {
+        let now = Instant::from_micros(wall_origin.elapsed().as_micros() as i64);
+        server.poll(now, link);
+        client.poll(now, link);
+        if client_handles
+            .iter()
+            .all(|&handle| client.sockets.get::<tcp::Socket>(handle).recv_queue() == PAYLOAD)
+        {
+            break;
+        }
+        if StdInstant::now() >= receive_deadline {
+            return Err("rst_unread_rx: payload delivery timed out".to_owned());
+        }
+    }
+    let queued = client_handles
+        .iter()
+        .map(|&handle| client.sockets.get::<tcp::Socket>(handle).recv_queue() as u64)
+        .sum();
+
+    for &handle in &server_handles {
+        server.sockets.get_mut::<tcp::Socket>(handle).abort();
+    }
+    let reset_deadline = checked_deadline(
+        "rst_unread_rx",
+        StdInstant::now(),
+        Duration::from_secs(seconds.min(5)),
+    )?;
+    let closed = loop {
+        let now = Instant::from_micros(wall_origin.elapsed().as_micros() as i64);
+        server.poll(now, link);
+        client.poll(now, link);
+        let closed = client_handles
+            .iter()
+            .filter(|&&handle| {
+                client.sockets.get::<tcp::Socket>(handle).state() == tcp::State::Closed
+            })
+            .count();
+        if closed == flows || StdInstant::now() >= reset_deadline {
+            break closed;
+        }
+    };
+
+    let retained_pool = pool.used();
+    let retained_capacity: usize = client_handles
+        .iter()
+        .map(|&handle| client.sockets.get::<tcp::Socket>(handle).recv_capacity())
+        .sum();
+    if retained_pool != retained_capacity {
+        return Err(format!(
+            "rst_unread_rx: retained pool {retained_pool} != receive capacity {retained_capacity}"
+        ));
+    }
+
+    let mut mem_trace = MemTrace::start(mode);
+    let memory_start = process_memory_sample();
+    let alloc_before = alloc_counters_with_memory(memory_start);
+    let allocator_phase = ALLOCATOR_TELEMETRY
+        .begin()
+        .map_err(|error| format!("rst_unread_rx: {error}"))?;
+    let hold_start = StdInstant::now();
+    let hold_deadline = checked_deadline("rst_unread_rx", hold_start, duration)?;
+    while StdInstant::now() < hold_deadline {
+        let now = Instant::from_micros(wall_origin.elapsed().as_micros() as i64);
+        server.poll(now, link);
+        client.poll(now, link);
+        if mode.sample_memory() {
+            mem_trace.maybe_sample(250);
+        }
+    }
+    let elapsed = hold_start.elapsed().as_secs_f64();
+    let allocator_peak = allocator_phase.finish();
+    let memory_end = process_memory_sample();
+    let alloc_after = alloc_counters_with_memory(memory_end);
+    let pool_after_hold = pool.used();
+
+    let mut drained = 0u64;
+    let mut scratch = [0u8; PAYLOAD];
+    for (flow, &handle) in client_handles.iter().enumerate() {
+        let socket = client.sockets.get_mut::<tcp::Socket>(handle);
+        while socket.can_recv() {
+            let read = socket
+                .recv_slice(&mut scratch)
+                .map_err(|error| format!("rst_unread_rx: flow {flow} drain failed: {error:?}"))?;
+            if read == 0 {
+                break;
+            }
+            if !scratch[..read].iter().all(|&byte| byte == 0x5a) {
+                return Err(format!("rst_unread_rx: flow {flow} payload mismatch"));
+            }
+            drained += read as u64;
+        }
+    }
+    let pool_after_drain = pool.used();
+    let lane_stats = link.stats();
+    drop(endpoints);
+    let pool_after_teardown = pool.used();
+    let memory_report = DynamicMemoryReport::from_snapshots(
+        alloc_before,
+        alloc_after,
+        allocator_peak,
+        PoolUsage {
+            start: retained_pool,
+            end: pool_after_hold,
+            budget: pool_bytes,
+            after_teardown: pool_after_teardown,
+        },
+    )
+    .map_err(|error| format!("rst_unread_rx: {error}"))?;
+
+    println!("\n========== shape: rst_unread_rx ==========");
+    println!("  flows:                  {flows}");
+    println!("  established / reset:    {established} / {closed}");
+    println!("  queued / drained bytes: {queued} / {drained}");
+    println!("  elapsed retained:       {elapsed:.3}s");
+    println!("  pool budget:            {} KiB", pool_bytes / 1024);
+    println!("  pool used active start: {} KiB", retained_pool / 1024);
+    println!("  pool used active end:   {} KiB", pool_after_hold / 1024);
+    println!("  pool used after drain:  {} KiB", pool_after_drain / 1024);
+    println!(
+        "  pool used after teardown: {} KiB",
+        pool_after_teardown / 1024
+    );
+    memory_report.print();
+    mem_trace.print();
+    print_lane_stats("rst_unread_rx", lane_stats);
+    validate_rst_unread_rx(
+        flows,
+        closed,
+        queued,
+        drained,
+        retained_pool,
+        pool_after_drain,
         pool_after_teardown,
     )
+}
+
+/// Fill a shared pool exactly, observe sender backpressure, then require fair
+/// progress while all buffers remain within the fixed budget.
+#[cfg(feature = "socket-tcp-dynamic-buffer")]
+#[inline(never)]
+fn shape_pool_pressure(
+    seconds: u64,
+    flows: usize,
+    offload: bool,
+    mode: RunMode,
+) -> Result<(), String> {
+    const MAX_BUF: u32 = 32 * 1024;
+    const CHUNK: usize = 8 * 1024;
+
+    let duration = checked_run_duration("pool_pressure", seconds)?;
+    let queue_depth = packet_queue_depth("pool_pressure", flows)?;
+    let pool_bytes = flows
+        .checked_mul(3 * CHUNK)
+        .ok_or_else(|| "pool_pressure: pool budget overflowed".to_owned())?;
+    let established_bytes = flows
+        .checked_mul(2 * CHUNK)
+        .ok_or_else(|| "pool_pressure: establishment budget overflowed".to_owned())?;
+    let pool = tcp::MemoryPool::new(pool_bytes);
+    let mut endpoints = setup_paired_endpoints([10, 0, 0], 1500, queue_depth, offload);
+    let PairedEndpoints {
+        server,
+        client,
+        link,
+    } = &mut endpoints;
+    let (server_handles, client_handles) =
+        add_dynamic_tcp_flows("pool_pressure", server, client, flows, MAX_BUF, &pool)?;
+
+    let wall_origin = StdInstant::now();
+    let connect_deadline = checked_deadline(
+        "pool_pressure",
+        wall_origin,
+        Duration::from_secs(seconds.min(5)),
+    )?;
+    let established = establish_tcp_flows(
+        server,
+        client,
+        link,
+        &server_handles,
+        &client_handles,
+        wall_origin,
+        connect_deadline,
+    );
+    if pool.used() != established_bytes {
+        return Err(format!(
+            "pool_pressure: establishment used {} of {established_bytes} expected bytes",
+            pool.used()
+        ));
+    }
+
+    let payload = [0xa5; CHUNK];
+    for (flow, &handle) in client_handles.iter().enumerate() {
+        let sent = client
+            .sockets
+            .get_mut::<tcp::Socket>(handle)
+            .send_slice(&payload)
+            .map_err(|error| format!("pool_pressure: flow {flow} send failed: {error:?}"))?;
+        if sent != CHUNK {
+            return Err(format!(
+                "pool_pressure: flow {flow} queued {sent}/{CHUNK} initial bytes"
+            ));
+        }
+    }
+    let fill_deadline = checked_deadline(
+        "pool_pressure",
+        StdInstant::now(),
+        Duration::from_secs(seconds.min(5)),
+    )?;
+    loop {
+        let now = Instant::from_micros(wall_origin.elapsed().as_micros() as i64);
+        client.poll(now, link);
+        server.poll(now, link);
+        client.poll(now, link);
+        let full = server_handles
+            .iter()
+            .all(|&handle| server.sockets.get::<tcp::Socket>(handle).recv_queue() == CHUNK);
+        let acked = client_handles
+            .iter()
+            .all(|&handle| client.sockets.get::<tcp::Socket>(handle).send_queue() == 0);
+        if full && acked {
+            break;
+        }
+        if StdInstant::now() >= fill_deadline {
+            return Err("pool_pressure: initial saturation timed out".to_owned());
+        }
+    }
+
+    for (flow, &handle) in client_handles.iter().enumerate() {
+        let sent = client
+            .sockets
+            .get_mut::<tcp::Socket>(handle)
+            .send_slice(&payload)
+            .map_err(|error| format!("pool_pressure: flow {flow} retry failed: {error:?}"))?;
+        if sent != CHUNK {
+            return Err(format!(
+                "pool_pressure: flow {flow} queued {sent}/{CHUNK} pending bytes"
+            ));
+        }
+    }
+    let now = Instant::from_micros(wall_origin.elapsed().as_micros() as i64);
+    client.poll(now, link);
+    server.poll(now, link);
+    client.poll(now, link);
+    let saturated_pool = pool.used();
+    let pending_bytes: usize = client_handles
+        .iter()
+        .map(|&handle| client.sockets.get::<tcp::Socket>(handle).send_queue())
+        .sum();
+
+    let mut received = vec![0u64; flows];
+    let mut scratch = [0u8; CHUNK];
+    let mut mem_trace = MemTrace::start(mode);
+    let memory_start = process_memory_sample();
+    let alloc_before = alloc_counters_with_memory(memory_start);
+    let allocator_phase = ALLOCATOR_TELEMETRY
+        .begin()
+        .map_err(|error| format!("pool_pressure: {error}"))?;
+    let start = StdInstant::now();
+    let deadline = checked_deadline("pool_pressure", start, duration)?;
+    while StdInstant::now() < deadline {
+        for (flow, &handle) in server_handles.iter().enumerate() {
+            let socket = server.sockets.get_mut::<tcp::Socket>(handle);
+            while socket.can_recv() {
+                match socket.recv_slice(&mut scratch) {
+                    Ok(read) if read > 0 => received[flow] += read as u64,
+                    _ => break,
+                }
+            }
+        }
+        let now = Instant::from_micros(wall_origin.elapsed().as_micros() as i64);
+        server.poll(now, link);
+        client.poll(now, link);
+        for &handle in &client_handles {
+            let socket = client.sockets.get_mut::<tcp::Socket>(handle);
+            if socket.send_queue() < CHUNK && socket.can_send() {
+                let _ = socket.send_slice(&payload);
+            }
+        }
+        client.poll(now, link);
+        server.poll(now, link);
+        if mode.sample_memory() {
+            mem_trace.maybe_sample(250);
+        }
+    }
+    let elapsed = start.elapsed().as_secs_f64();
+    let allocator_peak = allocator_phase.finish();
+    let memory_end = process_memory_sample();
+    let alloc_after = alloc_counters_with_memory(memory_end);
+    let pool_end = pool.used();
+    let lane_stats = link.stats();
+    drop(endpoints);
+    let pool_after_teardown = pool.used();
+    let memory_report = DynamicMemoryReport::from_snapshots(
+        alloc_before,
+        alloc_after,
+        allocator_peak,
+        PoolUsage {
+            start: saturated_pool,
+            end: pool_end,
+            budget: pool_bytes,
+            after_teardown: pool_after_teardown,
+        },
+    )
+    .map_err(|error| format!("pool_pressure: {error}"))?;
+    let fairness = fairness_after_prefill(&received, CHUNK as u64);
+    let total = fairness.total;
+
+    println!("\n========== shape: pool_pressure ==========");
+    println!("  flows:                  {flows}");
+    println!("  established:            {established}");
+    println!("  pool budget:            {} KiB", pool_bytes / 1024);
+    println!("  pool used active start: {} KiB", saturated_pool / 1024);
+    println!("  pool used active end:   {} KiB", pool_end / 1024);
+    println!("  pending at saturation:  {pending_bytes} bytes");
+    println!("  elapsed:                {elapsed:.3}s");
+    println!("  app received:           {total} bytes");
+    println!(
+        "  active throughput:      {:.3} Gbps",
+        total as f64 * 8.0 / elapsed / 1e9
+    );
+    println!(
+        "  pool used after teardown: {} KiB",
+        pool_after_teardown / 1024
+    );
+    fairness.print("received under pressure");
+    memory_report.print();
+    mem_trace.print();
+    print_lane_stats("pool_pressure", lane_stats);
+    validate_pool_pressure(
+        established,
+        saturated_pool,
+        pool_bytes,
+        pending_bytes,
+        &fairness,
+        pool_after_teardown,
+    )
+}
+
+/// Concurrent one-way dynamic TCP and buffered UDP on the same interfaces,
+/// link, allocator, and process-memory budget.
+#[cfg(feature = "socket-tcp-dynamic-buffer")]
+#[inline(never)]
+fn shape_mixed_tcp_udp(
+    seconds: u64,
+    tcp_flows: usize,
+    udp_flows: usize,
+    offload: bool,
+    mode: RunMode,
+) -> Result<(), String> {
+    const MAX_BUF: u32 = 32 * 1024;
+    const TCP_PAYLOAD: usize = 512;
+    const UDP_PAYLOAD: usize = 256;
+    const UDP_SLOTS: usize = 8;
+
+    let duration = checked_run_duration("mixed_tcp_udp", seconds)?;
+    validate_unique_flow_count("mixed_tcp_udp", tcp_flows.max(udp_flows))?;
+    let total_flows = tcp_flows
+        .checked_add(udp_flows)
+        .ok_or_else(|| "mixed_tcp_udp: total flow count overflowed".to_owned())?;
+    let queue_depth = packet_queue_depth("mixed_tcp_udp", total_flows)?;
+    let pool_bytes = tcp_flows
+        .checked_mul(4 * MAX_BUF as usize)
+        .ok_or_else(|| "mixed_tcp_udp: pool budget overflowed".to_owned())?;
+    let pool = tcp::MemoryPool::new(pool_bytes);
+    let mut endpoints = setup_paired_endpoints([10, 0, 0], 1500, queue_depth, offload);
+    let PairedEndpoints {
+        server,
+        client,
+        link,
+    } = &mut endpoints;
+    let (server_tcp, client_tcp) =
+        add_dynamic_tcp_flows("mixed_tcp_udp", server, client, tcp_flows, MAX_BUF, &pool)?;
+
+    let make_udp = || {
+        let rx_meta = vec![udp::PacketMetadata::EMPTY; UDP_SLOTS];
+        let tx_meta = vec![udp::PacketMetadata::EMPTY; UDP_SLOTS];
+        let rx_data = vec![0; UDP_SLOTS * UDP_PAYLOAD];
+        let tx_data = vec![0; UDP_SLOTS * UDP_PAYLOAD];
+        (
+            udp::PacketBuffer::new(rx_meta, rx_data),
+            udp::PacketBuffer::new(tx_meta, tx_data),
+        )
+    };
+    let mut server_udp = Vec::with_capacity(udp_flows);
+    let mut client_udp = Vec::with_capacity(udp_flows);
+    let mut destinations = Vec::with_capacity(udp_flows);
+    let mut server_bound = true;
+    let mut client_bound = true;
+    for flow in 0..udp_flows {
+        let (server_port, client_port) = flow_ports("mixed_tcp_udp", flow)?;
+        let (rx, tx) = make_udp();
+        let server_handle = server.sockets.add(udp::Socket::new(rx, tx));
+        server_bound &= server
+            .sockets
+            .get_mut::<udp::Socket>(server_handle)
+            .bind(server_port)
+            .is_ok();
+        let (rx, tx) = make_udp();
+        let client_handle = client.sockets.add(udp::Socket::new(rx, tx));
+        client_bound &= client
+            .sockets
+            .get_mut::<udp::Socket>(client_handle)
+            .bind(client_port)
+            .is_ok();
+        server_udp.push(server_handle);
+        client_udp.push(client_handle);
+        destinations.push(udp::UdpMetadata::from((
+            IpAddress::v4(10, 0, 0, 1),
+            server_port,
+        )));
+    }
+
+    let wall_origin = StdInstant::now();
+    let connect_deadline = checked_deadline(
+        "mixed_tcp_udp",
+        wall_origin,
+        Duration::from_secs(seconds.min(5)),
+    )?;
+    let established = establish_tcp_flows(
+        server,
+        client,
+        link,
+        &server_tcp,
+        &client_tcp,
+        wall_origin,
+        connect_deadline,
+    );
+
+    let tcp_payload = [0x6d; TCP_PAYLOAD];
+    let udp_payload = [0x75; UDP_PAYLOAD];
+    let mut tcp_scratch = [0; TCP_PAYLOAD];
+    let mut udp_scratch = [0; UDP_PAYLOAD];
+    let mut tcp_received = vec![0u64; tcp_flows];
+    let mut udp_received = vec![0u64; udp_flows];
+    let mut mem_trace = MemTrace::start(mode);
+    let pool_start = pool.used();
+    let memory_start = process_memory_sample();
+    let alloc_before = alloc_counters_with_memory(memory_start);
+    let allocator_phase = ALLOCATOR_TELEMETRY
+        .begin()
+        .map_err(|error| format!("mixed_tcp_udp: {error}"))?;
+    let start = StdInstant::now();
+    let deadline = checked_deadline("mixed_tcp_udp", start, duration)?;
+    while StdInstant::now() < deadline {
+        for &handle in &client_tcp {
+            let socket = client.sockets.get_mut::<tcp::Socket>(handle);
+            if socket.can_send() {
+                let _ = socket.send_slice(&tcp_payload);
+            }
+        }
+        for (flow, &handle) in client_udp.iter().enumerate() {
+            let socket = client.sockets.get_mut::<udp::Socket>(handle);
+            if socket.can_send() {
+                let _ = socket.send_slice(&udp_payload, destinations[flow]);
+            }
+        }
+
+        let now = Instant::from_micros(wall_origin.elapsed().as_micros() as i64);
+        client.poll(now, link);
+        server.poll(now, link);
+        for (flow, &handle) in server_tcp.iter().enumerate() {
+            let socket = server.sockets.get_mut::<tcp::Socket>(handle);
+            while socket.can_recv() {
+                match socket.recv_slice(&mut tcp_scratch) {
+                    Ok(read) if read > 0 => tcp_received[flow] += read as u64,
+                    _ => break,
+                }
+            }
+        }
+        for (flow, &handle) in server_udp.iter().enumerate() {
+            let socket = server.sockets.get_mut::<udp::Socket>(handle);
+            while socket.can_recv() {
+                match socket.recv_slice(&mut udp_scratch) {
+                    Ok((read, _)) => udp_received[flow] += read as u64,
+                    Err(_) => break,
+                }
+            }
+        }
+        server.poll(now, link);
+        client.poll(now, link);
+        if mode.sample_memory() {
+            mem_trace.maybe_sample(250);
+        }
+    }
+    let elapsed = start.elapsed().as_secs_f64();
+    let allocator_peak = allocator_phase.finish();
+    let memory_end = process_memory_sample();
+    let alloc_after = alloc_counters_with_memory(memory_end);
+    let pool_end = pool.used();
+    let lane_stats = link.stats();
+    drop(endpoints);
+    let pool_after_teardown = pool.used();
+    let memory_report = DynamicMemoryReport::from_snapshots(
+        alloc_before,
+        alloc_after,
+        allocator_peak,
+        PoolUsage {
+            start: pool_start,
+            end: pool_end,
+            budget: pool_bytes,
+            after_teardown: pool_after_teardown,
+        },
+    )
+    .map_err(|error| format!("mixed_tcp_udp: {error}"))?;
+    let tcp_fairness = Fairness::from(&tcp_received);
+    let udp_fairness = Fairness::from(&udp_received);
+    let total = tcp_fairness.total + udp_fairness.total;
+
+    println!("\n========== shape: mixed_tcp_udp ==========");
+    println!("  TCP / UDP flows:        {tcp_flows} / {udp_flows}");
+    println!("  TCP established:        {established}");
+    println!("  elapsed:                {elapsed:.3}s");
+    println!(
+        "  TCP / UDP received:     {} / {} bytes",
+        tcp_fairness.total, udp_fairness.total
+    );
+    println!(
+        "  active throughput:      {:.3} Gbps",
+        total as f64 * 8.0 / elapsed / 1e9
+    );
+    println!("  pool budget:            {} KiB", pool_bytes / 1024);
+    println!("  pool used active start: {} KiB", pool_start / 1024);
+    println!("  pool used active end:   {} KiB", pool_end / 1024);
+    println!(
+        "  pool used after teardown: {} KiB",
+        pool_after_teardown / 1024
+    );
+    tcp_fairness.print("TCP received");
+    udp_fairness.print("UDP received");
+    memory_report.print();
+    mem_trace.print();
+    print_lane_stats("mixed_tcp_udp", lane_stats);
+
+    validate_established_flows("mixed_tcp_udp TCP", established, tcp_flows, &tcp_fairness)?;
+    validate_fairness("mixed_tcp_udp TCP", &tcp_fairness)?;
+    validate_udp_bindings("mixed_tcp_udp UDP", server_bound, client_bound)?;
+    validate_flow_stats("mixed_tcp_udp UDP", &udp_fairness)?;
+    validate_fairness("mixed_tcp_udp UDP", &udp_fairness)?;
+    validate_pool_growth("mixed_tcp_udp", pool_start, pool_end)
 }
 
 /// Connection-churn shape. Repeatedly opens and tears down TCP flows at
@@ -4682,7 +5706,6 @@ fn shape_churn(
     offload: bool,
     mode: RunMode,
 ) -> Result<(), String> {
-    use std::time::Instant as StdInstant;
     const MAX_BUF: u32 = 32 * 1024;
     const SLOTS: usize = 256;
     const PAYLOAD: usize = 128;
@@ -4693,8 +5716,12 @@ fn shape_churn(
     let pool_bytes: usize = SLOTS * 2 * MAX_BUF as usize;
     let pool = tcp::MemoryPool::new(pool_bytes);
 
-    let (mut server, mut client, lane_a, lane_b) =
-        setup_paired_endpoints([10, 0, 0], 1500, qd, offload);
+    let mut endpoints = setup_paired_endpoints([10, 0, 0], 1500, qd, offload);
+    let PairedEndpoints {
+        server,
+        client,
+        link,
+    } = &mut endpoints;
 
     // Pre-allocate a ring of socket handles. Each "churn slot" is a pair
     // we cycle through; once a pair is fully torn down we recycle the slot.
@@ -4704,14 +5731,11 @@ fn shape_churn(
         u16,
     )> = Vec::with_capacity(SLOTS);
     for i in 0..SLOTS {
-        let h_srv = add_tcp_socket_dyn(&mut server, MAX_BUF, &pool);
-        let h_cli = add_tcp_socket_dyn(&mut client, MAX_BUF, &pool);
+        let h_srv = add_tcp_socket_dyn(server, MAX_BUF, &pool);
+        let h_cli = add_tcp_socket_dyn(client, MAX_BUF, &pool);
         slots.push((h_srv, h_cli, i as u16));
     }
 
-    let alloc_before = AllocSnap::now();
-    let start = StdInstant::now();
-    let mut mem_trace = MemTrace::start();
     let smol_now = |w0: StdInstant| Instant::from_micros(w0.elapsed().as_micros() as i64);
 
     let mut next_slot = 0usize;
@@ -4721,6 +5745,14 @@ fn shape_churn(
     let mut setup_error = None;
     let payload = vec![0xc5u8; PAYLOAD];
     let mut scratch = vec![0u8; PAYLOAD];
+    let mut mem_trace = MemTrace::start(mode);
+    let pool_used_start = pool.used();
+    let memory_start = process_memory_sample();
+    let alloc_before = alloc_counters_with_memory(memory_start);
+    let allocator_phase = ALLOCATOR_TELEMETRY
+        .begin()
+        .map_err(|error| format!("churn: {error}"))?;
+    let start = StdInstant::now();
     let mut next_open_us: u64 = 0;
     let deadline = checked_deadline("churn", start, duration)?;
 
@@ -4796,12 +5828,8 @@ fn shape_churn(
                 let _ = cs.send_slice(&payload);
             }
         }
-        client
-            .iface
-            .poll(now, &mut client.device, &mut client.sockets);
-        server
-            .iface
-            .poll(now, &mut server.device, &mut server.sockets);
+        client.poll(now, link);
+        server.poll(now, link);
 
         // Server: drain. After receiving payload, abort the connection
         // (skips TIME_WAIT so the slot recycles immediately). Client
@@ -4817,24 +5845,19 @@ fn shape_churn(
                 closed += 1;
             }
         }
-        server
-            .iface
-            .poll(now, &mut server.device, &mut server.sockets);
-        client
-            .iface
-            .poll(now, &mut client.device, &mut client.sockets);
+        server.poll(now, link);
+        client.poll(now, link);
         if mode.sample_memory() {
             mem_trace.maybe_sample(250);
         }
     }
 
     let elapsed = start.elapsed().as_secs_f64();
-    let alloc_after = AllocSnap::now();
+    let allocator_peak = allocator_phase.finish();
+    let memory_end = process_memory_sample();
+    let alloc_after = alloc_counters_with_memory(memory_end);
     let conn_rate = opened as f64 / elapsed;
     let close_rate = closed as f64 / elapsed;
-    let alloc_bytes = alloc_after.alloc_bytes - alloc_before.alloc_bytes;
-    let free_bytes = alloc_after.free_bytes - alloc_before.free_bytes;
-    let alloc_count = alloc_after.alloc_count - alloc_before.alloc_count;
 
     // Two pool readings with different roles. At the deadline, slots can
     // legitimately hold charge: connections mid-lifecycle, plus sockets
@@ -4843,9 +5866,21 @@ fn shape_churn(
     // contract. That value is a bounded diagnostic. The *leak gate* is the
     // post-teardown reading: dropping the sockets must refund every byte.
     let pool_at_deadline = pool.used();
-    drop(server);
-    drop(client);
+    let lane_stats = link.stats();
+    drop(endpoints);
     let pool_after_teardown = pool.used();
+    let memory_report = DynamicMemoryReport::from_snapshots(
+        alloc_before,
+        alloc_after,
+        allocator_peak,
+        PoolUsage {
+            start: pool_used_start,
+            end: pool_at_deadline,
+            budget: pool_bytes,
+            after_teardown: pool_after_teardown,
+        },
+    )
+    .map_err(|error| format!("churn: {error}"))?;
 
     println!("\n========== shape: churn ==========");
     println!("  target rate:            {} conn/s", target_conn_per_sec);
@@ -4854,6 +5889,7 @@ fn shape_churn(
     println!("  opened:                 {opened}   ({conn_rate:.1} conn/s)");
     println!("  closed:                 {closed}   ({close_rate:.1} conn/s)");
     println!("  app bytes xfer:         {bytes_xferred}");
+    println!("  pool used active start: {} KiB", pool_used_start / 1024);
     println!(
         "  pool used at deadline:  {} KiB  (in-flight + retained rx; bounded)",
         pool_at_deadline / 1024
@@ -4863,48 +5899,20 @@ fn shape_churn(
         pool_after_teardown / 1024
     );
     println!("  pool budget:            {} KiB", pool_bytes / 1024);
-    let metric = process_memory_label();
-    let memory_delta = signed_delta(alloc_after.process_memory, alloc_before.process_memory);
-    println!(
-        "  {metric} start:         {} KiB",
-        alloc_before.process_memory / 1024
-    );
-    println!(
-        "  {metric} end:           {} KiB",
-        alloc_after.process_memory / 1024
-    );
-    println!(
-        "  {metric} delta:         {:+.1} KiB",
-        memory_delta as f64 / 1024.0
-    );
-    println!("  bytes allocated:        {alloc_bytes}");
-    println!("  bytes freed:            {free_bytes}");
-    println!(
-        "  net heap delta:         {}",
-        alloc_bytes as i64 - free_bytes as i64
-    );
-    println!("  allocation count:       {alloc_count}");
+    memory_report.print();
     mem_trace.print();
-    print_lane_stats("churn", collect_lane_stats(&[&lane_a, &lane_b]));
+    print_lane_stats("churn", lane_stats);
     if let Some(error) = setup_error {
         return Err(format!("churn: {error}"));
     }
-    validate_nonzero_counters(
-        "churn",
-        &[
-            ("opened connections", opened),
-            ("closed connections", closed),
-            ("transferred bytes", bytes_xferred),
-        ],
-    )?;
-    validate_pool_boundaries("churn", pool_at_deadline, pool_bytes, pool_after_teardown)
+    validate_nonzero_counters("churn", &[("transferred bytes", bytes_xferred)])?;
+    validate_churn_rate(target_conn_per_sec, elapsed, opened, closed)
 }
 
 /// Mixed idle + active shape. Creates `n_idle` TCP sockets that never see
 /// data and `n_active` TCP sockets that run a steady-state echo workload.
 /// All share one [`tcp::MemoryPool`]. The point is to verify that lazy
-/// allocation keeps idle-flow memory at ~0 while active flows still hit
-/// full throughput.
+/// allocation keeps idle-flow memory at ~0 while active flows carry traffic.
 #[cfg(feature = "socket-tcp-dynamic-buffer")]
 fn shape_idle_hot(
     seconds: u64,
@@ -4913,8 +5921,6 @@ fn shape_idle_hot(
     offload: bool,
     mode: RunMode,
 ) -> Result<(), String> {
-    use std::time::Instant as StdInstant;
-
     const MAX_BUF: u32 = 32 * 1024;
     const PAYLOAD: usize = 1024;
     let duration = checked_run_duration("idle_hot", seconds)?;
@@ -4922,10 +5928,7 @@ fn shape_idle_hot(
         .checked_add(n_active)
         .ok_or_else(|| "idle_hot: total flow count overflowed".to_owned())?;
     validate_unique_flow_count("idle_hot", total)?;
-    let qd = total
-        .checked_mul(16)
-        .ok_or_else(|| "idle_hot: packet queue size overflowed".to_owned())?
-        .clamp(1024, 16384);
+    let qd = idle_hot_queue_depth(n_active)?;
     let active_socket_count = n_active
         .checked_mul(2)
         .ok_or_else(|| "idle_hot: active socket count overflowed".to_owned())?;
@@ -4939,16 +5942,20 @@ fn shape_idle_hot(
         .max(2 * MAX_BUF as usize);
     let pool = tcp::MemoryPool::new(pool_bytes);
 
-    let (mut server, mut client, lane_a, lane_b) =
-        setup_paired_endpoints([10, 0, 0], 1500, qd, offload);
+    let mut endpoints = setup_paired_endpoints([10, 0, 0], 1500, qd, offload);
+    let PairedEndpoints {
+        server,
+        client,
+        link,
+    } = &mut endpoints;
 
     // Active flows: open & connect.
     let mut srv_active: Vec<smoltcp::iface::SocketHandle> = Vec::with_capacity(n_active);
     let mut cli_active: Vec<smoltcp::iface::SocketHandle> = Vec::with_capacity(n_active);
     let mut setup_error = None;
     for i in 0..n_active {
-        let h_srv = add_tcp_socket_dyn(&mut server, MAX_BUF, &pool);
-        let h_cli = add_tcp_socket_dyn(&mut client, MAX_BUF, &pool);
+        let h_srv = add_tcp_socket_dyn(server, MAX_BUF, &pool);
+        let h_cli = add_tcp_socket_dyn(client, MAX_BUF, &pool);
         let (dst_port, src_port) = flow_ports("idle_hot", i)?;
         {
             let s = server.sockets.get_mut::<tcp::Socket>(h_srv);
@@ -4977,8 +5984,8 @@ fn shape_idle_hot(
     // Idle flows: create sockets, do not connect — they sit in Closed state
     // and exercise the dyn-buffer footprint that idle sockets pay for.
     for _ in 0..n_idle {
-        let _ = add_tcp_socket_dyn(&mut server, MAX_BUF, &pool);
-        let _ = add_tcp_socket_dyn(&mut client, MAX_BUF, &pool);
+        let _ = add_tcp_socket_dyn(server, MAX_BUF, &pool);
+        let _ = add_tcp_socket_dyn(client, MAX_BUF, &pool);
     }
 
     let memory_after_create = process_memory_bytes();
@@ -4992,12 +5999,8 @@ fn shape_idle_hot(
         checked_deadline("idle_hot", clock_start, Duration::from_secs(seconds.min(5)))?;
     loop {
         let now = smol_now(clock_start);
-        server
-            .iface
-            .poll(now, &mut server.device, &mut server.sockets);
-        client
-            .iface
-            .poll(now, &mut client.device, &mut client.sockets);
+        server.poll(now, link);
+        client.poll(now, link);
         let ready = cli_active.iter().zip(srv_active.iter()).all(|(&hc, &hs)| {
             matches!(
                 client.sockets.get::<tcp::Socket>(hc).state(),
@@ -5046,13 +6049,18 @@ fn shape_idle_hot(
 
     // Steady-state echo on active flows only.
     let mut sent: u64 = 0;
-    let mut recvd: u64 = 0;
+    let mut received_per_flow = vec![0u64; n_active];
     let payload = vec![0xa5u8; PAYLOAD];
     let mut sink = vec![0u8; PAYLOAD];
+    let mut mem_trace = MemTrace::start(mode);
+    let pool_used_start = pool.used();
+    let memory_start = process_memory_sample();
+    let alloc_before = alloc_counters_with_memory(memory_start);
+    let allocator_phase = ALLOCATOR_TELEMETRY
+        .begin()
+        .map_err(|error| format!("idle_hot: {error}"))?;
     let steady_start = StdInstant::now();
     let deadline = checked_deadline("idle_hot", steady_start, duration)?;
-    let alloc_before = AllocSnap::now();
-    let mut mem_trace = MemTrace::start();
     while StdInstant::now() < deadline {
         let now = smol_now(clock_start);
         for &h in &cli_active {
@@ -5063,18 +6071,14 @@ fn shape_idle_hot(
                 sent += n as u64;
             }
         }
-        client
-            .iface
-            .poll(now, &mut client.device, &mut client.sockets);
-        server
-            .iface
-            .poll(now, &mut server.device, &mut server.sockets);
-        for &h in &srv_active {
+        client.poll(now, link);
+        server.poll(now, link);
+        for (flow, &h) in srv_active.iter().enumerate() {
             let s = server.sockets.get_mut::<tcp::Socket>(h);
             while s.can_recv() {
                 match s.recv_slice(&mut sink) {
                     Ok(r) if r > 0 => {
-                        recvd += r as u64;
+                        received_per_flow[flow] += r as u64;
                         if s.can_send() {
                             let _ = s.send_slice(&sink[..r]);
                         }
@@ -5083,12 +6087,8 @@ fn shape_idle_hot(
                 }
             }
         }
-        server
-            .iface
-            .poll(now, &mut server.device, &mut server.sockets);
-        client
-            .iface
-            .poll(now, &mut client.device, &mut client.sockets);
+        server.poll(now, link);
+        client.poll(now, link);
         for &h in &cli_active {
             let s = client.sockets.get_mut::<tcp::Socket>(h);
             while s.can_recv() {
@@ -5103,20 +6103,27 @@ fn shape_idle_hot(
         }
     }
     let elapsed = steady_start.elapsed().as_secs_f64();
-    let mut alloc_after = AllocSnap::now();
+    let allocator_peak = allocator_phase.finish();
+    let memory_end = process_memory_sample();
+    let alloc_after = alloc_counters_with_memory(memory_end);
     let pool_steady = pool.used();
-    let memory_end = process_memory_bytes();
-    alloc_after.process_memory = memory_end;
-    let lane_stats = collect_lane_stats(&[&lane_a, &lane_b]);
-    drop(server);
-    drop(client);
+    let lane_stats = link.stats();
+    drop(endpoints);
     let pool_after_teardown = pool.used();
-    let memory_report = MultiTcpMemoryReport::from_snapshots(
+    let memory_report = DynamicMemoryReport::from_snapshots(
         alloc_before,
         alloc_after,
-        pool_steady,
-        pool_after_teardown,
-    );
+        allocator_peak,
+        PoolUsage {
+            start: pool_used_start,
+            end: pool_steady,
+            budget: pool_bytes,
+            after_teardown: pool_after_teardown,
+        },
+    )
+    .map_err(|error| format!("idle_hot: {error}"))?;
+    let received = Fairness::from(&received_per_flow);
+    let recvd = received.total;
     let gbps = (recvd as f64 * 8.0) / elapsed / 1e9;
 
     println!("\n========== shape: idle_hot ==========");
@@ -5140,11 +6147,21 @@ fn shape_idle_hot(
     println!("  elapsed:                {elapsed:.3}s");
     println!("  app sent / recvd:       {} / {}", sent, recvd);
     println!("  active throughput:      {gbps:.3} Gbps");
+    println!("  pool used active start: {} KiB", pool_used_start / 1024);
+    println!("  pool used active end:   {} KiB", pool_steady / 1024);
+    println!(
+        "  pool used after teardown: {} KiB",
+        pool_after_teardown / 1024
+    );
+    println!();
     memory_report.print();
     println!(
         "  expected: idle pool charge ~= 0 KiB; steady upper bound is {} KiB (active client/server sockets x rx/tx max)",
         expected_steady_bytes / 1024
     );
+    if n_active > 0 {
+        received.print("active received");
+    }
     mem_trace.print();
     print_lane_stats("idle_hot", lane_stats);
     if let Some(error) = setup_error {
@@ -5160,18 +6177,27 @@ fn shape_idle_hot(
             "idle_hot",
             &[("sent bytes", sent), ("received bytes", recvd)],
         )?;
+        validate_flow_stats("idle_hot", &received)?;
     }
     if pool_after_create != 0 {
         return Err(format!(
             "idle_hot: post-create pool use was {pool_after_create}, expected 0"
         ));
     }
-    if n_active == 0 && pool_steady != 0 {
+    if n_active == 0 && (pool_used_start != 0 || pool_steady != 0) {
         return Err(format!(
-            "idle_hot: idle-only steady pool use was {pool_steady}, expected 0"
+            "idle_hot: idle-only pool use was {pool_used_start} -> {pool_steady}, expected 0 -> 0"
         ));
     }
-    validate_pool_boundaries("idle_hot", pool_steady, pool_bytes, pool_after_teardown)
+    if n_active > 0 {
+        validate_pool_growth("idle_hot", pool_used_start, pool_steady)?;
+        if pool_steady > expected_steady_bytes {
+            return Err(format!(
+                "idle_hot: steady pool use {pool_steady} exceeded active socket maximum {expected_steady_bytes}"
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn print_socket_sizes() {
@@ -5208,18 +6234,6 @@ fn print_socket_sizes() {
         size_of::<smoltcp::wire::TcpRepr>()
     );
 }
-
-const USAGE: &str = "\
-Usage:
-  profile_loopback [--mode bench|trace] <shape> <seconds> [offload]
-  profile_loopback [--mode bench|trace] many_tcp|many_tcp_fair|many_udp <seconds> <flows> [offload]
-  profile_loopback [--mode bench|trace] multi_tcp|multi_tcp_sink <seconds> <threads> <flows-per-thread> [offload]
-  profile_loopback [--mode bench|trace] churn <seconds> <rate> [offload]
-  profile_loopback [--mode bench|trace] idle_hot <seconds> <idle> <active> [offload]
-
-Shapes without extra parameters: udp, firehose, pingpong, small, all
-Dynamic shapes require --features socket-tcp-dynamic-buffer.
-The optional final offload value is exactly one of: offload, 1, true.";
 
 fn run_config(config: Config) -> Result<(), String> {
     println!(
@@ -5274,6 +6288,19 @@ fn run_config(config: Config) -> Result<(), String> {
         #[cfg(feature = "socket-tcp-dynamic-buffer")]
         TrafficShape::Churn { rate } => shape_churn(seconds, rate.get(), offload, mode),
         #[cfg(feature = "socket-tcp-dynamic-buffer")]
+        TrafficShape::RstUnreadRx { flows } => {
+            shape_rst_unread_rx(seconds, flows.get(), offload, mode)
+        }
+        #[cfg(feature = "socket-tcp-dynamic-buffer")]
+        TrafficShape::PoolPressure { flows } => {
+            shape_pool_pressure(seconds, flows.get(), offload, mode)
+        }
+        #[cfg(feature = "socket-tcp-dynamic-buffer")]
+        TrafficShape::MixedTcpUdp {
+            tcp_flows,
+            udp_flows,
+        } => shape_mixed_tcp_udp(seconds, tcp_flows.get(), udp_flows.get(), offload, mode),
+        #[cfg(feature = "socket-tcp-dynamic-buffer")]
         TrafficShape::IdleHot { idle, active } => {
             shape_idle_hot(seconds, idle, active, offload, mode)
         }
@@ -5288,7 +6315,7 @@ fn main() -> ExitCode {
     let config = match parse_args(env::args().skip(1)) {
         Ok(config) => config,
         Err(error) => {
-            eprintln!("error: {error}\n\n{USAGE}");
+            eprintln!("error: {error}");
             return ExitCode::from(2);
         }
     };

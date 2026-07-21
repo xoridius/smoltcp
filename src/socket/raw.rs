@@ -14,7 +14,7 @@ use crate::wire::{Ipv4Packet, Ipv4Repr};
 #[cfg(feature = "proto-ipv6")]
 use crate::wire::{Ipv6Packet, Ipv6Repr};
 
-/// Error returned by [`Socket::bind`]
+/// Error type for binding a raw socket.
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum BindError {
@@ -31,8 +31,7 @@ impl core::fmt::Display for BindError {
     }
 }
 
-#[cfg(feature = "std")]
-impl std::error::Error for BindError {}
+impl core::error::Error for BindError {}
 
 /// Error returned by [`Socket::send`]
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
@@ -49,8 +48,7 @@ impl core::fmt::Display for SendError {
     }
 }
 
-#[cfg(feature = "std")]
-impl std::error::Error for SendError {}
+impl core::error::Error for SendError {}
 
 /// Error returned by [`Socket::recv`]
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
@@ -69,8 +67,7 @@ impl core::fmt::Display for RecvError {
     }
 }
 
-#[cfg(feature = "std")]
-impl std::error::Error for RecvError {}
+impl core::error::Error for RecvError {}
 
 /// A UDP packet metadata.
 pub type PacketMetadata = crate::storage::PacketMetadata<()>;

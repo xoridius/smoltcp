@@ -4,10 +4,12 @@ Operational guide for maintaining this downstream of `smoltcp-rs/smoltcp`.
 
 ## 1. Relationship
 
-This is a downstream of `https://github.com/smoltcp-rs/smoltcp`. It carries a
-small set of additive changes — RFC-compliance fixes, host-side wire-layer
-performance, Darwin/BSD phy hardening, and an in-process profiling harness.
-There is no architectural divergence from upstream; do not introduce one.
+This is a downstream of `https://github.com/smoltcp-rs/smoltcp`. It preserves
+upstream's public API where practical and keeps new public entry points
+additive, but maintains substantial internal changes in TCP recovery, dynamic
+buffer ownership and accounting, host-platform paths, and performance gates.
+Keep those differences narrow, documented, and explicitly reconciled when
+syncing upstream.
 
 Configure the upstream remote on a fresh clone:
 
@@ -127,7 +129,7 @@ notes, not as standing values in this file.
 | Did loss recovery or congestion control regress? | `./ci.sh netsim` for the serialized NoControl, CUBIC, and Reno sweeps (§15), plus targeted TCP tests. |
 | What is tunnel-like throughput? | `./ci.sh profile-smoke` first, then `profile_loopback --mode bench udp <seconds>` and the same run with `offload` (§4.2, §4.3). |
 | Are many flows fair and bounded? | `./ci.sh profile-smoke` first, then `many_tcp_fair`, `many_tcp`, and `many_udp` (§4.2). |
-| Are dynamic TCP buffers safe for packet-tunnel memory budgets? | `./ci.sh ios-gate` for a quick check or `./ci.sh ios-full-gate` for the complete constrained-memory matrix (§4.2.1, §14.6). Compare raw process memory; report lane `reserved total` separately. |
+| Are dynamic TCP buffers safe for packet-tunnel memory budgets? | `./ci.sh ios-gate` for a quick check or `./ci.sh ios-full-gate` for the smoltcp-side traffic/memory matrix (§4.2.1, §14.6), plus matched A/B measurements for landing. |
 | Where is CPU time going? | `perf record` / `perf report`, `cargo flamegraph`, or `samply` (§5). |
 | Where is heap growth coming from? | Built-in process-memory/allocator fields first, then `heaptrack`, Massif, or `dhat-heap` (§6). |
 | Is parser hardening still covered? | `./ci.sh fuzz-build`, `./ci.sh fuzz-smoke`, and Miri proof lanes (§7). `fuzz-smoke` defaults to every registered target and also accepts one target name. |
@@ -246,12 +248,12 @@ Report fields to read:
 | `Jain` | Per-flow fairness index. `many_tcp_fair` is the deterministic TCP fairness signal; `many_tcp` is a high-throughput stress shape. |
 | `verdict` | Single-line pass/fail style summary for fairness + starvation. |
 | `<metric> verdict` | `bounded` or `GROWTH`. GROWTH means the median process-memory sample is materially smaller than the final sample — leak suspect. |
-| `net heap delta` | Should be a small constant. Non-constant values mean smoltcp itself allocated on the hot path → bug. |
+| `net heap delta` | Whole-process allocator delta. A matched increase needs investigation; the harness alone cannot attribute it to smoltcp. |
 | `lane stats` | Fixed packet ownership plus TX/RX backpressure and reserved-capacity diagnostics. No mode has a fallback allocation path. |
 
 ### 4.2.1 Dynamic-buffer / multi-thread shapes
 
-Four shapes require `--features socket-tcp-dynamic-buffer`. They
+Seven shapes require `--features socket-tcp-dynamic-buffer`. They
 exercise the pool-backed dynamic-buffer paths (§14) under workloads
 that the legacy `many_tcp` / `many_udp` shapes don't cover.
 
@@ -270,6 +272,18 @@ cargo run --release --example profile_loopback --features socket-tcp-dynamic-buf
 cargo run --release --example profile_loopback --features socket-tcp-dynamic-buffer \
   -- --mode bench churn <seconds> <conn_per_sec>
 
+# Hold unread receive data across peer resets, then drain and refund it.
+cargo run --release --example profile_loopback --features socket-tcp-dynamic-buffer \
+  -- --mode bench rst_unread_rx <seconds> <flows>
+
+# Saturate the exact shared-pool budget and require fair progress.
+cargo run --release --example profile_loopback --features socket-tcp-dynamic-buffer \
+  -- --mode bench pool_pressure <seconds> <flows>
+
+# Drive dynamic TCP and fixed-buffer UDP together on one interface pair.
+cargo run --release --example profile_loopback --features socket-tcp-dynamic-buffer \
+  -- --mode bench mixed_tcp_udp <seconds> <tcp_flows> <udp_flows>
+
 # Mixed idle + active: many idle sockets + few hot ones.
 cargo run --release --example profile_loopback --features socket-tcp-dynamic-buffer \
   -- --mode bench idle_hot <seconds> <n_idle> <n_active>
@@ -282,7 +296,10 @@ What each catches:
 | `multi_tcp` | copy-heavy dynamic-buffer TCP echo throughput, per-thread Jain across `MemoryPool` contention | `Jain < 0.95`, incomplete work, nonzero teardown pool charge, or a large host-local throughput drop versus the previous isolated baseline |
 | `multi_tcp_sink` | one-way dynamic-buffer TCP throughput with direct send/recv closures | incomplete work, nonzero teardown pool charge, lower throughput than `multi_tcp` without a trace-backed explanation, or no reduction in copy/memmove pressure |
 | `churn` | open+close rate sustained, post-teardown `pool used (end)` returns to 0, `net heap delta` bounded | post-teardown `pool used (end) > 0` (leaked reservations); `net heap delta` growing with rate (allocator-on-hot-path). The separate `pool used at deadline` line is diagnostic: in-flight connections plus aborted-with-unread-rx sockets (readable until the slot recycles, per the `may_recv`-after-Closed contract) legitimately hold a small bounded charge at cutoff |
-| `idle_hot` | `pool used post-create == 0` for idle flows; steady-state pool = N_active × 2 sockets × MAX_BUF | non-zero charge from idle sockets (lazy alloc broken); active flows can't reach max (grow policy broken) |
+| `rst_unread_rx` | exact unread byte retention across RST and pool refund after drain | missing reset, changed data, retained TX charge, or nonzero pool after drain/teardown |
+| `pool_pressure` | exact pool saturation, sender backpressure, and per-flow progress | budget overshoot, no pending sender data at saturation, starvation, or nonzero teardown charge |
+| `mixed_tcp_udp` | concurrent TCP/UDP progress and fairness with one dynamic pool | setup failure, protocol starvation, unfairness, unbounded pool use, or nonzero teardown charge |
+| `idle_hot` | zero post-create idle charge; no active flow starves; steady-state upper bound = N_active × 2 endpoints × 2 buffers × MAX_BUF | idle charge, starvation, pool-growth failure, or nonzero teardown charge |
 
 The lane device owns a fixed packet set in every mode and has no fallback
 allocation path. Exhaustion increments TX/RX backpressure and defers progress;
@@ -519,19 +536,21 @@ process memory:
   <metric> delta:         ...
 ```
 
-`many_*`, `churn`, and `idle_hot` additionally print a process-memory
-trajectory sampled periodically in `--mode bench`. `linux_rss` is the resident
-page count from `/proc/self/statm`; `apple_phys_footprint` is the exact
-`task_vm_info.phys_footprint` on Apple platforms. `--mode trace` disables
-periodic samples so Instruments captures are cleaner.
+`many_*` and all dynamic-buffer traffic shapes additionally print a bounded
+process-memory trajectory sampled periodically in `--mode bench`. `linux_rss`
+is the resident page count from `/proc/self/statm`; `apple_phys_footprint` is
+`ri_phys_footprint` from Apple's `proc_pid_rusage` API. The separate lifetime
+peak uses `ri_lifetime_max_phys_footprint`. `--mode trace` disables periodic
+samples so Instruments captures are cleaner.
 
 Interpretation rules:
 
-- **`net heap delta` should be a small constant**. Anything else means
-  smoltcp itself allocated on the hot path — a regression to investigate.
-- **`<metric> verdict: bounded`** when the final sample stays within the harness threshold
-  relative to the median. `GROWTH` flags a possible leak; drop into
-  massif/heaptrack to confirm.
+- **`net heap delta` should be a small constant**. The global allocator counts
+  the whole harness, so investigate a matched increase before attributing it to
+  smoltcp.
+- **`<metric> verdict` is a heuristic trace diagnostic**, not the RSS gate.
+  `GROWTH` warrants a longer run and heap profiling; acceptance uses paired raw
+  process-memory samples from fresh processes.
 - **`reserved total` in lane stats is profiling-harness memory**, not smoltcp
   socket memory. The paired in-memory link preallocates packet buffers so
   trace-mode runs avoid allocator noise. Report that virtual capacity beside
@@ -594,10 +613,8 @@ cargo test --release --test sizecheck --features socket-tcp-reno -- --nocapture
 ```
 
 Prints `size_of` for the TCP/UDP/ICMP/Raw `Socket` types, `RingBuffer`,
-`Assembler`, `IpRepr`, and `TcpRepr`. The test never asserts; it is diagnostic
-only. Run after any field-type change and record the current values in the
-commit message — future field-layout changes will move them, which is the
-catch.
+`Assembler`, `IpRepr`, and `TcpRepr`. It hard-gates the 536-byte default and
+592-byte constrained-Apple TCP shapes; other rows are diagnostic.
 
 ### 6.5 Verifying the alloc-free hot path
 
@@ -608,11 +625,9 @@ cargo run --release --example profile_loopback -- --mode bench many_tcp 5 1000 2
   grep -E "net heap delta|allocation count"
 ```
 
-Expect a small constant `net heap delta` and an `allocation count` whose
-magnitude tracks the number of `MemTrace::maybe_sample` calls in bench
-mode. Materially higher values indicate something is allocating per
-packet — usually a `Vec::with_capacity` or `Bytes::from(Vec)` introduced
-in the hot path.
+Expect a small constant `net heap delta` and an allocation count that does not
+scale with packet volume. Compare matched runs because the counters cover the
+whole harness, not only smoltcp.
 
 ## 7. Property tests as regression gates
 
@@ -932,10 +947,13 @@ current isolated runs on the same host and revision. The durable gates are:
 
 | Shape | Durable gate |
 |---|---|
-| `multi_tcp` | per-thread Jain >= 0.95, bounded pool CAS retries, `pool used (end)` returns to 0; TX/RX backpressure remains diagnostic. |
+| `multi_tcp` | per-thread Jain >= 0.95 and `pool used (end)` returns to 0; pool CAS retries and TX/RX backpressure remain matched-run diagnostics. |
 | `multi_tcp_sink` | same pool and lane gates as `multi_tcp`; compare Time/CPU Profiler hotspots against `multi_tcp` for lower app-side copy pressure before claiming a copy win. |
-| `churn` | achieved close rate tracks target rate, post-teardown `pool used (end) == 0` (the at-deadline reading may be small and bounded), net heap delta does not grow with connection rate. |
-| `idle_hot` | `pool used post-create == 0`; steady pool charge is proportional only to active client/server sockets; lane `reserved total` is harness-only and must be kept separate from iOS socket-budget claims; `n_active=0` is valid and should keep steady pool use at 0. |
+| `churn` | opened and closed counts reach at least 95% of the target schedule; post-teardown `pool used (end) == 0` (the at-deadline reading may be small and bounded); matched net heap does not regress. |
+| `rst_unread_rx` | every flow resets with its exact queued bytes readable; draining and teardown both leave pool use at zero. |
+| `pool_pressure` | pool use reaches but never exceeds its budget, queued senders prove backpressure, every flow progresses with Jain >= 0.95, and teardown returns zero. |
+| `mixed_tcp_udp` | every TCP and UDP flow progresses with Jain >= 0.95, pool use stays within budget, and teardown returns zero. |
+| `idle_hot` | `pool used post-create == 0`, every active flow progresses, charge stays within the active client/server rx/tx maximum, and teardown returns zero; lane reservation remains separate from iOS socket memory. |
 
 Sub-linear scaling at higher thread counts is expected once every worker is
 CPU-bound. Jain below the gate across threads suggests `MemoryPool` contention
@@ -954,10 +972,9 @@ On macOS, do not emulate `/proc` in the harness. Use System Trace analysis
 `virtual-memory`; use `data_window_seconds` from `summary` for rates.
 
 `multi_tcp` and `multi_tcp_sink` report `pool CAS retries:` from
-`MemoryPool::cas_retries()`. Bounded and sub-linear retry growth is the gate;
-if retries become a throughput limiter, confirm that the target threads are
-CPU-bound and not blocked on syscalls, allocator activity, or another
-synchronization primitive.
+`MemoryPool::cas_retries()`. There is no portable absolute limit; compare the
+same thread/flow shape against its matched baseline. If retries rise with a
+throughput loss, confirm the threads are CPU-bound before changing the pool.
 
 ### 13.6 CPU cost maps and heap attribution
 
@@ -1052,16 +1069,22 @@ cargo build --release --example profile_loopback \
 target/release/examples/profile_loopback --mode bench udp 10
 ```
 
+Repeat layout-sensitive checks with `--profile release-lto`. That profile uses
+the shipping Apple code-generation policy (fat LTO, one codegen unit, and
+abort-on-panic) while retaining profiler symbols.
+
 Do not keep old feature-overhead percentages in this document unless
 they are backed by current isolated runs and a matching trace showing
 where the cost comes from.
 
 ### 14.5 Cost when feature is **on** and used (`new_dynamic`)
 
-- Per-flow steady state: `Vec<u8>` per buffer sized to current
-  capacity (between `initial` and `max`).
-- Public `listen()` / `connect()` preserve nonzero `rx_initial` and
-  `tx_initial` after the internal reset that opens a new connection.
+- Per-flow steady state: `Vec<u8>` per buffer sized between `initial` and `max`
+  when pool charge and allocation succeed. Refusal leaves a zero-capacity
+  buffer that applies backpressure until growth can be retried.
+- Public `listen()` / `connect()` restore nonzero `rx_initial` and `tx_initial`
+  after reset when pool charge and allocation succeed; otherwise they retain
+  zero capacity and retry through the normal growth path.
 - `can_send()` reports true for zero-initial dynamic TX buffers when
   the buffer can grow under the socket and pool limits.
 - Growth path: amortized O(rx_max) total memcpy across O(log(rx_max))
@@ -1158,9 +1181,10 @@ Rationale:
 - **Pool = 24 MiB**, roughly half the 50 MB jetsam budget. The rest is
   headroom for wire/device buffers, the `Interface`, non-TCP sockets, the
   consumer's own state, and the Network-framework overhead the extension
-  pays regardless. The pool bounds the worst case; idle flows cost ~0
-  (`dynbuf_memcompare`: ~0.5 KiB/flow process memory vs ~55 KiB/flow for legacy
-  64 KiB fixed buffers).
+  pays regardless. The pool bounds charged steady-state socket capacity;
+  allocator growth can transiently hold old and new buffers at once, and the
+  process also owns memory outside the pool. Idle dynamic sockets charge no
+  buffer capacity; use `dynbuf_memcompare` for current process-memory cost.
 - **`rx_max = tx_max = 64 KiB`** keeps the window-scale shift at 1 and is
   enough to fill typical mobile BDPs (e.g. 100 Mbit/s × 5 ms ≈ 62 KB).
   Don't raise `rx_max` past what the flow's bandwidth-delay product needs:
@@ -1168,10 +1192,12 @@ Rationale:
   (one scale granule, `1 << shift`) and worst-case per-flow cost under load.
 - **`initial = 0`** so admission is free: hundreds of idle flows (DNS,
   keep-alive idle HTTP) charge nothing until traffic arrives.
-- **Worst case** = `budget` bytes of socket buffers across all flows, e.g.
+- **Steady-state charged maximum** = `budget` bytes of socket buffers across
+  all flows, e.g.
   192 concurrent flows all grown to both 64 KiB maxima. Past that, growth
   refusal converts into advertised-window backpressure per flow instead of
-  memory growth — the failure mode is throughput, not jetsam.
+  additional charged socket capacity. Raw RSS or Apple physical footprint is
+  the process-memory gate; the pool alone is not a jetsam guarantee.
 
 Build with `socket-tcp-cubic` for cellular deployments: a real congestion
 controller keeps loss recovery (§15) strictly selective — the cwnd budget
@@ -1179,17 +1205,17 @@ goes to reassembly holes — where `NoControl` deliberately falls back to a
 redundant in-order pass after the holes.
 
 Validate a configuration change with `./ci.sh ios-gate`; use
-`./ci.sh ios-full-gate` when changing pool or buffer sizing. The full gate runs
-the separate-process idle-memory comparison and the `churn` and `idle_hot`
-shapes. Keep the printed lane `reserved total` beside the raw process metric as
-a separate harness-capacity diagnostic; allocated capacity cannot be subtracted
-from resident memory or physical footprint.
+`./ci.sh ios-full-gate` when changing pool or buffer sizing. This smoltcp-side
+matrix runs the separate-process idle-memory comparison and all seven dynamic
+traffic shapes. Matched A/B measurements remain a separate landing gate. Keep
+lane reservation separate from raw resident memory or physical footprint.
 
 ## 15. SACK-based selective retransmission
 
 The sender consumes incoming SACK blocks (RFC 2018) instead of ignoring
-them. Always on; zero-cost on lossless connections (the scoreboard is
-empty and every consumer short-circuits on `is_empty`).
+them. It is always enabled. Lossless connections avoid scoreboard walks
+because the scoreboard remains empty, but every socket retains the fixed
+scoreboard storage and inexpensive state checks.
 
 Design, in `src/socket/tcp.rs`:
 
@@ -1204,12 +1230,12 @@ Design, in `src/socket/tcp.rs`:
   The pure observers (`seq_to_transmit`, `poll_at`, `egress_interest`)
   therefore needed no changes. The segment selector clamps a hole
   retransmission at the next SACKed block.
-- **Recovery point** (RFC 6582 §3): armed at dupack #3 and on RTO.
-  Partial ACKs below it rewind-and-walk the next hole immediately;
-  reaching it ends recovery. During SACK-based recovery, partial ACKs do
-  not notify Reno/Cubic as ordinary new-data ACKs, so the controller stays
-  in fast recovery until the recovery point is cumulatively ACKed. RTO
-  discards the scoreboard and resends conservatively (RFC 2018 §8).
+- **Recovery point** (RFC 6582 §3): armed at dupack #3 and on RTO, and cleared
+  when cumulatively acknowledged. Fast-recovery partial ACKs rewind-and-walk
+  the next hole without notifying Reno/Cubic as ordinary new-data ACKs. RTO
+  discards the scoreboard and resends conservatively (RFC 2018 §8); ordinary
+  post-RTO ACKs resume congestion control, while fresh SACK evidence may guide
+  the cursor before the recorded boundary is reached.
 - **Redundant pass, `NoControl` only**: when the selective walk exhausts
   while recovery is open, one bounded in-order resend of the window —
   holes always first, then redundancy fills the unmanaged pipe and
@@ -1224,12 +1250,10 @@ the `NoControl` redundant pass. It is not a full RFC 6675 pipe estimator: bytes
 outstanding above the cursor are still outside this accounting, which remains
 slightly conservative for cwnd growth.
 
-Evidence gates (re-measure per host; see §13 policy): deterministic
-netsim across 16 seeds at 32 KiB buffers — mean ±0% at 2% loss, +6% at
-5%, +36% at 10%; real-kernel TUN interop at 5% loss — multi-fold faster
-with the RTO tail eliminated, byte-exact. Clean-path throughput
-unchanged. RACK-TLP and pacing remain out of scope (§11) until profile
-evidence demands them.
+Performance and recovery evidence is host- and revision-specific; use the
+matched reports under `docs/perf` and the serial NoControl/Reno/CUBIC snapshots
+instead of treating historical headline numbers as invariants. RACK-TLP and
+pacing remain out of scope (§11) until profile evidence demands them.
 
 In-tree regression coverage: `tests/netsim.rs` runs the buffer×loss sweep.
 `./ci.sh netsim` runs the NoControl snapshot, which exercises the SACK repair
@@ -1247,11 +1271,10 @@ controllers must; refresh them only after reviewing the throughput table.
 
 ## 16. Backported post-0.13.1 upstream changes
 
-The fork branches from `v0.13.1` (see §2). The changes below were
-cherry-picked from upstream commits that landed on `upstream/main` after that
-tag. A future maintainer reconciling against upstream should treat these as
-already present and avoid re-applying them. Each fork commit names the
-upstream PR/commit it came from.
+The fork branches from `v0.13.1` (see §2). This ledger tracks upstream changes
+semantically: some were adapted to fork-owned TCP code, some were implemented
+independently, and some were deliberately skipped. A future maintainer should
+use the recorded outcome instead of assuming patch identity.
 
 | Upstream PR | What | Fork adaptation |
 |---|---|---|
@@ -1260,7 +1283,13 @@ upstream PR/commit it came from.
 | #1159 | deterministic `config.rs` via `BTreeMap` | verbatim |
 | #1162 + #1164 | out-of-window RX: drop OOW RST, exempt OOW data ACKs from rate limiting | verbatim production change; netsim snapshot rebaselined |
 | #1161 | effective MSS subtracts options length; `MIN_REMOTE_MSS` clamp | adapted for `remote_mss: u32`; preserves the adjacent SACK clamp |
-| #1154 / #1156 / #1157 + RTT parts of #1155 | RFC-compliant congestion-control redesign (new Controller API, Reno/CUBIC fast recovery, RTT estimator `on_rto`/`on_retransmit` split, `smoothed_rtt`) | `reno.rs`/`cubic.rs` are taken **verbatim from upstream** save for one fork delta: `set_mss` opens the window at RFC 6928 IW10 instead of upstream's 2*MSS (faster first-RTT ramp; guarded by `*_iw10_on_set_mss`/`*_rwnd_is_grow_only` tests). The fork's static-dispatch `AnyController` wrappers live in `congestion.rs` and are unaffected. The pre-redesign fork shrank these window fields to `u32` and tracked rwnd shrinks in the controller; both were **dropped** — the `u32` shrink saved ~24 B/socket (negligible vs the buffer pool) at the cost of pervasive casts and heavy divergence, and the controller rwnd-shrink collapsed cwnd on transient receive-window dips once the cwnd-vs-in-flight accounting was corrected. The live receive window is still enforced at the socket layer. |
+| #1154 / #1156 / #1157 + RTT parts of #1155 | RFC-compliant congestion-control redesign (new Controller API, Reno/CUBIC fast recovery, RTT estimator `on_rto`/`on_retransmit` split, `smoothed_rtt`) | Adapted to the fork's static `AnyController`, SACK recovery, and exact RFC 6928 IW10 reset. The implementation is intentionally not patch-identical to upstream. The live receive window remains enforced at the socket layer. |
+| #1169 / #1170 | upstream contribution policy and follow-up typo removal | deliberately skipped; repository governance is not a library backport |
+| #1172 | public `wire::checksum` re-export | independently implemented by `dc75b44`; no duplicate re-export applied |
+| #1173 | broken rustdoc links | backported verbatim in this landing |
+| #1175 | unconditional `core::error::Error` implementations | adapted mechanically to all 21 fork error types; extends the trait impls to `no_std` |
+| #1176 | native-endian checksum loop | independently implemented and superseded by the fork's measured dual-`u64` checksum path (`dc75b44`, `7a68a60`, `2da6e33`) |
+| #1177 | stable conversion from `std::time::Instant` | independently implemented by `227c345`, with an additional ordering regression |
 
 Deliberately **not** taken:
 

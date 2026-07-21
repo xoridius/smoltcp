@@ -23,7 +23,9 @@ use std::env;
 use smoltcp::socket::tcp::{self, DynamicBufferConfig, MemoryPool, SocketBuffer};
 
 mod process_memory;
-use process_memory::{process_memory_bytes, process_memory_label, signed_delta};
+use process_memory::{
+    process_memory_bytes, process_memory_label, process_memory_sample, signed_delta,
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Mode {
@@ -82,6 +84,16 @@ fn savings_ratio(legacy_delta: i128, dynamic_delta: i128) -> Option<f64> {
     }
 }
 
+fn print_lifetime_peak(stage: &str, n: usize, peak: Option<u64>) {
+    let metric = process_memory_label();
+    match peak {
+        Some(peak) => {
+            println!("process after {stage} N={n}: {metric} lifetime peak: {peak} bytes")
+        }
+        None => println!("process after {stage} N={n}: {metric} lifetime peak: unavailable"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::savings_ratio;
@@ -100,7 +112,7 @@ fn run_legacy(n: usize) -> (i128, f64) {
     const RX: usize = 32 * 1024;
     const TX: usize = 32 * 1024;
 
-    let start = process_memory_bytes();
+    let start = process_memory_sample();
     let mut legacy: Vec<tcp::Socket<'static>> = Vec::with_capacity(n);
     for _ in 0..n {
         let rx = SocketBuffer::new(vec![0u8; RX]);
@@ -108,15 +120,16 @@ fn run_legacy(n: usize) -> (i128, f64) {
         legacy.push(tcp::Socket::new(rx, tx));
     }
     std::hint::black_box(&legacy);
-    let end = process_memory_bytes();
-    let cost = signed_delta(end, start);
+    let end = process_memory_sample();
+    let cost = signed_delta(end.current_bytes, start.current_bytes);
     let per_flow = per_flow_kib(cost, n);
     let cost_kib = cost as f64 / 1024.0;
     let metric = process_memory_label();
     println!(
         "legacy fixed-buffer N={n}: {metric} delta {cost_kib:>8.1} KiB \
-         ({per_flow:>6.2} KiB / flow)"
+         ({per_flow:>6.2} KiB / flow) ({cost:+} bytes)"
     );
+    print_lifetime_peak("legacy fixed-buffer", n, end.lifetime_peak_bytes);
     (cost, per_flow)
 }
 
@@ -132,21 +145,22 @@ fn run_dynamic(n: usize) -> (i128, f64) {
         tx_max: TX as u32,
         grow_chunk: 4 * 1024,
     };
-    let start = process_memory_bytes();
+    let start = process_memory_sample();
     let mut dynamic: Vec<tcp::Socket<'static>> = Vec::with_capacity(n);
     for _ in 0..n {
         dynamic.push(tcp::Socket::new_dynamic(cfg, Some(pool.clone())));
     }
     std::hint::black_box(&dynamic);
-    let end = process_memory_bytes();
-    let cost = signed_delta(end, start);
+    let end = process_memory_sample();
+    let cost = signed_delta(end.current_bytes, start.current_bytes);
     let per_flow = per_flow_kib(cost, n);
     let cost_kib = cost as f64 / 1024.0;
     let metric = process_memory_label();
     println!(
         "dynamic idle N={n}: {metric} delta      {cost_kib:>8.1} KiB \
-         ({per_flow:>6.2} KiB / flow)"
+         ({per_flow:>6.2} KiB / flow) ({cost:+} bytes)"
     );
+    print_lifetime_peak("dynamic idle", n, end.lifetime_peak_bytes);
     println!(
         "pool charged after N idle sockets:   {:>8} KiB  (expect 0)",
         pool.used() / 1024

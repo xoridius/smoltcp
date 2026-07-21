@@ -206,7 +206,7 @@ impl Interface {
     /// Create a network interface using the previously provided configuration.
     ///
     /// # Panics
-    /// This function panics if the [`Config::hardware_address`] does not match
+    /// This function panics if the [`Config::hardware_addr`] does not match
     /// the medium of the device.
     pub fn new(config: Config, device: &mut (impl Device + ?Sized), now: Instant) -> Self {
         let caps = device.capabilities();
@@ -429,7 +429,7 @@ impl Interface {
     /// Enable or disable the AnyIP capability.
     ///
     /// AnyIP allowins packets to be received
-    /// locally on IP addresses other than the interface's configured [ip_addrs].
+    /// locally on IP addresses other than the interface's configured [`ip_addrs`](Self::ip_addrs).
     /// When AnyIP is enabled and a route prefix in [`routes`](Self::routes) specifies one of
     /// the interface's [`ip_addrs`](Self::ip_addrs) as its gateway, the interface will accept
     /// packets addressed to that prefix.

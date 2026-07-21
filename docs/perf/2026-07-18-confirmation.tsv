@@ -1,0 +1,23 @@
+cell	metric	pairs	control_median	candidate_median	paired_delta_median	paired_delta_pct	paired_delta_min	paired_delta_max
+small-offload	throughput	10	1.3685	1.3895	0.022499999999999853	1.642456326549735	0.0040000000000000036	0.05499999999999994
+small-offload	rss_end	10	2748416.0	2748416.0	0.0		0	8192
+small-offload	rss_peak	10	2748416.0	2748416.0	0.0		0	8192
+small-offload	smaps_total	10	2748416.0	2748416.0	0.0		0	8192
+small-offload	smaps_anonymous	10	958464.0	958464.0	0.0		-4096	4096
+small-offload	smaps_file	10	1789952.0	1789952.0	0.0		0	12288
+small-offload	smaps_executable	10	1789952.0	1789952.0	0.0		0	12288
+small-offload	smaps_other_file	10	0.0	0.0	0.0		0	0
+idle_hot-1000-10-offload	throughput	10	1.2545000000000002	1.23	0.008499999999999952	0.7384079816250333	-0.29699999999999993	0.09199999999999986
+idle_hot-1000-10-offload	rss_end	10	4452352.0	4452352.0	0.0		-16384	16384
+idle_hot-1000-10-offload	rss_peak	10	4452352.0	4452352.0	0.0		-16384	16384
+exact-final-static-small-offload	throughput	5	1.375	1.406	0.031	2.254545	0.014	0.043
+exact-final-static-small-offload	rss_end	5	2736128	2744320	4096		0	8192
+exact-final-static-small-offload	rss_peak	5	2736128	2744320	4096		0	8192
+exact-final-dynamic-small-offload	throughput	5	1.367	1.388	0.022	1.607012	0.016	0.030
+exact-final-dynamic-small-offload	rss_end	5	2969600	2969600	0		0	12288
+exact-final-dynamic-small-offload	rss_peak	5	2969600	2969600	0		0	12288
+exact-final-dynamic-idle-hot-1000-10-offload	throughput	5	1.352	1.402	0.037	2.710623	-0.028	0.104
+exact-final-dynamic-idle-hot-1000-10-offload	rss_end	5	4452352	4452352	0		0	4096
+exact-final-dynamic-idle-hot-1000-10-offload	rss_peak	5	4452352	4452352	0		0	4096
+exact-final-dynamic-idle-hot-1000-10-offload	jain	5	1.0000	1.0000	0		0	0
+exact-final-dynamic-idle-hot-1000-10-offload	pool_after_kib	5	0	0	0		0	0

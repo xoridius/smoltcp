@@ -156,7 +156,8 @@ mod tests {
     #[test]
     fn raw_fd_constructor_duplicates_with_cloexec_and_survives_original_close() {
         let (original, mut peer) = UnixStream::pair().unwrap();
-        let interface = TunTapInterface::from_fd(original.as_raw_fd(), Medium::Ip, 1500).unwrap();
+        let interface =
+            TunTapInterface::from_fd(original.as_raw_fd(), Medium::default(), 1500).unwrap();
 
         assert_ne!(
             fd_flags(interface.as_raw_fd()).unwrap() & libc::FD_CLOEXEC,
@@ -182,7 +183,7 @@ mod tests {
     fn dropping_raw_fd_interface_does_not_close_original() {
         let (original, mut peer) = UnixStream::pair().unwrap();
         let original_fd = original.as_raw_fd();
-        let interface = TunTapInterface::from_fd(original_fd, Medium::Ip, 1500).unwrap();
+        let interface = TunTapInterface::from_fd(original_fd, Medium::default(), 1500).unwrap();
 
         drop(interface);
 
@@ -206,7 +207,7 @@ mod tests {
         let (original, mut peer) = UnixStream::pair().unwrap();
         let original_fd = original.as_raw_fd();
         let owned_fd: OwnedFd = original.into();
-        let interface = TunTapInterface::from_owned_fd(owned_fd, Medium::Ip, 1500).unwrap();
+        let interface = TunTapInterface::from_owned_fd(owned_fd, Medium::default(), 1500).unwrap();
 
         assert_eq!(interface.as_raw_fd(), original_fd);
         let byte = [0x3c_u8];
@@ -230,7 +231,7 @@ mod tests {
 
     #[test]
     fn raw_fd_constructor_rejects_invalid_descriptor() {
-        let error = TunTapInterface::from_fd(-1, Medium::Ip, 1500).unwrap_err();
+        let error = TunTapInterface::from_fd(-1, Medium::default(), 1500).unwrap_err();
         assert_eq!(error.raw_os_error(), Some(libc::EBADF));
     }
 }
