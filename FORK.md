@@ -180,7 +180,7 @@ also run the relevant Tree Borrows proofs:
 MIRIFLAGS="-Zmiri-tree-borrows" cargo +nightly miri test --lib socket::tcp
 MIRIFLAGS="-Zmiri-tree-borrows" cargo +nightly miri test --lib test_deconstruct
 MIRIFLAGS="-Zmiri-tree-borrows" cargo +nightly miri test --lib \
-  --features socket-tcp-dynamic-buffer socket::tcp::test::dyn_buf \
+  --features socket-tcp-dynamic-buffer dyn \
   -- --skip socket::tcp::test::dyn_buf::pool_capacity_floor_300_sockets_24mib_budget
 ```
 
@@ -192,10 +192,13 @@ least three of five matched pairs. Dynamic traffic must retain Jain fairness
 of at least 0.95, no starvation, no fallback allocation, bounded memory traces,
 and zero pool charge after teardown.
 
-The immutable, hash-backed production comparison is
-[`docs/perf/2026-07-18-after.md`](docs/perf/2026-07-18-after.md). New evidence
-must identify the exact source, binaries, toolchain, feature set, commands, and
-matched-run method; do not replace measured history with unrepeatable claims.
+The hash-backed hardening comparison is
+[`docs/perf/2026-07-18-after.md`](docs/perf/2026-07-18-after.md); the final
+refactor is covered by
+[`docs/perf/2026-07-21-cleanup.md`](docs/perf/2026-07-21-cleanup.md). New
+evidence must identify the exact source, binaries, toolchain, feature set,
+commands, and matched-run method; do not replace measured history with
+unrepeatable claims.
 
 ## Upstream sync
 

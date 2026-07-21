@@ -151,7 +151,7 @@ Pin this fork by immutable Git revision:
 
 ```toml
 [dependencies]
-smoltcp = { git = "https://github.com/xoridius/smoltcp.git", rev = "8f5e7042ad73bf21e785b7f3cfaed6a7a6324013" }
+smoltcp = { git = "https://github.com/xoridius/smoltcp.git", rev = "c583bf75105ecdba55a8982be49aaeff59061a56" }
 ```
 
 Move the pin only to a reviewed commit that has passed the production gates in
