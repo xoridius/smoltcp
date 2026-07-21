@@ -1213,14 +1213,15 @@ them. It is always enabled. Lossless connections avoid scoreboard walks
 because the scoreboard remains empty, but every socket retains the fixed
 scoreboard storage and inexpensive state checks.
 
-Design, in `src/socket/tcp.rs`:
+The implementation is split by ownership: recovery policy and orchestration
+remain in `src/socket/tcp.rs`, while the private scoreboard representation,
+ACK rebasing, and interval walks live in `src/socket/tcp/sack.rs`.
 
-- **Scoreboard**: peer-SACKed ranges in a second fixed-size `Assembler`
-  (+64 B per socket, no allocation), stored as offsets relative to
-  SND.UNA; `Assembler::shift_front` slides it with the cumulative ACK.
-  Ingest validates hostile blocks with wrapping-ordered comparisons
-  before any subtraction, trims to SND.UNA, clamps to buffered data, and
-  drops on overflow — worst case equals pre-SACK behavior.
+- **Scoreboard**: peer-SACKed ranges in a private `SackScoreboard` backed by a
+  fixed-size `Assembler` (+64 B per socket, no allocation), stored as offsets
+  relative to SND.UNA. It validates hostile blocks before subtraction, trims
+  to transmitted buffered data, rebases with cumulative ACKs, and drops on
+  overflow — worst case equals pre-SACK behavior.
 - **Invariant I1**: `remote_last_seq` never rests inside a SACKed range
   (`normalize_tx_cursor`, enforced at every cursor/scoreboard mutation).
   The pure observers (`seq_to_transmit`, `poll_at`, `egress_interest`)
