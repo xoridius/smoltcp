@@ -1,13 +1,8 @@
 use crate::{socket::tcp::RttEstimator, time::Instant};
 
-use super::{Controller, initial_window, window_to_usize};
+use super::{Controller, initial_window, window_to_u32, window_to_usize};
 
 const DEFAULT_MSS: u32 = 1024;
-
-#[inline]
-fn window_to_u32(window: usize) -> u32 {
-    window.min(u32::MAX as usize) as u32
-}
 
 #[inline]
 fn half_window(in_flight: usize, mss: u32) -> u32 {

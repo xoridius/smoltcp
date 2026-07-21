@@ -46,6 +46,12 @@ pub(super) fn initial_window(mss: u32) -> u32 {
         .min(mss.saturating_mul(2).max(14_600))
 }
 
+#[cfg(any(feature = "socket-tcp-reno", feature = "socket-tcp-cubic"))]
+#[inline]
+pub(super) fn window_to_u32(window: usize) -> u32 {
+    window.min(u32::MAX as usize) as u32
+}
+
 #[inline]
 pub(super) fn window_to_usize(window: u32) -> usize {
     usize::try_from(window).unwrap_or(usize::MAX)

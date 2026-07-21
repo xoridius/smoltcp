@@ -410,7 +410,7 @@ impl<'a, T: 'a> From<ManagedSlice<'a, T>> for RingBuffer<'a, T> {
 /// Dynamic-storage operations. Only meaningful when the underlying storage is
 /// `ManagedSlice::Owned(Vec<T>)`; with `Borrowed` storage they are no-ops and
 /// return `false`, so static/`no_std` users are unaffected.
-#[cfg(feature = "alloc")]
+#[cfg(feature = "socket-tcp-dynamic-buffer")]
 impl<'a, T: 'a + Copy + Default> RingBuffer<'a, T> {
     /// Grow the backing storage to `new_capacity`, preserving the buffered
     /// contents and their order. Returns `true` if the growth was applied.
@@ -429,7 +429,6 @@ impl<'a, T: 'a + Copy + Default> RingBuffer<'a, T> {
     /// memory accounting (Darwin); on overcommit hosts (Linux) and jetsam-
     /// style hosts (iOS) malloc rarely returns NULL but we still surface
     /// failure instead of panicking.
-    #[cfg_attr(not(feature = "socket-tcp-dynamic-buffer"), allow(dead_code))]
     pub(crate) fn try_grow(&mut self, new_capacity: usize) -> bool {
         use alloc::vec::Vec;
 
@@ -470,7 +469,6 @@ impl<'a, T: 'a + Copy + Default> RingBuffer<'a, T> {
     ///
     /// The ring becomes empty and zero-capacity. No-op for borrowed storage.
     /// After release, the ring can be re-grown via `try_grow`.
-    #[cfg_attr(not(feature = "socket-tcp-dynamic-buffer"), allow(dead_code))]
     pub(crate) fn release_owned(&mut self) {
         let ManagedSlice::Owned(v) = &mut self.storage else {
             return;
@@ -571,7 +569,7 @@ mod test {
         assert!(ring.is_empty());
     }
 
-    #[cfg(feature = "alloc")]
+    #[cfg(feature = "socket-tcp-dynamic-buffer")]
     #[test]
     fn test_try_grow_preserves_unallocated_writes() {
         // The TCP rx path stores out-of-order payloads past `length` via
@@ -594,7 +592,7 @@ mod test {
         assert_eq!(ring.get_unallocated(2, 3), b"XYZ");
     }
 
-    #[cfg(feature = "alloc")]
+    #[cfg(feature = "socket-tcp-dynamic-buffer")]
     #[test]
     fn test_try_grow_preserves_unallocated_writes_wrapped() {
         // Same, but with read_at != 0 so both the in-order data and the
@@ -614,7 +612,7 @@ mod test {
         assert_eq!(ring.get_unallocated(1, 3), b"OOO");
     }
 
-    #[cfg(feature = "alloc")]
+    #[cfg(feature = "socket-tcp-dynamic-buffer")]
     #[test]
     fn test_release_owned_is_noop_for_borrowed_storage() {
         let mut storage = [0u8; 4];

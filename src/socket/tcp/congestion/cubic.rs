@@ -1,6 +1,6 @@
 use crate::{socket::tcp::RttEstimator, time::Instant};
 
-use super::{Controller, initial_window, window_to_usize};
+use super::{Controller, initial_window, window_to_u32, window_to_usize};
 
 // Constants for the Cubic congestion control algorithm.
 // See RFC 9438.
@@ -10,11 +10,6 @@ const C: f64 = 0.4;
 const ALPHA_CUBIC: f64 = 3.0 * (1.0 - BETA_CUBIC) / (1.0 + BETA_CUBIC);
 
 const DEFAULT_MSS: u32 = 1024;
-
-#[inline]
-fn window_to_u32(window: usize) -> u32 {
-    window.min(u32::MAX as usize) as u32
-}
 
 #[inline]
 fn f64_to_window(window: f64) -> u32 {

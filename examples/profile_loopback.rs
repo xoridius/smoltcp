@@ -284,10 +284,8 @@ fn parse_offload(args: &mut impl Iterator<Item = String>) -> Result<bool, String
     if value.starts_with('-') {
         return Err(format!("unknown option '{value}'"));
     }
-    if !matches!(value.as_str(), "offload" | "1" | "true") {
-        return Err(format!(
-            "invalid offload value '{value}': expected offload|1|true"
-        ));
+    if value != "offload" {
+        return Err(format!("invalid offload value '{value}': expected offload"));
     }
     if let Some(trailing) = args.next() {
         if is_mode_option(&trailing) {
@@ -1193,11 +1191,11 @@ mod tests {
                 config(RunMode::Trace, 2, TrafficShape::Firehose, true),
             ),
             (
-                &["--mode=bench", "pingpong", "3", "1"],
+                &["--mode=bench", "pingpong", "3", "offload"],
                 config(RunMode::Bench, 3, TrafficShape::PingPong, true),
             ),
             (
-                &["small", "4", "true"],
+                &["small", "4", "offload"],
                 config(RunMode::Bench, 4, TrafficShape::Small, true),
             ),
             (
@@ -1223,7 +1221,7 @@ mod tests {
                 ),
             ),
             (
-                &["many_udp", "10", "11", "1"],
+                &["many_udp", "10", "11", "offload"],
                 config(
                     RunMode::Bench,
                     10,
@@ -1267,7 +1265,7 @@ mod tests {
                 ),
             ),
             (
-                &["churn", "7", "8", "1"],
+                &["churn", "7", "8", "offload"],
                 config(RunMode::Bench, 7, TrafficShape::Churn { rate: nz(8) }, true),
             ),
             (
@@ -1301,7 +1299,7 @@ mod tests {
                 ),
             ),
             (
-                &["idle_hot", "9", "10", "0", "true"],
+                &["idle_hot", "9", "10", "0", "offload"],
                 config(
                     RunMode::Bench,
                     9,
@@ -1332,7 +1330,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_args_accepts_each_mode_and_offload_spelling() {
+    fn parse_args_accepts_each_mode_and_literal_offload() {
         let cases: &[(&[&str], RunMode, bool)] = &[
             (&["udp", "1"], RunMode::Bench, false),
             (&["--mode", "bench", "udp", "1"], RunMode::Bench, false),
@@ -1340,8 +1338,6 @@ mod tests {
             (&["--mode", "trace", "udp", "1"], RunMode::Trace, false),
             (&["--mode=trace", "udp", "1"], RunMode::Trace, false),
             (&["udp", "1", "offload"], RunMode::Bench, true),
-            (&["udp", "1", "1"], RunMode::Bench, true),
-            (&["udp", "1", "true"], RunMode::Bench, true),
         ];
 
         for (input, expected_mode, expected_offload) in cases {
@@ -1421,6 +1417,8 @@ mod tests {
                 vec!["udp", "1", "--mode", "trace"],
                 "--mode must appear before the traffic shape",
             ),
+            (vec!["udp", "1", "1"], "invalid offload value '1'"),
+            (vec!["udp", "1", "true"], "invalid offload value 'true'"),
             (vec!["udp", "1", "false"], "invalid offload value 'false'"),
             (
                 vec!["udp", "1", "offload", "extra"],
@@ -2360,8 +2358,7 @@ struct PairedDevice<'a> {
     rx: &'a mut Lane,
     mtu: usize,
     /// If true, the device advertises checksum offload so smoltcp skips
-    /// IPv4/UDP/TCP checksum emit+verify (mimicking a hardware NIC, or
-    /// e.g. an iOS NEPacketTunnelFlow where the OS already verified them).
+    /// IPv4/UDP/TCP checksum emit+verify, mimicking a hardware NIC.
     offload_checksums: bool,
     stats: &'a mut DeviceStats,
 }
@@ -6200,41 +6197,6 @@ fn shape_idle_hot(
     Ok(())
 }
 
-fn print_socket_sizes() {
-    use core::mem::size_of;
-    use smoltcp::socket;
-    use smoltcp::storage::*;
-    println!("\n========== smoltcp footprint (bytes) ==========");
-    println!(
-        "  TCP socket:             {:>6}",
-        size_of::<socket::tcp::Socket>()
-    );
-    println!(
-        "  UDP socket:             {:>6}",
-        size_of::<socket::udp::Socket>()
-    );
-    #[cfg(feature = "socket-icmp")]
-    println!(
-        "  ICMP socket:            {:>6}",
-        size_of::<socket::icmp::Socket>()
-    );
-    #[cfg(feature = "socket-raw")]
-    println!(
-        "  Raw socket:             {:>6}",
-        size_of::<socket::raw::Socket>()
-    );
-    println!(
-        "  RingBuffer<u8>:         {:>6}",
-        size_of::<RingBuffer<u8>>()
-    );
-    println!("  Assembler:              {:>6}", size_of::<Assembler>());
-    println!(
-        "  IpRepr / TcpRepr:       {:>3} / {:>3}",
-        size_of::<smoltcp::wire::IpRepr>(),
-        size_of::<smoltcp::wire::TcpRepr>()
-    );
-}
-
 fn run_config(config: Config) -> Result<(), String> {
     println!(
         "config: mode={} | {} checksums ({}{})",
@@ -6245,7 +6207,7 @@ fn run_config(config: Config) -> Result<(), String> {
             "full software"
         },
         if config.offload_checksums {
-            "mimics a NIC or iOS NEPacketTunnelFlow"
+            "mimics a hardware NIC"
         } else {
             "worst case"
         },
@@ -6254,7 +6216,6 @@ fn run_config(config: Config) -> Result<(), String> {
             None => String::new(),
         }
     );
-    print_socket_sizes();
 
     let seconds = config.seconds.get();
     let offload = config.offload_checksums;

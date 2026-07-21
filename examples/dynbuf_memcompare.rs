@@ -6,19 +6,14 @@
 //!     --features socket-tcp-dynamic-buffer -- legacy <N>
 //!   cargo run --release --example dynbuf_memcompare \
 //!     --features socket-tcp-dynamic-buffer -- dynamic <N>
-//!   cargo run --release --example dynbuf_memcompare \
-//!     --features socket-tcp-dynamic-buffer -- both <N>
 //!
 //! The legacy column shows the floor cost a smoltcp consumer pays today
 //! per admitted flow. The dynamic column shows the cost when buffers are
 //! kept lazy — the iOS / NetworkExtension use-case where many idle flows
 //! coexist with a small number of actively-buffered ones.
-//!
-//! Use separate `legacy` and `dynamic` process runs as memory evidence. `both`
-//! is only a convenient smoke check because allocator state from the first
-//! phase can affect the second phase's process memory.
 
 use std::env;
+use std::num::NonZeroUsize;
 
 use smoltcp::socket::tcp::{self, DynamicBufferConfig, MemoryPool, SocketBuffer};
 
@@ -31,7 +26,6 @@ use process_memory::{
 enum Mode {
     Legacy,
     Dynamic,
-    Both,
 }
 
 impl Mode {
@@ -39,49 +33,41 @@ impl Mode {
         match value {
             "legacy" => Some(Self::Legacy),
             "dynamic" => Some(Self::Dynamic),
-            "both" => Some(Self::Both),
             _ => None,
         }
     }
 }
 
-fn usage() -> ! {
-    eprintln!("usage: dynbuf_memcompare [legacy|dynamic|both] <N>");
+fn usage(error: &str) -> ! {
+    eprintln!("{error}\nusage: dynbuf_memcompare <legacy|dynamic> <N>");
     std::process::exit(2);
 }
 
-fn parse_args() -> (Mode, usize) {
-    let mut args = env::args().skip(1);
-    let first = args.next();
-    match first.as_deref() {
-        None => (Mode::Both, 1000),
-        Some(value) => {
-            if let Some(mode) = Mode::parse(value) {
-                let n = args
-                    .next()
-                    .as_deref()
-                    .unwrap_or("1000")
-                    .parse()
-                    .unwrap_or_else(|_| usage());
-                (mode, n)
-            } else {
-                let n = value.parse().unwrap_or_else(|_| usage());
-                (Mode::Both, n)
-            }
-        }
+fn parse_args(args: impl IntoIterator<Item = String>) -> Result<(Mode, NonZeroUsize), String> {
+    let mut args = args.into_iter();
+    let mode_name = args
+        .next()
+        .ok_or_else(|| "missing mode, expected legacy|dynamic".to_owned())?;
+    let mode = Mode::parse(&mode_name)
+        .ok_or_else(|| format!("invalid mode '{mode_name}', expected legacy|dynamic"))?;
+
+    let count = args
+        .next()
+        .ok_or_else(|| "missing socket count N".to_owned())?;
+    let count = count
+        .parse::<usize>()
+        .map_err(|_| format!("invalid socket count '{count}': expected a positive integer"))?;
+    let count =
+        NonZeroUsize::new(count).ok_or_else(|| "socket count N must be non-zero".to_owned())?;
+
+    if let Some(trailing) = args.next() {
+        return Err(format!("unexpected trailing argument '{trailing}'"));
     }
+    Ok((mode, count))
 }
 
 fn per_flow_kib(delta_bytes: i128, n: usize) -> f64 {
-    delta_bytes as f64 / 1024.0 / n.max(1) as f64
-}
-
-fn savings_ratio(legacy_delta: i128, dynamic_delta: i128) -> Option<f64> {
-    if legacy_delta > 0 && dynamic_delta > 0 {
-        Some(legacy_delta as f64 / dynamic_delta as f64)
-    } else {
-        None
-    }
+    delta_bytes as f64 / 1024.0 / n as f64
 }
 
 fn print_lifetime_peak(stage: &str, n: usize, peak: Option<u64>) {
@@ -96,19 +82,41 @@ fn print_lifetime_peak(stage: &str, n: usize, peak: Option<u64>) {
 
 #[cfg(test)]
 mod tests {
-    use super::savings_ratio;
+    use super::{Mode, parse_args};
+
+    fn args(values: &[&str]) -> Result<(Mode, std::num::NonZeroUsize), String> {
+        parse_args(values.iter().map(|value| (*value).to_owned()))
+    }
 
     #[test]
-    fn savings_ratio_requires_two_positive_deltas() {
-        assert_eq!(savings_ratio(12, 3), Some(4.0));
-        assert_eq!(savings_ratio(0, 3), None);
-        assert_eq!(savings_ratio(-1, 3), None);
-        assert_eq!(savings_ratio(12, 0), None);
-        assert_eq!(savings_ratio(12, -1), None);
+    fn parse_args_accepts_explicit_mode_and_positive_count() {
+        assert_eq!(
+            args(&["legacy", "1"]),
+            Ok((Mode::Legacy, std::num::NonZeroUsize::new(1).unwrap()))
+        );
+        assert_eq!(
+            args(&["dynamic", "1000"]),
+            Ok((Mode::Dynamic, std::num::NonZeroUsize::new(1000).unwrap()))
+        );
+    }
+
+    #[test]
+    fn parse_args_rejects_unsupported_forms() {
+        for input in [
+            &[][..],
+            &["1000"][..],
+            &["both", "1000"][..],
+            &["legacy"][..],
+            &["legacy", "0"][..],
+            &["dynamic", "many"][..],
+            &["legacy", "1", "extra"][..],
+        ] {
+            assert!(args(input).is_err(), "input {input:?} should be rejected");
+        }
     }
 }
 
-fn run_legacy(n: usize) -> (i128, f64) {
+fn run_legacy(n: usize) {
     const RX: usize = 32 * 1024;
     const TX: usize = 32 * 1024;
 
@@ -130,10 +138,9 @@ fn run_legacy(n: usize) -> (i128, f64) {
          ({per_flow:>6.2} KiB / flow) ({cost:+} bytes)"
     );
     print_lifetime_peak("legacy fixed-buffer", n, end.lifetime_peak_bytes);
-    (cost, per_flow)
 }
 
-fn run_dynamic(n: usize) -> (i128, f64) {
+fn run_dynamic(n: usize) {
     const RX: usize = 32 * 1024;
     const TX: usize = 32 * 1024;
 
@@ -170,37 +177,17 @@ fn run_dynamic(n: usize) -> (i128, f64) {
         "pool charged after Drop:             {:>8} KiB  (expect 0)",
         pool.used() / 1024
     );
-    (cost, per_flow)
 }
 
 fn main() {
-    let (mode, n) = parse_args();
+    let (mode, n) = parse_args(env::args().skip(1)).unwrap_or_else(|error| usage(&error));
+    let n = n.get();
     let base = process_memory_bytes() / 1024;
     let metric = process_memory_label();
     println!("baseline {metric}:                   {base:>8} KiB");
 
     match mode {
-        Mode::Legacy => {
-            let _ = run_legacy(n);
-        }
-        Mode::Dynamic => {
-            let _ = run_dynamic(n);
-        }
-        Mode::Both => {
-            println!(
-                "mode=both is a smoke check only; use separate legacy/dynamic runs as memory evidence"
-            );
-            let (legacy_cost, per_legacy_kib) = run_legacy(n);
-            let post_legacy = process_memory_bytes() / 1024;
-            println!("after dropping legacy sockets:       {post_legacy:>8} KiB");
-            let (dyn_cost, per_dyn_kib) = run_dynamic(n);
-            if let Some(ratio) = savings_ratio(legacy_cost, dyn_cost) {
-                println!(
-                    "savings ratio: {ratio:>6.1}x ({per_legacy_kib:>5.1} KiB -> {per_dyn_kib:>5.1} KiB / flow)"
-                );
-            } else {
-                println!("savings ratio: unavailable");
-            }
-        }
+        Mode::Legacy => run_legacy(n),
+        Mode::Dynamic => run_dynamic(n),
     }
 }
