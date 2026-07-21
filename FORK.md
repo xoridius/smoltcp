@@ -159,7 +159,6 @@ Before a production release, run:
 ```text
 ./ci.sh all
 ./ci.sh docs
-./ci.sh apple-check
 TRACE=0 ./ci.sh ios-full-gate
 cargo +nightly bench --bench bench
 ./ci.sh fuzz-build

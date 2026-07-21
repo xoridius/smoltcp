@@ -113,10 +113,6 @@ fi
 
 status=0
 : > "$upstream_prs"
-declare -A ledger_outcomes upstream_seen
-while IFS=$'\t' read -r pr outcome _note; do
-    ledger_outcomes["$pr"]="$outcome"
-done < "$ledger"
 
 git rev-list --first-parent "$BASE_TAG..upstream/main" > "$tmp_dir/commits"
 while IFS= read -r commit; do
@@ -140,26 +136,25 @@ while IFS= read -r commit; do
         status=1
         continue
     fi
-    if [[ -n "${upstream_seen[$pr]+present}" ]]; then
+    if awk -F '\t' -v pr="$pr" '$1 == pr { found = 1 } END { exit !found }' "$upstream_prs"; then
         echo "error: duplicate upstream pull request #$pr at $commit" >&2
         status=1
         continue
     fi
-    upstream_seen["$pr"]=1
     printf '%s\t%s\t%s\n' "$pr" "$title" "$commit" >> "$upstream_prs"
 done < "$tmp_dir/commits"
 
-for pr in "${!ledger_outcomes[@]}"; do
-    if [[ -z "${upstream_seen[$pr]+present}" ]]; then
+while IFS=$'\t' read -r pr _outcome _note; do
+    if ! awk -F '\t' -v pr="$pr" '$1 == pr { found = 1 } END { exit !found }' "$upstream_prs"; then
         echo "error: ledger PR #$pr is absent from $BASE_TAG..upstream/main" >&2
         exit 2
     fi
-done
+done < "$ledger"
 
 echo
 echo "Upstream pull requests since $BASE_TAG:"
 while IFS=$'\t' read -r pr title _commit; do
-    outcome="${ledger_outcomes[$pr]-}"
+    outcome="$(awk -F '\t' -v pr="$pr" '$1 == pr { print $2; exit }' "$ledger")"
     if [[ -z "$outcome" ]]; then
         printf '  [NEW]        #%s %s\n' "$pr" "$title"
         status=1

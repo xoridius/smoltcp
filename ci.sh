@@ -285,6 +285,7 @@ fuzz_smoke() {
 }
 
 run_all() {
+    cargo fmt --all -- --check
     run_test_matrix
     run_check_matrix
     clippy
