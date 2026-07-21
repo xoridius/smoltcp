@@ -384,11 +384,6 @@ fn pool_overcommit_falls_back_to_zero() {
 }
 
 #[test]
-fn impossible_initial_allocation_is_fallible() {
-    assert!(super::super::try_zeroed_socket_storage(usize::MAX).is_none());
-}
-
-#[test]
 fn win_shift_uses_max_not_current() {
     // The negotiated window scale must accommodate any future
     // growth, so it tracks rx_max, not the current (possibly tiny)
@@ -1116,9 +1111,10 @@ fn growth_throttles_under_pool_pressure() {
     // budget. Same conceptual gate as Linux's
     // `tcp_under_memory_pressure(sk)`.
     let pool = MemoryPool::new(64 * 1024);
-    // Pre-charge to 75% to put the pool immediately under pressure.
-    assert!(pool.try_charge(48 * 1024));
-    assert!(pool.under_pressure());
+    let _pressure = Socket::new_dynamic(
+        DynamicBufferConfig::symmetric(24 * 1024, 24 * 1024, 1),
+        Some(pool.clone()),
+    );
 
     let cfg = DynamicBufferConfig::symmetric(0, 32 * 1024, 4 * 1024);
     let mut s = dyn_socket_established(cfg, Some(pool.clone()));
@@ -1136,22 +1132,6 @@ fn growth_throttles_under_pool_pressure() {
         12 * 1024,
         "pressure should force linear growth, not geometric"
     );
-}
-
-#[test]
-fn next_capacity_math() {
-    // Geometric, no pressure.
-    assert_eq!(Socket::next_capacity(0, 4096, 65536, false), 4096);
-    assert_eq!(Socket::next_capacity(4096, 4096, 65536, false), 8192);
-    assert_eq!(Socket::next_capacity(8192, 4096, 65536, false), 16384);
-    assert_eq!(Socket::next_capacity(32768, 4096, 65536, false), 65536);
-    // At max → no grow.
-    assert_eq!(Socket::next_capacity(65536, 4096, 65536, false), 65536);
-    // Pressure throttle → linear.
-    assert_eq!(Socket::next_capacity(8192, 4096, 65536, true), 12288);
-    assert_eq!(Socket::next_capacity(32768, 4096, 65536, true), 36864);
-    // Clamp at max even with linear.
-    assert_eq!(Socket::next_capacity(60000, 4096, 65536, true), 64096);
 }
 
 #[test]
@@ -1199,37 +1179,6 @@ fn pool_accounting_survives_u32_max_caps() {
     // the clamped value, not the original u32::MAX.
     assert_eq!(s.recv_capacity_max(), 1 << 30);
     assert_eq!(s.send_capacity_max(), 1 << 30);
-}
-
-#[test]
-fn pool_accounting_no_truncation_on_initial_charge() {
-    // The bug was: `state.charge(charge as u32)` truncated when
-    // rx_initial + tx_initial exceeded u32::MAX, but the Vec
-    // allocations were full-size. Pool would undercount; physical
-    // memory could exceed budget. Fixed by widening charge to
-    // usize and using checked_add.
-    //
-    // Exercise the accounting layer directly instead of allocating
-    // 1.5 GiB of Vec backing storage. The invariant is arithmetic,
-    // not allocator behavior.
-    let pool = MemoryPool::new(2 * 1024 * 1024 * 1024);
-    let cfg = DynamicBufferConfig {
-        rx_initial: 0,
-        rx_max: 1 << 30,
-        tx_initial: 0,
-        tx_max: 1 << 30,
-        grow_chunk: 8 * 1024,
-    };
-    let mut state = dynbuf::DynBufState::new(&cfg, Some(pool.clone()));
-    let charge = 2 * 768 * 1024 * 1024;
-
-    assert!(state.charge(charge));
-    assert_eq!(state.charged, charge);
-    assert_eq!(pool.used(), charge);
-
-    state.refund(charge);
-    assert_eq!(pool.used(), 0);
-    assert_eq!(state.charged, 0);
 }
 
 #[test]

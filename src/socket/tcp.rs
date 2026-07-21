@@ -576,7 +576,7 @@ pub struct Socket<'a> {
     /// rx/tx buffers on demand up to per-flow caps and releases on close.
     /// `None` preserves the legacy fixed-buffer behavior bit-for-bit.
     #[cfg(feature = "socket-tcp-dynamic-buffer")]
-    dyn_state: Option<alloc::boxed::Box<dynbuf::DynBufState>>,
+    dyn_state: Option<alloc::boxed::Box<dynbuf::DynamicBufferState>>,
 }
 
 const DEFAULT_MSS: usize = 536;
@@ -652,16 +652,6 @@ const MAX_WIN_SHIFT: u8 = 14;
 fn win_shift_for_capacity(cap: usize) -> u8 {
     let cap_log2 = mem::size_of::<usize>() * 8 - cap.leading_zeros() as usize;
     (cap_log2.saturating_sub(16) as u8).min(MAX_WIN_SHIFT)
-}
-
-#[cfg(feature = "socket-tcp-dynamic-buffer")]
-fn try_zeroed_socket_storage(capacity: usize) -> Option<alloc::vec::Vec<u8>> {
-    let mut storage = alloc::vec::Vec::new();
-    if storage.try_reserve_exact(capacity).is_err() {
-        return None;
-    }
-    storage.resize(capacity, 0);
-    Some(storage)
 }
 
 impl<'a> Socket<'a> {
@@ -756,53 +746,9 @@ impl<'a> Socket<'a> {
     pub fn new_dynamic(config: DynamicBufferConfig, pool: Option<MemoryPool>) -> Socket<'a> {
         use alloc::boxed::Box;
 
-        // The RFC 1323 effective-window cap is 2^30 (1 GiB) — enforce on
-        // BOTH directions, not just rx. Without this cap, callers passing
-        // a pathological tx_max could escape the per-direction ceiling,
-        // and on a 32-bit pointer target `(rx_initial + tx_initial)` could
-        // even overflow `usize`. The cap matches what the wire-level
-        // window-scale negotiation can express. On targets whose `usize`
-        // cannot represent 2^30 (16-bit), saturate to `usize::MAX` — the
-        // address space gates allocation well before the RFC cap does.
-        const PER_DIRECTION_CAP: u32 = 1 << 30;
-        let cap = |v: u32| usize::try_from(v.min(PER_DIRECTION_CAP)).unwrap_or(usize::MAX);
-        let rx_max = cap(config.rx_max);
-        let tx_max = cap(config.tx_max);
-        let rx_initial = cap(config.rx_initial).min(rx_max);
-        let tx_initial = cap(config.tx_initial).min(tx_max);
-
-        let mut state = dynbuf::DynBufState::new(
-            &DynamicBufferConfig {
-                rx_initial: rx_initial as u32,
-                rx_max: rx_max as u32,
-                tx_initial: tx_initial as u32,
-                tx_max: tx_max as u32,
-                grow_chunk: config.grow_chunk.max(1),
-            },
-            pool,
-        );
-
-        // Try to charge the initial reservation. If the pool refuses,
-        // fall back to zero-initial — growth attempts later will retry.
-        // At 2 × 2^30 = 2 GiB the sum fits in `usize` on every supported
-        // target (32-bit usize maxes at 2^32); saturating_add is
-        // defensive in case the per-direction caps above are ever
-        // loosened past the RFC limit.
-        let charge = rx_initial.saturating_add(tx_initial);
-        let (rx_storage, tx_storage) = if state.charge(charge) {
-            match (
-                try_zeroed_socket_storage(rx_initial),
-                try_zeroed_socket_storage(tx_initial),
-            ) {
-                (Some(rx_storage), Some(tx_storage)) => (rx_storage, tx_storage),
-                _ => {
-                    state.refund(charge);
-                    (alloc::vec::Vec::new(), alloc::vec::Vec::new())
-                }
-            }
-        } else {
-            (alloc::vec::Vec::new(), alloc::vec::Vec::new())
-        };
+        let mut state = dynbuf::DynamicBufferState::new(config, pool);
+        let rx_max = state.rx_capacity_max();
+        let (rx_storage, tx_storage) = state.allocate_initial();
 
         let rx_buffer = SocketBuffer::new(rx_storage);
         let tx_buffer = SocketBuffer::new(tx_storage);
@@ -821,7 +767,7 @@ impl<'a> Socket<'a> {
     #[cfg(feature = "socket-tcp-dynamic-buffer")]
     pub fn recv_capacity_max(&self) -> usize {
         match &self.dyn_state {
-            Some(s) => s.rx_max as usize,
+            Some(state) => state.rx_capacity_max(),
             None => self.rx_buffer.capacity(),
         }
     }
@@ -831,16 +777,12 @@ impl<'a> Socket<'a> {
     #[cfg(feature = "socket-tcp-dynamic-buffer")]
     pub fn send_capacity_max(&self) -> usize {
         match &self.dyn_state {
-            Some(s) => s.tx_max as usize,
+            Some(state) => state.tx_capacity_max(),
             None => self.tx_buffer.capacity(),
         }
     }
 
-    /// States in which growing the rx buffer is useful: handshake states
-    /// that may immediately advertise a receive window, plus Established and
-    /// FinWait1/FinWait2 where the peer may still deliver bytes until its FIN.
-    /// Closed/Listen/CloseWait/TimeWait release or never accept more rx data;
-    /// growing there would waste pool budget.
+    /// States where a peer may still deliver receive data.
     #[cfg(feature = "socket-tcp-dynamic-buffer")]
     fn rx_growth_allowed(&self) -> bool {
         matches!(
@@ -853,8 +795,7 @@ impl<'a> Socket<'a> {
         )
     }
 
-    /// Mirror of `rx_growth_allowed` for the send side. CloseWait is
-    /// included because we may still transmit after the peer FIN.
+    /// States where the local endpoint may still transmit data.
     #[cfg(feature = "socket-tcp-dynamic-buffer")]
     fn tx_growth_allowed(&self) -> bool {
         matches!(
@@ -868,95 +809,27 @@ impl<'a> Socket<'a> {
         let Some(state) = self.dyn_state.as_ref() else {
             return false;
         };
-        if !self.tx_growth_allowed() {
-            return false;
-        }
-
-        let cur = self.tx_buffer.capacity();
-        let max = state.tx_max as usize;
-        if cur >= max {
-            return false;
-        }
-
-        let pressure = state.pool.as_ref().is_some_and(|p| p.under_pressure());
-        let want = Self::next_capacity(cur, state.grow_chunk as usize, max, pressure);
-        let Some(need) = want.checked_sub(cur).filter(|n| *n > 0) else {
-            return false;
-        };
-        state.pool.as_ref().is_none_or(|p| p.available() >= need)
+        self.tx_growth_allowed() && state.can_grow_tx(self.tx_buffer.capacity())
     }
 
-    /// Compute the next capacity. Geometric growth amortizes copying; under
-    /// pool pressure, grow by one chunk to preserve capacity for other flows.
-    #[cfg(feature = "socket-tcp-dynamic-buffer")]
-    fn next_capacity(cur: usize, chunk: usize, max: usize, pressure: bool) -> usize {
-        if cur >= max {
-            return cur;
-        }
-        let target = if pressure {
-            cur.saturating_add(chunk)
-        } else {
-            // Geometric: at least `cur + chunk`, but prefer doubling.
-            cur.saturating_add(chunk).max(cur.saturating_mul(2))
-        };
-        target.min(max)
-    }
-
-    /// Grow `buffer` one step toward `max`, charging the increment to the
-    /// shared pool via `state`. Shared by the rx and tx grow paths; the
-    /// only difference between them is which buffer and which cap.
-    ///
-    /// Returns `true` if the buffer grew. Failure leaves its capacity unchanged,
-    /// applying receive flow control or transmit backpressure as appropriate.
-    #[cfg(feature = "socket-tcp-dynamic-buffer")]
-    fn try_grow_buffer(
-        buffer: &mut SocketBuffer<'a>,
-        state: &mut dynbuf::DynBufState,
-        max: usize,
-    ) -> bool {
-        let pressure = state.pool.as_ref().is_some_and(|p| p.under_pressure());
-        let cur = buffer.capacity();
-        let want = Self::next_capacity(cur, state.grow_chunk as usize, max, pressure);
-        let Some(need) = want.checked_sub(cur).filter(|n| *n > 0) else {
-            return false;
-        };
-        if !state.charge(need) {
-            return false;
-        }
-        if !buffer.try_grow(want) {
-            // Allocation refused (e.g. Vec::try_reserve_exact failed).
-            // Refund what we just charged so accounting stays balanced.
-            state.refund(need);
-            return false;
-        }
-        true
-    }
-
-    /// Attempt to grow the rx buffer so the advertised window has room.
-    /// Called from `dispatch` before computing the advertised window.
-    /// `#[cold]`: the hot-path check at the dispatch entry decides whether
-    /// to dive in.
+    /// Cold path selected before dispatch computes the advertised window.
     #[cfg(feature = "socket-tcp-dynamic-buffer")]
     #[cold]
     fn try_grow_rx(&mut self) -> bool {
         let Some(state) = self.dyn_state.as_deref_mut() else {
             return false;
         };
-        let max = state.rx_max as usize;
-        Self::try_grow_buffer(&mut self.rx_buffer, state, max)
+        state.try_grow_rx(&mut self.rx_buffer)
     }
 
-    /// Attempt to grow the tx buffer for an upcoming write. Silent failure
-    /// becomes backpressure to the caller (their `send_slice` enqueue
-    /// copies fewer bytes and they retry).
+    /// Silent failure becomes partial-enqueue backpressure to the caller.
     #[cfg(feature = "socket-tcp-dynamic-buffer")]
     #[cold]
     fn try_grow_tx(&mut self) -> bool {
         let Some(state) = self.dyn_state.as_deref_mut() else {
             return false;
         };
-        let max = state.tx_max as usize;
-        Self::try_grow_buffer(&mut self.tx_buffer, state, max)
+        state.try_grow_tx(&mut self.tx_buffer)
     }
 
     #[cfg(feature = "socket-tcp-dynamic-buffer")]
@@ -965,50 +838,20 @@ impl<'a> Socket<'a> {
         let Some(state) = self.dyn_state.as_mut() else {
             return;
         };
-        let rx_initial = state.rx_initial as usize;
-        let tx_initial = state.tx_initial as usize;
-        let charge = rx_initial.saturating_add(tx_initial);
-        if charge == 0 {
-            return;
-        }
-        if !state.charge(charge) {
-            return;
-        }
-
-        let rx_ok = rx_initial == 0 || self.rx_buffer.try_grow(rx_initial);
-        let tx_ok = tx_initial == 0 || self.tx_buffer.try_grow(tx_initial);
-        if !(rx_ok && tx_ok) {
-            self.rx_buffer.release_owned();
-            self.tx_buffer.release_owned();
-            state.refund(charge);
-        }
+        state.restore_initial(&mut self.rx_buffer, &mut self.tx_buffer);
     }
 
-    /// Release the dynamic-buffer backing storage and refund the pool.
-    /// Called only once the current state no longer needs queued rx/tx
-    /// bytes to compute outgoing sequence numbers, acknowledgments, or
-    /// retransmissions. Marked cold because lifecycle ends are rare
-    /// relative to dispatch frequency.
+    /// Release only after lifecycle code no longer needs queued data.
     #[cfg(feature = "socket-tcp-dynamic-buffer")]
     #[cold]
     fn release_dyn_buffers(&mut self) {
         if let Some(state) = self.dyn_state.as_mut() {
-            self.rx_buffer.release_owned();
-            self.tx_buffer.release_owned();
-            let charged = state.charged;
-            state.refund(charged);
+            state.release(&mut self.rx_buffer, &mut self.tx_buffer);
         }
     }
 
-    /// Release for the connection-is-gone case (RST received, abort RST
-    /// emitted, final ACK in LastAck): no segment can ever be emitted or
-    /// accepted again, so the tx side is released immediately — its
-    /// contents are undeliverable. The rx side, however, may hold data
-    /// that was received and ACKed but not yet read; `may_recv` promises
-    /// it stays readable in `Closed` (Linux likewise delivers pre-RST
-    /// queued data before surfacing ECONNRESET). Releasing rx is deferred
-    /// to `recv_slice` or `recv_with` once the application drains it; `reset`/`Drop`
-    /// remain the backstop if it never does.
+    /// Release undeliverable tx immediately, but retain unread rx until the
+    /// application drains it; `may_recv` promises queued data in `Closed`.
     #[cfg(feature = "socket-tcp-dynamic-buffer")]
     #[cold]
     fn release_dyn_buffers_if_closed_and_detached(&mut self) {
@@ -1018,9 +861,7 @@ impl<'a> Socket<'a> {
         if self.rx_buffer.is_empty() {
             self.release_dyn_buffers();
         } else if let Some(state) = self.dyn_state.as_deref_mut() {
-            let tx_capacity = self.tx_buffer.capacity();
-            self.tx_buffer.release_owned();
-            state.refund(tx_capacity);
+            state.release_tx(&mut self.tx_buffer);
         }
     }
 
@@ -1464,7 +1305,7 @@ impl<'a> Socket<'a> {
         let cap_for_shift = self
             .dyn_state
             .as_ref()
-            .map(|s| s.rx_max as usize)
+            .map(|state| state.rx_capacity_max())
             .unwrap_or_else(|| self.rx_buffer.capacity());
         #[cfg(not(feature = "socket-tcp-dynamic-buffer"))]
         let cap_for_shift = self.rx_buffer.capacity();
@@ -1862,7 +1703,7 @@ impl<'a> Socket<'a> {
         // partial enqueue/backpressure through the returned byte count.
         #[cfg(feature = "socket-tcp-dynamic-buffer")]
         if let Some(state) = self.dyn_state.as_ref()
-            && self.tx_buffer.window() < state.grow_chunk as usize
+            && state.should_grow_tx(self.tx_buffer.window())
             && self.tx_growth_allowed()
         {
             self.try_grow_tx();
@@ -3415,34 +3256,16 @@ impl<'a> Socket<'a> {
             return Ok(());
         }
 
-        // Dynamic-buffer rx growth: if our advertised window is about to be
-        // sub-MSS, and we have headroom up to rx_max, request more backing
-        // from the pool. Done after the lost-source-IP reset above (so a
-        // doomed socket doesn't charge the pool only to refund it) and
-        // before `egress_interest` / scaled_window(), so the gate and the
-        // segment we're about to emit both see the new capacity. One grow
-        // per dispatch matches the kernel autotune cadence (Linux's
-        // `tcp_rcv_space_adjust` runs per recvmsg / per RTT-cycle, not in
-        // a loop). Failure (pool exhausted, at max) silently collapses the
-        // advertised window — the kernel-canonical backpressure signal.
-        //
-        // Guard order is cheapest-discriminating-first: the window check is
-        // usually false (buffer has room) in steady state, so it
-        // short-circuits before the state-machine match in
-        // `rx_growth_allowed`.
-        //
-        // The `1 << remote_win_shift` term is a correctness floor, not a
-        // tuning knob: the advertised window is `window() >> shift`, so
-        // any free space below one scale granule truncates to a zero
-        // advertisement. Without it, a flow whose `rx_max` implies a large
-        // shift would stop growing at a capacity that still advertises 0
-        // and deadlock behind zero-window probes forever.
+        // Grow once before egress computes the window. The scale granule is a
+        // correctness floor: less free space truncates to a zero advertisement.
+        // The cheap window predicate stays first on this hot path.
         #[cfg(feature = "socket-tcp-dynamic-buffer")]
         if let Some(state) = self.dyn_state.as_ref()
-            && self.rx_buffer.window()
-                < (state.grow_chunk as usize)
-                    .max(self.remote_mss as usize)
-                    .max(1usize << self.remote_win_shift)
+            && state.should_grow_rx(
+                self.rx_buffer.window(),
+                self.remote_mss as usize,
+                1usize << self.remote_win_shift,
+            )
             && self.rx_growth_allowed()
             && self.try_grow_rx()
         {
@@ -3985,14 +3808,8 @@ impl<'a> fmt::Write for Socket<'a> {
     }
 }
 
-// Pool refund-on-drop lives on `DynBufState`, not on `Socket`. Putting it
-// on `Socket` would add drop glue to the enclosing `socket::Socket`
-// enum and cost ~3–5 % UDP throughput in workloads that never touch a
-// dynamic-buffer TCP socket. Hanging the Drop off the inner state lets
-// the compiler synthesize the outer drop calls only when `dyn_state` is
-// `Some`. Set_state(Closed)/reset() still call `refund_all` explicitly
-// so the pool is returned eagerly on close; the Drop path here just
-// guarantees correctness on `SocketSet::remove` and teardown.
+// Drop stays on `DynamicBufferState`: moving it to `Socket` measured 3–5% slower
+// for UDP-only workloads. Lifecycle hooks refund eagerly; Drop is the backstop.
 
 // TODO: TCP should work for all features. For now, we only test with the IP feature. We could do
 // it for other features as well with rstest, however, this means we have to modify a lot of the
