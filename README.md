@@ -5,7 +5,8 @@
 > [`smoltcp-rs/smoltcp`](https://github.com/smoltcp-rs/smoltcp), based on
 > upstream `v0.13.1`. TCP recovery, dynamic buffer accounting, platform
 > hardening, and constrained-memory gates described here are fork-only unless
-> explicitly recorded otherwise. See [FORK.md](FORK.md) before updating.
+> explicitly recorded otherwise. See [FORK.md](FORK.md) before updating and
+> [docs/apple.md](docs/apple.md) before Apple integration or profiling.
 
 [![upstream docs.rs](https://docs.rs/smoltcp/badge.svg)](https://docs.rs/smoltcp)
 [![crates.io](https://img.shields.io/crates/v/smoltcp.svg)](https://crates.io/crates/smoltcp)
@@ -151,7 +152,7 @@ Pin this fork by immutable Git revision:
 
 ```toml
 [dependencies]
-smoltcp = { git = "https://github.com/xoridius/smoltcp.git", rev = "c583bf75105ecdba55a8982be49aaeff59061a56" }
+smoltcp = { git = "https://github.com/xoridius/smoltcp.git", rev = "cd7095fc173528a64fc4a13828aacb97e74dc9a7" }
 ```
 
 Move the pin only to a reviewed commit that has passed the production gates in
@@ -222,6 +223,10 @@ This feature is disabled by default.
 ### Features `phy-raw_socket` and `phy-tuntap_interface`
 
 Enable `smoltcp::phy::RawSocket` and `smoltcp::phy::TunTapInterface`, respectively.
+
+`RawSocket` uses BPF on macOS. `TunTapInterface` is available on Linux and
+Android only. Apple Network Extensions should provide their packet flow through
+a custom `phy::Device`; see [docs/apple.md](docs/apple.md).
 
 These features are enabled by default.
 
@@ -324,7 +329,9 @@ The maximum amount of parsed options the IPv6 Hop-by-Hop header can hold. Defaul
 
 _smoltcp_, being a freestanding networking stack, needs to be able to transmit and receive
 raw frames. For testing purposes, we will use a regular OS, and run _smoltcp_ in
-a userspace process. Only Linux is supported (right now).
+a userspace process. The TUN/TAP examples below are Linux-only. Rootless macOS
+validation uses paired in-process devices and requires no elevated privileges;
+see [docs/apple.md](docs/apple.md).
 
 On \*nix OSes, transmitting and receiving raw frames normally requires superuser privileges, but
 on Linux it is possible to create a _persistent tap interface_ that can be manipulated by

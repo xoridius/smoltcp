@@ -38,9 +38,11 @@ use super::fragmentation::{Fragmenter, FragmentsBuffer};
 #[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
 use super::neighbor::{Answer as NeighborAnswer, Cache as NeighborCache};
 use super::socket_set::SocketSet;
-use crate::config::{
-    IFACE_MAX_ADDR_COUNT, IFACE_MAX_PREFIX_COUNT, IFACE_MAX_SIXLOWPAN_ADDRESS_CONTEXT_COUNT,
-};
+use crate::config::IFACE_MAX_ADDR_COUNT;
+#[cfg(feature = "proto-ipv6-slaac")]
+use crate::config::IFACE_MAX_PREFIX_COUNT;
+#[cfg(feature = "proto-sixlowpan")]
+use crate::config::IFACE_MAX_SIXLOWPAN_ADDRESS_CONTEXT_COUNT;
 use crate::iface::Routes;
 #[cfg(feature = "proto-ipv6-slaac")]
 use crate::iface::Slaac;
@@ -132,6 +134,7 @@ pub struct InterfaceInner {
 
     #[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
     neighbor_cache: NeighborCache,
+    #[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
     hardware_addr: HardwareAddress,
     #[cfg(feature = "medium-ieee802154")]
     sequence_no: u8,
@@ -275,6 +278,7 @@ impl Interface {
             inner: InterfaceInner {
                 now,
                 caps,
+                #[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
                 hardware_addr: config.hardware_addr,
                 ip_addrs: Vec::new(),
                 any_ip: false,
@@ -1249,13 +1253,15 @@ impl InterfaceInner {
         let ipv4_id = self.next_ipv4_frag_ident();
 
         // First we calculate the total length that we will have to emit.
-        let mut total_len = ip_repr.buffer_len();
+        let total_len = ip_repr.buffer_len();
 
         // Add the size of the Ethernet header if the medium is Ethernet.
         #[cfg(feature = "medium-ethernet")]
-        if matches!(self.caps.medium, Medium::Ethernet) {
-            total_len = EthernetFrame::<&[u8]>::buffer_len(total_len);
-        }
+        let total_len = if matches!(self.caps.medium, Medium::Ethernet) {
+            EthernetFrame::<&[u8]>::buffer_len(total_len)
+        } else {
+            total_len
+        };
 
         // If the medium is Ethernet, then we need to retrieve the destination hardware address.
         #[cfg(feature = "medium-ethernet")]
@@ -1311,11 +1317,13 @@ impl InterfaceInner {
                         let first_frag_data_len =
                             self.caps.max_ipv4_fragment_size(repr.buffer_len());
                         let first_frag_ip_len = first_frag_data_len + ip_header_len;
-                        let mut tx_len = first_frag_ip_len;
+                        let tx_len = first_frag_ip_len;
                         #[cfg(feature = "medium-ethernet")]
-                        if matches!(caps.medium, Medium::Ethernet) {
-                            tx_len += EthernetFrame::<&[u8]>::header_len();
-                        }
+                        let tx_len = if matches!(caps.medium, Medium::Ethernet) {
+                            tx_len + EthernetFrame::<&[u8]>::header_len()
+                        } else {
+                            tx_len
+                        };
 
                         if frag.buffer.len() < total_ip_len {
                             net_debug!(
@@ -1358,12 +1366,14 @@ impl InterfaceInner {
                         }
 
                         // Transmit the first packet.
-                        tx_token.consume(tx_len, |mut tx_buffer| {
+                        tx_token.consume(tx_len, |tx_buffer| {
                             #[cfg(feature = "medium-ethernet")]
-                            if matches!(self.caps.medium, Medium::Ethernet) {
+                            let tx_buffer = if matches!(self.caps.medium, Medium::Ethernet) {
                                 emit_ethernet(&ip_repr, tx_buffer);
-                                tx_buffer = &mut tx_buffer[EthernetFrame::<&[u8]>::header_len()..];
-                            }
+                                &mut tx_buffer[EthernetFrame::<&[u8]>::header_len()..]
+                            } else {
+                                tx_buffer
+                            };
 
                             // Change the offset for the next packet.
                             frag.ipv4.frag_offset = (first_frag_ip_len - ip_header_len) as u16;
@@ -1387,12 +1397,14 @@ impl InterfaceInner {
                     tx_token.set_meta(meta);
 
                     // No fragmentation is required.
-                    tx_token.consume(total_len, |mut tx_buffer| {
+                    tx_token.consume(total_len, |tx_buffer| {
                         #[cfg(feature = "medium-ethernet")]
-                        if matches!(self.caps.medium, Medium::Ethernet) {
+                        let tx_buffer = if matches!(self.caps.medium, Medium::Ethernet) {
                             emit_ethernet(&ip_repr, tx_buffer);
-                            tx_buffer = &mut tx_buffer[EthernetFrame::<&[u8]>::header_len()..];
-                        }
+                            &mut tx_buffer[EthernetFrame::<&[u8]>::header_len()..]
+                        } else {
+                            tx_buffer
+                        };
 
                         emit_ip(&ip_repr, tx_buffer);
                     });
@@ -1408,12 +1420,14 @@ impl InterfaceInner {
                     net_debug!("IPv6 fragmentation support is unimplemented. Dropping.");
                     Ok(())
                 } else {
-                    tx_token.consume(total_len, |mut tx_buffer| {
+                    tx_token.consume(total_len, |tx_buffer| {
                         #[cfg(feature = "medium-ethernet")]
-                        if matches!(self.caps.medium, Medium::Ethernet) {
+                        let tx_buffer = if matches!(self.caps.medium, Medium::Ethernet) {
                             emit_ethernet(&ip_repr, tx_buffer);
-                            tx_buffer = &mut tx_buffer[EthernetFrame::<&[u8]>::header_len()..];
-                        }
+                            &mut tx_buffer[EthernetFrame::<&[u8]>::header_len()..]
+                        } else {
+                            tx_buffer
+                        };
 
                         emit_ip(&ip_repr, tx_buffer);
                     });
@@ -1424,6 +1438,7 @@ impl InterfaceInner {
     }
 }
 
+#[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 enum DispatchError {
@@ -1435,3 +1450,6 @@ enum DispatchError {
     /// should be retried later.
     NeighborPending,
 }
+
+#[cfg(not(any(feature = "medium-ethernet", feature = "medium-ieee802154")))]
+type DispatchError = core::convert::Infallible;

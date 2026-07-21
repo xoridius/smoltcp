@@ -12,6 +12,7 @@ MSRV="1.91.0"
 IOS_FEATURES="alloc,medium-ip,proto-ipv4,proto-ipv6,socket-udp,socket-tcp,socket-tcp-dynamic-buffer,socket-tcp-cubic"
 TUNNEL_STATIC_FEATURES="std,libc,log,medium-ip,proto-ipv4,proto-ipv4-fragmentation,proto-ipv6,proto-ipv6-fragmentation,socket-tcp,socket-udp,socket-tcp-cubic,auto-icmp-echo-reply"
 TUNNEL_DYNAMIC_FEATURES="$TUNNEL_STATIC_FEATURES,socket-tcp-dynamic-buffer"
+TUNNEL_CONSUMER_FEATURES="std,log,medium-ip,proto-ipv4,proto-ipv4-fragmentation,proto-ipv6,proto-ipv6-fragmentation,socket-tcp,socket-udp,socket-tcp-cubic,auto-icmp-echo-reply,socket-tcp-dynamic-buffer"
 HOST_PHY_FEATURES="phy-raw_socket,phy-tuntap_interface,medium-ip,medium-ethernet,proto-ipv4,socket-raw"
 
 RUSTC_VERSIONS=(
@@ -67,7 +68,8 @@ Core commands:
   build_16bit                   Nightly build-std check for 16-bit pointers.
   coverage                      cargo-llvm-cov matrix.
   netsim                        Stable NoControl, CUBIC, and Reno netsim sweeps.
-  apple-check                   Cross-check macOS and iOS targets on stable.
+  consumer-check                Warning-clean downstream feature check.
+  apple-check                   Cross-check Intel/arm64 macOS and arm64 iOS targets.
   docs                          Rustdoc with warnings denied for default and iOS shapes.
   all                           Portable core matrix; excludes Apple, docs, perf, fuzz, and Miri.
 
@@ -75,7 +77,7 @@ Local fork evidence:
   quick                         Fast local smoke: fmt, iOS check, host phy check, iOS sizecheck.
   sizecheck                     Print default and iOS-shaped footprint numbers.
   ios-gate                      iOS Network Extension memory-shape proofs.
-  ios-full-gate                 smoltcp-side constrained-memory traffic matrix.
+  ios-full-gate                 Constrained-memory traffic matrix; rootless on macOS.
   profile-smoke [seconds]       Short throughput/fairness/RSS harness smoke.
   fuzz-build                    Build all fuzz targets on nightly.
   fuzz-smoke [seconds] [target] Short reproducibly seeded ASan smoke (LSan where supported); defaults to all targets.
@@ -99,22 +101,34 @@ netsim() {
 }
 
 apple_check() {
+    local apple_rustflags="${RUSTFLAGS:+$RUSTFLAGS }-Dwarnings"
+
     rustup target add --toolchain stable \
         x86_64-apple-darwin \
+        aarch64-apple-darwin \
         aarch64-apple-ios \
         aarch64-apple-ios-sim
 
-    cargo +stable check --target x86_64-apple-darwin \
-        --lib --tests --examples \
-        --features "socket-tcp-dynamic-buffer,socket-tcp-cubic,socket-tcp-reno"
-    cargo +stable check --target x86_64-apple-darwin \
-        --lib --examples --no-default-features \
-        --features "$TUNNEL_DYNAMIC_FEATURES"
+    for target in x86_64-apple-darwin aarch64-apple-darwin; do
+        RUSTFLAGS="$apple_rustflags" cargo +stable check --target "$target" \
+            --lib --tests --examples \
+            --features "socket-tcp-dynamic-buffer,socket-tcp-cubic,socket-tcp-reno"
+        RUSTFLAGS="$apple_rustflags" cargo +stable check --target "$target" \
+            --lib --examples --no-default-features \
+            --features "$TUNNEL_DYNAMIC_FEATURES"
+    done
 
     for target in aarch64-apple-ios aarch64-apple-ios-sim; do
-        cargo +stable check --target "$target" --lib \
+        RUSTFLAGS="$apple_rustflags" cargo +stable check --target "$target" --lib \
             --no-default-features --features "$TUNNEL_DYNAMIC_FEATURES"
     done
+}
+
+consumer_check() {
+    rustup toolchain install stable
+    RUSTFLAGS="${RUSTFLAGS:+$RUSTFLAGS }-Dwarnings" \
+        cargo +stable test --lib --no-default-features \
+        --features "$TUNNEL_CONSUMER_FEATURES"
 }
 
 docs() {
@@ -200,6 +214,7 @@ sizecheck() {
 
 quick() {
     cargo fmt --check
+    consumer_check
     cargo check --no-default-features --features "$IOS_FEATURES"
     cargo check --features "$HOST_PHY_FEATURES"
     cargo test --release --test sizecheck --no-default-features --features "$IOS_FEATURES" -- --nocapture
@@ -287,6 +302,7 @@ fuzz_smoke() {
 
 run_all() {
     cargo fmt --all -- --check
+    consumer_check
     run_test_matrix
     run_check_matrix
     clippy
@@ -320,6 +336,9 @@ case "$cmd" in
         ;;
     netsim)
         netsim
+        ;;
+    consumer-check)
+        consumer_check
         ;;
     apple-check)
         apple_check

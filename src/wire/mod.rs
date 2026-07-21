@@ -72,6 +72,12 @@ let mut buffer = vec![0; repr.buffer_len() + repr.payload_len];
 
 mod field {
     pub type Field = ::core::ops::Range<usize>;
+    #[cfg(any(
+        feature = "medium-ethernet",
+        feature = "medium-ieee802154",
+        feature = "proto-dhcpv4",
+        feature = "proto-rpl"
+    ))]
     pub type Rest = ::core::ops::RangeFrom<usize>;
 }
 
@@ -575,7 +581,7 @@ impl From<HardwareAddress> for RawHardwareAddress {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, any(feature = "medium-ethernet", feature = "medium-ieee802154")))]
 mod tests {
     use super::*;
     use rstest::rstest;

@@ -14,9 +14,10 @@ use rstest::*;
 
 use super::*;
 
+#[cfg(all(feature = "medium-ip", feature = "medium-ethernet", feature = "alloc"))]
 use crate::iface::Interface;
 use crate::phy::ChecksumCapabilities;
-#[cfg(feature = "alloc")]
+#[cfg(all(feature = "medium-ip", feature = "medium-ethernet", feature = "alloc"))]
 use crate::phy::Loopback;
 use crate::time::Instant;
 
@@ -38,8 +39,10 @@ fn recv_all(device: &mut crate::tests::TestingDevice, timestamp: Instant) -> Vec
 
 #[derive(Debug, PartialEq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
+#[cfg(feature = "medium-ethernet")]
 struct MockTxToken;
 
+#[cfg(feature = "medium-ethernet")]
 impl TxToken for MockTxToken {
     fn consume<R, F>(self, len: usize, f: F) -> R
     where
@@ -86,13 +89,15 @@ fn poll_at_keeps_socket_deadline_without_slaac_deadline() {
 }
 
 #[cfg(feature = "socket-udp")]
+#[cfg(any(
+    feature = "medium-ip",
+    feature = "medium-ethernet",
+    feature = "medium-ieee802154"
+))]
 #[rstest]
-#[case::ip(Medium::Ip)]
-#[cfg(feature = "medium-ip")]
-#[case::ethernet(Medium::Ethernet)]
-#[cfg(feature = "medium-ethernet")]
-#[case::ieee802154(Medium::Ieee802154)]
-#[cfg(feature = "medium-ieee802154")]
+#[cfg_attr(feature = "medium-ip", case::ip(Medium::Ip))]
+#[cfg_attr(feature = "medium-ethernet", case::ethernet(Medium::Ethernet))]
+#[cfg_attr(feature = "medium-ieee802154", case::ieee802154(Medium::Ieee802154))]
 fn test_handle_udp_broadcast(#[case] medium: Medium) {
     use crate::socket::udp;
     use crate::wire::IpEndpoint;

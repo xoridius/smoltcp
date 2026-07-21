@@ -600,7 +600,14 @@ impl<'a> Socket<'a> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(
+    test,
+    any(
+        feature = "medium-ip",
+        feature = "medium-ethernet",
+        feature = "medium-ieee802154"
+    )
+))]
 mod test {
     use super::*;
     use crate::wire::{IpRepr, UdpRepr};
@@ -674,7 +681,7 @@ mod test {
         }
     }
 
-    pub const LOCAL_IP_REPR: IpRepr = IpReprIpvX(IpvXRepr {
+    const LOCAL_IP_REPR: IpRepr = IpReprIpvX(IpvXRepr {
         src_addr: LOCAL_ADDR,
         dst_addr: REMOTE_ADDR,
         next_header: IpProtocol::Udp,
@@ -682,7 +689,7 @@ mod test {
         hop_limit: 64,
     });
 
-    pub const REMOTE_IP_REPR: IpRepr = IpReprIpvX(IpvXRepr {
+    const REMOTE_IP_REPR: IpRepr = IpReprIpvX(IpvXRepr {
         src_addr: REMOTE_ADDR,
         dst_addr: LOCAL_ADDR,
         next_header: IpProtocol::Udp,
@@ -690,7 +697,7 @@ mod test {
         hop_limit: 64,
     });
 
-    pub const BAD_IP_REPR: IpRepr = IpReprIpvX(IpvXRepr {
+    const BAD_IP_REPR: IpRepr = IpReprIpvX(IpvXRepr {
         src_addr: REMOTE_ADDR,
         dst_addr: OTHER_ADDR,
         next_header: IpProtocol::Udp,
@@ -774,12 +781,9 @@ mod test {
     }
 
     #[rstest]
-    #[case::ip(Medium::Ip)]
-    #[cfg(feature = "medium-ip")]
-    #[case::ethernet(Medium::Ethernet)]
-    #[cfg(feature = "medium-ethernet")]
-    #[case::ieee802154(Medium::Ieee802154)]
-    #[cfg(feature = "medium-ieee802154")]
+    #[cfg_attr(feature = "medium-ip", case::ip(Medium::Ip))]
+    #[cfg_attr(feature = "medium-ethernet", case::ethernet(Medium::Ethernet))]
+    #[cfg_attr(feature = "medium-ieee802154", case::ieee802154(Medium::Ieee802154))]
     fn test_send_dispatch(#[case] medium: Medium) {
         let (mut iface, _, _) = setup(medium);
         let cx = iface.context();
@@ -824,12 +828,9 @@ mod test {
     }
 
     #[rstest]
-    #[case::ip(Medium::Ip)]
-    #[cfg(feature = "medium-ip")]
-    #[case::ethernet(Medium::Ethernet)]
-    #[cfg(feature = "medium-ethernet")]
-    #[case::ieee802154(Medium::Ieee802154)]
-    #[cfg(feature = "medium-ieee802154")]
+    #[cfg_attr(feature = "medium-ip", case::ip(Medium::Ip))]
+    #[cfg_attr(feature = "medium-ethernet", case::ethernet(Medium::Ethernet))]
+    #[cfg_attr(feature = "medium-ieee802154", case::ieee802154(Medium::Ieee802154))]
     fn test_recv_process(#[case] medium: Medium) {
         let (mut iface, _, _) = setup(medium);
         let cx = iface.context();
@@ -868,12 +869,9 @@ mod test {
     }
 
     #[rstest]
-    #[case::ip(Medium::Ip)]
-    #[cfg(feature = "medium-ip")]
-    #[case::ethernet(Medium::Ethernet)]
-    #[cfg(feature = "medium-ethernet")]
-    #[case::ieee802154(Medium::Ieee802154)]
-    #[cfg(feature = "medium-ieee802154")]
+    #[cfg_attr(feature = "medium-ip", case::ip(Medium::Ip))]
+    #[cfg_attr(feature = "medium-ethernet", case::ethernet(Medium::Ethernet))]
+    #[cfg_attr(feature = "medium-ieee802154", case::ieee802154(Medium::Ieee802154))]
     fn test_peek_process(#[case] medium: Medium) {
         let (mut iface, _, _) = setup(medium);
         let cx = iface.context();
@@ -903,12 +901,9 @@ mod test {
     }
 
     #[rstest]
-    #[case::ip(Medium::Ip)]
-    #[cfg(feature = "medium-ip")]
-    #[case::ethernet(Medium::Ethernet)]
-    #[cfg(feature = "medium-ethernet")]
-    #[case::ieee802154(Medium::Ieee802154)]
-    #[cfg(feature = "medium-ieee802154")]
+    #[cfg_attr(feature = "medium-ip", case::ip(Medium::Ip))]
+    #[cfg_attr(feature = "medium-ethernet", case::ethernet(Medium::Ethernet))]
+    #[cfg_attr(feature = "medium-ieee802154", case::ieee802154(Medium::Ieee802154))]
     fn test_recv_truncated_slice(#[case] medium: Medium) {
         let (mut iface, _, _) = setup(medium);
         let cx = iface.context();
@@ -931,12 +926,9 @@ mod test {
     }
 
     #[rstest]
-    #[case::ip(Medium::Ip)]
-    #[cfg(feature = "medium-ip")]
-    #[case::ethernet(Medium::Ethernet)]
-    #[cfg(feature = "medium-ethernet")]
-    #[case::ieee802154(Medium::Ieee802154)]
-    #[cfg(feature = "medium-ieee802154")]
+    #[cfg_attr(feature = "medium-ip", case::ip(Medium::Ip))]
+    #[cfg_attr(feature = "medium-ethernet", case::ethernet(Medium::Ethernet))]
+    #[cfg_attr(feature = "medium-ieee802154", case::ieee802154(Medium::Ieee802154))]
     fn test_peek_truncated_slice(#[case] medium: Medium) {
         let (mut iface, _, _) = setup(medium);
         let cx = iface.context();
@@ -960,12 +952,9 @@ mod test {
     }
 
     #[rstest]
-    #[case::ip(Medium::Ip)]
-    #[cfg(feature = "medium-ip")]
-    #[case::ethernet(Medium::Ethernet)]
-    #[cfg(feature = "medium-ethernet")]
-    #[case::ieee802154(Medium::Ieee802154)]
-    #[cfg(feature = "medium-ieee802154")]
+    #[cfg_attr(feature = "medium-ip", case::ip(Medium::Ip))]
+    #[cfg_attr(feature = "medium-ethernet", case::ethernet(Medium::Ethernet))]
+    #[cfg_attr(feature = "medium-ieee802154", case::ieee802154(Medium::Ieee802154))]
     fn test_set_hop_limit(#[case] medium: Medium) {
         let (mut iface, _, _) = setup(medium);
         let cx = iface.context();
@@ -995,12 +984,9 @@ mod test {
     }
 
     #[rstest]
-    #[case::ip(Medium::Ip)]
-    #[cfg(feature = "medium-ip")]
-    #[case::ethernet(Medium::Ethernet)]
-    #[cfg(feature = "medium-ethernet")]
-    #[case::ieee802154(Medium::Ieee802154)]
-    #[cfg(feature = "medium-ieee802154")]
+    #[cfg_attr(feature = "medium-ip", case::ip(Medium::Ip))]
+    #[cfg_attr(feature = "medium-ethernet", case::ethernet(Medium::Ethernet))]
+    #[cfg_attr(feature = "medium-ieee802154", case::ieee802154(Medium::Ieee802154))]
     fn test_doesnt_accept_wrong_port(#[case] medium: Medium) {
         let (mut iface, _, _) = setup(medium);
         let cx = iface.context();
@@ -1016,12 +1002,9 @@ mod test {
     }
 
     #[rstest]
-    #[case::ip(Medium::Ip)]
-    #[cfg(feature = "medium-ip")]
-    #[case::ethernet(Medium::Ethernet)]
-    #[cfg(feature = "medium-ethernet")]
-    #[case::ieee802154(Medium::Ieee802154)]
-    #[cfg(feature = "medium-ieee802154")]
+    #[cfg_attr(feature = "medium-ip", case::ip(Medium::Ip))]
+    #[cfg_attr(feature = "medium-ethernet", case::ethernet(Medium::Ethernet))]
+    #[cfg_attr(feature = "medium-ieee802154", case::ieee802154(Medium::Ieee802154))]
     fn test_doesnt_accept_wrong_ip(#[case] medium: Medium) {
         let (mut iface, _, _) = setup(medium);
         let cx = iface.context();
@@ -1050,12 +1033,9 @@ mod test {
     }
 
     #[rstest]
-    #[case::ip(Medium::Ip)]
-    #[cfg(feature = "medium-ip")]
-    #[case::ethernet(Medium::Ethernet)]
-    #[cfg(feature = "medium-ethernet")]
-    #[case::ieee802154(Medium::Ieee802154)]
-    #[cfg(feature = "medium-ieee802154")]
+    #[cfg_attr(feature = "medium-ip", case::ip(Medium::Ip))]
+    #[cfg_attr(feature = "medium-ethernet", case::ethernet(Medium::Ethernet))]
+    #[cfg_attr(feature = "medium-ieee802154", case::ieee802154(Medium::Ieee802154))]
     fn test_process_empty_payload(#[case] medium: Medium) {
         let meta = Box::leak(Box::new([PacketMetadata::EMPTY]));
         let recv_buffer = PacketBuffer::new(&mut meta[..], vec![]);

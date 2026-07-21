@@ -7,7 +7,7 @@ name: Test
 jobs:
   tests:
     runs-on: ubuntu-22.04
-    needs: [check-msrv, test-msrv, test-stable, clippy, test-netsim, check-apple]
+    needs: [check-msrv, consumer-check, test-msrv, test-stable, clippy, test-netsim, check-apple, test-macos-arm64]
     steps:
       - name: Done
         run: exit 0
@@ -25,6 +25,23 @@ jobs:
       - uses: actions/checkout@v4
       - name: Cross-check Apple targets
         run: ./ci.sh apple-check
+
+  consumer-check:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check downstream feature set with warnings denied
+        run: ./ci.sh consumer-check
+
+  test-macos-arm64:
+    runs-on: macos-14
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify Apple Silicon runner
+        run: test "$(uname -m)" = arm64
+      - name: Run rootless constrained-memory gate
+        run: TRACE=0 CARGO_INCREMENTAL=0 CARGO_TARGET_DIR=target/apple-native ./ci.sh ios-full-gate
 
   test-msrv:
     runs-on: ubuntu-22.04

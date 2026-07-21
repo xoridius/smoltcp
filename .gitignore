@@ -5,3 +5,4 @@ Cargo.lock
 dhat-heap.json
 cachegrind.out.*
 callgrind.out.*
+/lcov.info
