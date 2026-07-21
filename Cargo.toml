@@ -377,8 +377,8 @@ required-features = ["std", "medium-ethernet", "medium-ip", "phy-tuntap_interfac
 [profile.release]
 debug = 2
 
-# Release profile with link-time optimization. Used by FORK.md §14.4
-# to exercise the whole-program code generation used by shipping Apple
+# Release profile with link-time optimization. Used by the fork's performance
+# gates to exercise the whole-program code generation used by shipping Apple
 # consumers. Build the harness under both release profiles; either can expose
 # layout-sensitive regressions that the other misses:
 #

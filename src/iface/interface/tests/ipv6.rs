@@ -29,6 +29,7 @@ fn parse_ipv6(data: &[u8]) -> crate::wire::Result<Packet<'_>> {
     }
 }
 
+#[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
 fn emit_icmpv6(
     src_addr: Ipv6Address,
     dst_addr: Ipv6Address,
@@ -53,6 +54,7 @@ fn emit_icmpv6(
     bytes
 }
 
+#[cfg(all(feature = "multicast", feature = "medium-ethernet"))]
 fn emit_hop_by_hop_icmpv6(
     src_addr: Ipv6Address,
     dst_addr: Ipv6Address,
@@ -903,6 +905,7 @@ fn ndisc_neighbor_advertisement_ieee802154(#[case] medium: Medium) {
     );
 }
 
+#[cfg(feature = "medium-ethernet")]
 #[derive(Clone, Copy)]
 enum InvalidNeighborAdvertisement {
     MulticastTarget,
@@ -1025,6 +1028,7 @@ fn dad_neighbor_solicitation(#[case] medium: Medium) {
     assert!(!sockets.get_mut::<raw::Socket>(raw_handle).can_recv());
 }
 
+#[cfg(feature = "medium-ethernet")]
 #[derive(Clone, Copy)]
 enum InvalidDadNeighborSolicitation {
     HopLimit,

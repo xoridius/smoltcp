@@ -68,7 +68,8 @@ Core commands:
   coverage                      cargo-llvm-cov matrix.
   netsim                        Stable NoControl, CUBIC, and Reno netsim sweeps.
   apple-check                   Cross-check macOS and iOS targets on stable.
-  all                           Core matrix except cross-target Apple checks.
+  docs                          Rustdoc with warnings denied for default and iOS shapes.
+  all                           Portable core matrix; excludes Apple, docs, perf, fuzz, and Miri.
 
 Local fork evidence:
   quick                         Fast local smoke: fmt, iOS check, host phy check, iOS sizecheck.
@@ -114,6 +115,12 @@ apple_check() {
         cargo +stable check --target "$target" --lib \
             --no-default-features --features "$TUNNEL_DYNAMIC_FEATURES"
     done
+}
+
+docs() {
+    RUSTDOCFLAGS="-Dwarnings" cargo +stable doc --no-deps
+    RUSTDOCFLAGS="-Dwarnings" cargo +stable doc --no-deps --lib \
+        --no-default-features --features "$IOS_FEATURES"
 }
 
 check() {
@@ -314,6 +321,9 @@ case "$cmd" in
         ;;
     apple-check)
         apple_check
+        ;;
+    docs)
+        docs
         ;;
     all)
         run_all

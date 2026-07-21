@@ -1,80 +1,178 @@
 #!/usr/bin/env bash
-#
-# upstream-delta.sh — show which upstream smoltcp PRs have landed since the
-# fork's base tag and are NOT yet recorded in FORK.md §16 (backported or
-# deliberately skipped).
-#
-# The fork branches from upstream at v0.13.1, but changes are cherry-picked
-# rather than merged (the local edits to tcp.rs / congestion*.rs make a full
-# merge conflict-heavy). This script answers "what is new upstream that we
-# haven't triaged yet?". It only inspects the upstream side, so it works even
-# in a shallow clone where `git merge-base` against upstream would fail. See
-# FORK.md §2 for the shallow-clone caveat.
-#
-# Usage:
-#   tools/upstream-delta.sh [base-tag]      # default base tag: v0.13.1
-#
-# It adds the `upstream` remote if missing and fetches it.
 
 set -euo pipefail
 
-BASE_TAG="${1:-v0.13.1}"
-UPSTREAM_URL="https://github.com/smoltcp-rs/smoltcp.git"
+readonly BASE_TAG=v0.13.1
+readonly UPSTREAM_URL=https://github.com/smoltcp-rs/smoltcp.git
+readonly LEDGER_START='<!-- upstream-ledger:start -->'
+readonly LEDGER_END='<!-- upstream-ledger:end -->'
+
+if (( $# != 0 )); then
+    echo "usage: tools/upstream-delta.sh" >&2
+    exit 2
+fi
 
 cd "$(git rev-parse --show-toplevel)"
+tmp_dir="$(mktemp -d)"
+trap 'rm -rf -- "$tmp_dir"' EXIT
+ledger="$tmp_dir/ledger.tsv"
+upstream_prs="$tmp_dir/upstream.tsv"
+
+if ! awk -v start="$LEDGER_START" -v end="$LEDGER_END" '
+    function trim(value) {
+        sub(/^[[:space:]]+/, "", value)
+        sub(/[[:space:]]+$/, "", value)
+        return value
+    }
+    function fail(message) {
+        print "error: " message > "/dev/stderr"
+        failed = 1
+    }
+    $0 == start {
+        starts++
+        if (inside || ends) fail("duplicate or misplaced upstream ledger start marker")
+        inside = 1
+        next
+    }
+    $0 == end {
+        ends++
+        if (!inside) fail("upstream ledger end marker has no matching start")
+        inside = 0
+        next
+    }
+    inside {
+        if ($0 ~ /^[[:space:]]*$/) next
+        count = split($0, field, "|")
+        if (count != 5 || trim(field[1]) != "" || trim(field[5]) != "") {
+            fail("malformed upstream ledger row at FORK.md:" NR)
+            next
+        }
+        first = trim(field[2])
+        second = trim(field[3])
+        third = trim(field[4])
+        if (!header) {
+            if (first != "PR" || second != "Outcome" || third != "Note")
+                fail("invalid upstream ledger header")
+            header = 1
+            next
+        }
+        if (!separator) {
+            if (first !~ /^:?-{3,}:?$/ || second !~ /^:?-{3,}:?$/ || third !~ /^:?-{3,}:?$/)
+                fail("invalid upstream ledger separator")
+            separator = 1
+            next
+        }
+        if (first !~ /^#[0-9]+$/) {
+            fail("upstream ledger PR must be numeric at FORK.md:" NR)
+            next
+        }
+        pr = substr(first, 2)
+        if (seen[pr]++) {
+            fail("duplicate upstream ledger PR #" pr)
+            next
+        }
+        if (second != "integrated" && second != "adapted" &&
+            second != "superseded" && second != "skipped") {
+            fail("unknown outcome for upstream PR #" pr ": " second)
+            next
+        }
+        if (third == "" || third ~ /\t/) {
+            fail("missing or invalid note for upstream PR #" pr)
+            next
+        }
+        print pr "\t" second "\t" third
+        rows++
+    }
+    END {
+        if (starts != 1 || ends != 1 || inside)
+            fail("FORK.md must contain exactly one complete upstream ledger block")
+        if (!header || !separator || rows == 0)
+            fail("upstream ledger must contain a header and at least one row")
+        if (failed) exit 1
+    }
+' FORK.md > "$ledger"; then
+    exit 2
+fi
 
 if ! git remote get-url upstream >/dev/null 2>&1; then
-    echo "adding 'upstream' remote -> ${UPSTREAM_URL}"
-    git remote add upstream "${UPSTREAM_URL}"
+    git remote add upstream "$UPSTREAM_URL"
 fi
 echo "fetching upstream..."
-git fetch -q upstream
+git fetch -q upstream \
+    '+refs/heads/main:refs/remotes/upstream/main' \
+    'refs/tags/v0.13.1:refs/tags/v0.13.1'
 
-if ! git rev-parse -q --verify "${BASE_TAG}^{commit}" >/dev/null; then
-    echo "error: base tag '${BASE_TAG}' not found (fetch tags from upstream?)" >&2
+if ! git rev-parse -q --verify "$BASE_TAG^{commit}" >/dev/null; then
+    echo "error: fixed base tag $BASE_TAG is unavailable" >&2
+    exit 2
+fi
+if ! git merge-base --is-ancestor "$BASE_TAG" upstream/main; then
+    echo "error: $BASE_TAG is not an ancestor of upstream/main" >&2
+    exit 2
+fi
+
+status=0
+: > "$upstream_prs"
+declare -A ledger_outcomes upstream_seen
+while IFS=$'\t' read -r pr outcome _note; do
+    ledger_outcomes["$pr"]="$outcome"
+done < "$ledger"
+
+git rev-list --first-parent "$BASE_TAG..upstream/main" > "$tmp_dir/commits"
+while IFS= read -r commit; do
+    read -r -a parents <<< "$(git rev-list --parents -n 1 "$commit")"
+    if (( ${#parents[@]} == 2 )); then
+        echo "error: direct-to-main upstream commit $commit" >&2
+        status=1
+        continue
+    fi
+    subject="$(git show -s --format=%s "$commit")"
+    if (( ${#parents[@]} != 3 )) ||
+        [[ ! "$subject" =~ ^Merge\ pull\ request\ \#([0-9]+)\ from\ .+$ ]]; then
+        echo "error: unrecognized upstream merge $commit: $subject" >&2
+        status=1
+        continue
+    fi
+    pr="${BASH_REMATCH[1]}"
+    title="$(git show -s --format=%b "$commit" | awk 'NF { print; exit }')"
+    if [[ -z "$title" || "$title" == *$'\t'* ]]; then
+        echo "error: upstream merge $commit has no valid display title" >&2
+        status=1
+        continue
+    fi
+    if [[ -n "${upstream_seen[$pr]+present}" ]]; then
+        echo "error: duplicate upstream pull request #$pr at $commit" >&2
+        status=1
+        continue
+    fi
+    upstream_seen["$pr"]=1
+    printf '%s\t%s\t%s\n' "$pr" "$title" "$commit" >> "$upstream_prs"
+done < "$tmp_dir/commits"
+
+for pr in "${!ledger_outcomes[@]}"; do
+    if [[ -z "${upstream_seen[$pr]+present}" ]]; then
+        echo "error: ledger PR #$pr is absent from $BASE_TAG..upstream/main" >&2
+        exit 2
+    fi
+done
+
+echo
+echo "Upstream pull requests since $BASE_TAG:"
+while IFS=$'\t' read -r pr title _commit; do
+    outcome="${ledger_outcomes[$pr]-}"
+    if [[ -z "$outcome" ]]; then
+        printf '  [NEW]        #%s %s\n' "$pr" "$title"
+        status=1
+    else
+        printf '  [%-10s] #%s %s\n' "$outcome" "$pr" "$title"
+    fi
+done < "$upstream_prs"
+
+if (( status != 0 )); then
+    echo
+    echo "Upstream classification is incomplete." >&2
     exit 1
 fi
 
-# PR numbers already recorded in FORK.md §16 (backported OR deliberately skipped).
-recorded="$(
-    awk '
-        /^## 16[. ]/ { in_section = 1; next }
-        in_section && /^## [0-9]+[. ]/ { exit }
-        in_section { print }
-    ' FORK.md | grep -oE '#[0-9]+' | tr -d '#' | sort -u || true
-)"
-
-total=0
-new=0
 echo
-echo "Upstream PRs merged since ${BASE_TAG} (newest first):"
-echo "  [status] #PR    title"
-echo "  -------------------------------------------------------------"
-while read -r subject; do
-    [ -z "${subject}" ] && continue
-    total=$((total + 1))
-    pr="$(printf '%s' "${subject}" | grep -oE 'pull request #[0-9]+' | grep -oE '[0-9]+' || true)"
-    title="$(printf '%s' "${subject}" | sed 's/^Merge pull request #[0-9]* from //')"
-    if [ -z "${pr}" ]; then
-        status="?      "
-    elif printf '%s\n' "${recorded}" | grep -qx "${pr}"; then
-        status="handled"
-    else
-        status="NEW    "
-        new=$((new + 1))
-    fi
-    printf '  [%s] #%-5s %s\n' "${status}" "${pr:-?}" "${title}"
-done < <(git log --merges --format='%s' "${BASE_TAG}..upstream/main")
-
-# Direct-to-main (non-merge, first-parent) commits are rare upstream but would
-# be missed by the merge listing above; surface a count as a tripwire.
-direct="$(git log --no-merges --first-parent --format='%h' "${BASE_TAG}..upstream/main" | wc -l | tr -d ' ')"
-
-echo
-echo "  ${total} merge-PRs total, ${new} NEW (untriaged), ${direct} direct-to-main commits."
-echo
-echo "NEW = not referenced in FORK.md §16. Triage each: cherry-pick the"
-echo "relevant commits onto a feature branch, run the §3 test matrix, then"
-echo "record the outcome (backported / adapted / skipped) in FORK.md §16."
-echo "If 'direct-to-main commits' is non-zero, inspect them with:"
-echo "    git log --no-merges --first-parent ${BASE_TAG}..upstream/main"
+echo "All upstream pull requests are classified."

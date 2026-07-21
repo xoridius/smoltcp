@@ -1,6 +1,13 @@
 # smoltcp
 
-[![docs.rs](https://docs.rs/smoltcp/badge.svg)](https://docs.rs/smoltcp)
+> [!IMPORTANT]
+> This repository is a production-oriented fork of
+> [`smoltcp-rs/smoltcp`](https://github.com/smoltcp-rs/smoltcp), based on
+> upstream `v0.13.1`. TCP recovery, dynamic buffer accounting, platform
+> hardening, and constrained-memory gates described here are fork-only unless
+> explicitly recorded otherwise. See [FORK.md](FORK.md) before updating.
+
+[![upstream docs.rs](https://docs.rs/smoltcp/badge.svg)](https://docs.rs/smoltcp)
 [![crates.io](https://img.shields.io/crates/v/smoltcp.svg)](https://crates.io/crates/smoltcp)
 [![crates.io](https://img.shields.io/crates/d/smoltcp.svg)](https://crates.io/crates/smoltcp)
 [![crates.io](https://img.shields.io/matrix/smoltcp:matrix.org)](https://matrix.to/#/#smoltcp:matrix.org)
@@ -140,7 +147,20 @@ The TCP protocol is supported over IPv4 and IPv6, and server and client TCP sock
 
 ## Installation
 
-To use the _smoltcp_ library in your project, add the following to `Cargo.toml`:
+Pin this fork by immutable Git revision:
+
+```toml
+[dependencies]
+smoltcp = { git = "https://github.com/xoridius/smoltcp.git", rev = "8f5e7042ad73bf21e785b7f3cfaed6a7a6324013" }
+```
+
+Move the pin only to a reviewed commit that has passed the production gates in
+[FORK.md](FORK.md#verification).
+
+### Upstream crates.io release
+
+The crates.io package is upstream smoltcp and does not contain the fork-only
+changes. To use upstream `v0.13.1`, add:
 
 ```toml
 [dependencies]
@@ -210,6 +230,13 @@ These features are enabled by default.
 Enable the corresponding socket type.
 
 These features are enabled by default.
+
+### Feature `socket-tcp-dynamic-buffer`
+
+This fork-only feature adds opt-in, lazy TCP receive and transmit buffers with
+optional shared `MemoryPool` accounting. It requires `alloc`; fixed-buffer
+`tcp::Socket::new` remains available and unchanged. See
+[FORK.md](FORK.md#dynamic-tcp-buffers) for the ownership and memory invariants.
 
 ### Features `proto-ipv4`, `proto-ipv6` and `proto-sixlowpan`
 

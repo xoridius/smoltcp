@@ -12,7 +12,8 @@
 //!   * `cycles_estimate` per packet from a 2.4 GHz reference
 //!
 //! Designed to run under `perf`, Massif, or Heaptrack without external setup.
-//! Detailed CLI examples live in the iOS gate manifests and `FORK.md`.
+//! Traffic commands live in the iOS gate manifests under `ci/`; see
+//! `./ci.sh help` for verification entry points.
 
 #[cfg(not(feature = "dhat-heap"))]
 use std::alloc::System;
