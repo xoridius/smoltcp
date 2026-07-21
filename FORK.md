@@ -1094,18 +1094,14 @@ where the cost comes from.
 
 ### 14.6 Memory savings (idle flows)
 
-Measure legacy and dynamic idle sockets as separate processes. The
-convenience `both` mode is useful for smoke checks, but allocator state
-from the first phase can affect the second phase's process memory and must not be
-used as evidence.
+Measure legacy and dynamic idle sockets as separate processes so allocator
+state from one mode cannot affect the other mode's process-memory result.
 
 ```
 cargo run --release --example dynbuf_memcompare \
   --features socket-tcp-dynamic-buffer -- legacy 1000
 cargo run --release --example dynbuf_memcompare \
   --features socket-tcp-dynamic-buffer -- dynamic 1000
-cargo run --release --example dynbuf_memcompare \
-  --features socket-tcp-dynamic-buffer -- both 1000   # smoke only
 ```
 
 Expected invariant: dynamic idle sockets with `rx_initial = tx_initial = 0`
@@ -1131,7 +1127,7 @@ Touched files:
 
 - `Cargo.toml` — feature decl, example registration.
 - `src/storage/ring_buffer.rs` — crate-internal `try_grow` + `release_owned`
-  (alloc-gated, appended).
+  (`socket-tcp-dynamic-buffer`-gated, appended).
 - `src/socket/tcp.rs` — module decl, struct field, `new_dynamic`,
   grow/release helpers, hooks in `listen`/`connect`/`dispatch`/`process`/
   `send_impl`/`recv_slice`/`reset`. All
