@@ -9,7 +9,6 @@
 //!   * allocation count + bytes allocated (instrumented allocator)
 //!   * process memory (Linux RSS; Apple physical footprint)
 //!   * smoltcp Socket footprint of relevant sockets
-//!   * `cycles_estimate` per packet from a 2.4 GHz reference
 //!
 //! Designed to run under `perf`, Massif, or Heaptrack without external setup.
 //! Traffic commands live in the iOS gate manifests under `ci/`; see
@@ -639,10 +638,6 @@ impl Histo {
         self.sum_ns.checked_div(self.samples).unwrap_or(0)
     }
 }
-
-/// Reference CPU frequency used to estimate cycles from elapsed wall time.
-/// Reasonable approximation for typical x86_64/aarch64 server CPUs in this era.
-const REF_CPU_GHZ: f64 = 2.4;
 
 /// Per-flow throughput statistics computed at the end of a many-flow run.
 ///
@@ -1695,7 +1690,6 @@ impl<'a> Report<'a> {
         } else {
             self.elapsed * 1e9 / self.wire_packets as f64
         };
-        let cyc_per_pkt = ns_per_pkt * REF_CPU_GHZ;
         let unit_rate = if self.elapsed == 0.0 {
             0.0
         } else {
@@ -1723,10 +1717,7 @@ impl<'a> Report<'a> {
             self.wire_bytes as f64 / self.elapsed / 1e6
         );
         println!("  packet rate:            {mpps:>8.3} Mpps     (avg {avg_pkt:.1} bytes/pkt)");
-        println!(
-            "  per-packet:             {ns_per_pkt:>8.1} ns   (~{:.0} reference cycles @ {} GHz)",
-            cyc_per_pkt, REF_CPU_GHZ
-        );
+        println!("  per-packet:             {ns_per_pkt:>8.1} ns");
         println!(
             "  work units:             {:>8} {}  ({:.3} M{}/s)",
             self.work_units,
@@ -3576,11 +3567,6 @@ fn shape_multi_tcp_impl(
     println!(
         "  context switches:       {vol_delta} voluntary, {nvol_delta} nonvoluntary  ({:.0} cs/thread/s)",
         (vol_delta + nvol_delta) as f64 / n_threads as f64 / total_secs
-    );
-    let cas_retries = pool.cas_retries();
-    println!(
-        "  pool CAS retries:       {cas_retries}  ({:.1} retries/thread/s)",
-        cas_retries as f64 / n_threads as f64 / total_secs
     );
     print_lane_stats(shape_name, lane_stats);
     validate_pool_growth(shape_name, pool_used_start, pool_used_end)?;

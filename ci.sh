@@ -15,7 +15,7 @@ TUNNEL_DYNAMIC_FEATURES="$TUNNEL_STATIC_FEATURES,socket-tcp-dynamic-buffer"
 HOST_PHY_FEATURES="phy-raw_socket,phy-tuntap_interface,medium-ip,medium-ethernet,proto-ipv4,socket-raw"
 
 RUSTC_VERSIONS=(
-    $MSRV
+    "$MSRV"
     "stable"
     "nightly"
 )
@@ -86,10 +86,10 @@ USAGE
 
 test() {
     local version=$1
-    rustup toolchain install $version
+    rustup toolchain install "$version"
 
     for features in "${FEATURES_TEST[@]}"; do
-        cargo +$version test --no-default-features --features "$features"
+        cargo +"$version" test --no-default-features --features "$features"
     done
 }
 
@@ -125,18 +125,18 @@ docs() {
 
 check() {
     local version=$1
-    rustup toolchain install $version
+    rustup toolchain install "$version"
 
     export DEFMT_LOG="trace"
 
     for features in "${FEATURES_CHECK[@]}"; do
-        cargo +$version check --no-default-features --features "$features"
+        cargo +"$version" check --no-default-features --features "$features"
     done
 
-    cargo +$version check --examples
+    cargo +"$version" check --examples
 
     if [[ $version == "nightly" ]]; then
-        cargo +$version check --benches
+        cargo +"$version" check --benches
     fi
 }
 

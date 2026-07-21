@@ -97,8 +97,10 @@ hooks, and resizable ring-buffer operations are not compiled. When on,
   either direction rolls back both allocations and the complete pool charge.
 - Unread receive data survives terminal transitions until application dequeue
   no longer needs it. In particular, peer RST cannot prematurely refund or
-  discard unread data. `recv`, `recv_slice`, and `recv_with` run the same safe
-  release hooks.
+  discard unread data. `recv_slice` and `recv_with` reclaim terminal storage
+  after dequeue. The borrowing `recv` API cannot reclaim storage before its
+  returned value stops borrowing the receive buffer; reset, drop, or a later
+  non-borrowing receive completes reclamation.
 - Pool charge must return to zero after all sharing sockets are torn down.
 
 A zero-initial configuration admits idle sockets without buffer capacity:

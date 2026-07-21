@@ -3751,9 +3751,6 @@ impl<'a> fmt::Write for Socket<'a> {
     }
 }
 
-// Drop stays on `DynamicBufferState`: moving it to `Socket` measured 3–5% slower
-// for UDP-only workloads. Lifecycle hooks refund eagerly; Drop is the backstop.
-
 // TODO: TCP should work for all features. For now, we only test with the IP feature. We could do
 // it for other features as well with rstest, however, this means we have to modify a lot of the
 // tests in here, which I didn't had the time for at the moment.

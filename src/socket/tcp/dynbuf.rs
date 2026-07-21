@@ -37,8 +37,6 @@ struct MemoryPoolInner {
     pressure_threshold: usize,
     /// `Relaxed`: this is aggregate accounting and gates no other memory.
     used: AtomicUsize,
-    /// Diagnostic used by the multi-Interface contention gate.
-    cas_retries: AtomicUsize,
 }
 
 impl MemoryPool {
@@ -53,14 +51,8 @@ impl MemoryPool {
                 budget,
                 pressure_threshold,
                 used: AtomicUsize::new(0),
-                cas_retries: AtomicUsize::new(0),
             }),
         }
-    }
-
-    /// Total CAS retries observed in `try_charge` across this pool's lifetime.
-    pub fn cas_retries(&self) -> usize {
-        self.inner.cas_retries.load(Ordering::Relaxed)
     }
 
     /// Total byte budget configured for the pool.
@@ -87,16 +79,10 @@ impl MemoryPool {
             return true;
         }
         let mut current = self.inner.used.load(Ordering::Relaxed);
-        let mut retries: usize = 0;
         loop {
             let next = match current.checked_add(bytes) {
                 Some(n) if n <= self.inner.budget => n,
-                _ => {
-                    if retries > 0 {
-                        self.inner.cas_retries.fetch_add(retries, Ordering::Relaxed);
-                    }
-                    return false;
-                }
+                _ => return false,
             };
             match self.inner.used.compare_exchange_weak(
                 current,
@@ -104,16 +90,8 @@ impl MemoryPool {
                 Ordering::Relaxed,
                 Ordering::Relaxed,
             ) {
-                Ok(_) => {
-                    if retries > 0 {
-                        self.inner.cas_retries.fetch_add(retries, Ordering::Relaxed);
-                    }
-                    return true;
-                }
-                Err(now) => {
-                    retries += 1;
-                    current = now;
-                }
+                Ok(_) => return true,
+                Err(now) => current = now,
             }
         }
     }
@@ -267,13 +245,16 @@ impl DynamicBufferState {
             return (Vec::new(), Vec::new());
         }
 
-        match (allocate(rx_initial), allocate(tx_initial)) {
-            (Some(rx_storage), Some(tx_storage)) => (rx_storage, tx_storage),
-            _ => {
-                self.refund(charge);
-                (Vec::new(), Vec::new())
-            }
-        }
+        let Some(rx_storage) = allocate(rx_initial) else {
+            self.refund(charge);
+            return (Vec::new(), Vec::new());
+        };
+        let Some(tx_storage) = allocate(tx_initial) else {
+            drop(rx_storage);
+            self.refund(charge);
+            return (Vec::new(), Vec::new());
+        };
+        (rx_storage, tx_storage)
     }
 
     pub(super) fn restore_initial(
@@ -290,9 +271,9 @@ impl DynamicBufferState {
             return;
         }
 
-        let rx_ok = rx_initial == 0 || rx_buffer.try_grow(rx_initial);
-        let tx_ok = tx_initial == 0 || tx_buffer.try_grow(tx_initial);
-        if !(rx_ok && tx_ok) {
+        let restored = (rx_initial == 0 || rx_buffer.try_grow(rx_initial))
+            && (tx_initial == 0 || tx_buffer.try_grow(tx_initial));
+        if !restored {
             rx_buffer.release_owned();
             tx_buffer.release_owned();
             self.refund(charge);
@@ -429,6 +410,33 @@ mod test {
         assert_eq!(state.tx_initial, 1 << 30);
         assert_eq!(state.tx_capacity_max(), 1 << 30);
         assert_eq!(state.grow_chunk, 1);
+    }
+
+    #[test]
+    fn initial_first_allocation_failure_short_circuits() {
+        let pool = MemoryPool::new(6144);
+        let mut state = DynamicBufferState::new(
+            DynamicBufferConfig {
+                rx_initial: 4096,
+                rx_max: 8192,
+                tx_initial: 2048,
+                tx_max: 4096,
+                grow_chunk: 4096,
+            },
+            Some(pool.clone()),
+        );
+        let mut calls = 0;
+
+        let (rx_storage, tx_storage) = state.allocate_initial_with(|_| {
+            calls += 1;
+            None
+        });
+
+        assert_eq!(calls, 1);
+        assert!(rx_storage.is_empty());
+        assert!(tx_storage.is_empty());
+        assert_eq!(state.charged, 0);
+        assert_eq!(pool.used(), 0);
     }
 
     #[test]
