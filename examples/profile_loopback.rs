@@ -509,14 +509,8 @@ unsafe impl GlobalAlloc for CountingAlloc {
 #[global_allocator]
 static A: CountingAlloc = CountingAlloc;
 
-/// Read voluntary + involuntary context-switch counts from
-/// /proc/self/status on Linux. macOS users should use Instruments System
-/// Trace for per-thread context-switch analysis.
-/// Returns `(voluntary, nonvoluntary)`.
-/// Voluntary = process blocked / yielded (rare in our spin loops);
-/// nonvoluntary = preempted by the scheduler. Multi-thread shapes
-/// expect a small voluntary count and a nonvoluntary count proportional
-/// to N_threads × wall_time / time_slice.
+/// Read voluntary and involuntary context-switch counts from
+/// `/proc/self/status` on Linux.
 fn ctxsw_counts() -> (u64, u64) {
     #[cfg(target_os = "linux")]
     {

@@ -7,7 +7,7 @@
 //! Trickle].
 //!
 //! [RFC 6206]: https://datatracker.ietf.org/doc/html/rfc6206
-//! [Enhanced Trickle]: https://d1wqtxts1xzle7.cloudfront.net/71402623/E-Trickle_Enhanced_Trickle_Algorithm_for20211005-2078-1ckh34a.pdf?1633439582=&response-content-disposition=inline%3B+filename%3DE_Trickle_Enhanced_Trickle_Algorithm_for.pdf&Expires=1681472005&Signature=cC7l-Pyr5r64XBNCDeSJ2ha6oqWUtO6A-KlDOyC0UVaHxDV3h3FuVHRtcNp3O9BUfRK8jeuWCYGBkCZgQT4Zgb6XwgVB-3z4TF9o3qBRMteRyYO5vjVkpPBeN7mz4Tl746SsSCHDm2NMtr7UVtLYamriU3D0rryoqLqJXmnkNoJpn~~wJe2H5PmPgIwixTwSvDkfFLSVoESaYS9ZWHZwbW-7G7OxIw8oSYhx9xMBnzkpdmT7sJNmvDzTUhoOjYrHTRM23cLVS9~oOSpT7hKtKD4h5CSmrNK4st07KnT9~tUqEcvGO3aXdd4quRZeKUcCkCbTLvhOEYg9~QqgD8xwhA__&Key-Pair-Id=APKAJLOHF5GGSLRBV4ZA
+//! [Enhanced Trickle]: https://doi.org/10.1109/CIT/IUCC/DASC/PICOM.2015.168
 
 use crate::{
     rand::Rand,

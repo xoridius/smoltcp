@@ -22,7 +22,7 @@ The main maintained differences are:
 | TCP memory | Optional lazy, pool-accounted receive and transmit buffers | `src/socket/tcp.rs`, `src/socket/tcp/dynbuf.rs`, `src/storage/ring_buffer.rs` |
 | Wire and interface validation | Checked length, checksum, address, multicast, and security-metadata handling on audited paths | `src/wire/`, `src/iface/` |
 | Hosted platforms | Monotonic hosted time, batched BPF reads, and explicit TUN/TAP descriptor ownership | `src/time.rs`, `src/phy/sys/`, `src/phy/tuntap_interface.rs` |
-| Production evidence | Socket-size, constrained-memory, traffic, Apple cross-build, netsim, fuzz, and profiling lanes | `ci.sh`, `ci/`, `examples/profile_loopback*`, `tests/`, `docs/apple.md`, `docs/perf/` |
+| Production evidence | Socket-size, constrained-memory, traffic, Apple cross-build, netsim, fuzz, and profiling lanes | `ci.sh`, `ci/`, `examples/profile_loopback*`, `tests/`, `docs/perf/` |
 
 Keep upstream-shaped state transitions and dispatch ordering in
 `src/socket/tcp.rs`. Fork-owned data structures belong in private modules; do
@@ -141,10 +141,10 @@ Network framework overhead.
   autotuner. Per-flow maxima cannot be changed after construction.
 - The SACK implementation is selective recovery, not RACK-TLP, pacing, or a
   full RFC 6675 pipe estimator.
-- Host-side Linux RSS and native macOS physical-footprint measurements are
-  useful signals, not an iOS Network Extension proof. iOS targets are
-  cross-compiled; final integration still needs on-device footprint and jetsam
-  validation.
+- On native macOS, `apple_phys_footprint` comes from `proc_pid_rusage`. Like
+  host-side Linux RSS, it is a useful signal, not an iOS Network Extension
+  proof. iOS targets are cross-compiled; final integration still needs
+  on-device footprint and jetsam validation.
 - `Interface` remains single-thread owned. Consumers that need parallelism
   shard interfaces; the fork does not make `Interface` synchronized.
 - `poll()` retains upstream's drain-until-empty behavior. Use the existing
@@ -155,8 +155,8 @@ Network framework overhead.
 
 `./ci.sh help` is the command reference. Traffic commands live in
 `ci/ios-full-gate-static.txt` and `ci/ios-full-gate-dynamic.txt`; do not copy
-those matrices into prose. Apple validation and rootless Instruments guidance
-live in [`docs/apple.md`](docs/apple.md).
+those matrices into prose. Apple harnesses use paired in-process `Medium::Ip`
+devices and require no elevated privileges.
 
 Before a production release, run:
 
@@ -194,10 +194,8 @@ least three of five matched pairs. Dynamic traffic must retain Jain fairness
 of at least 0.95, no starvation, no fallback allocation, bounded memory traces,
 and zero pool charge after teardown.
 
-The hash-backed measurements are indexed in
-[`docs/perf/README.md`](docs/perf/README.md). New evidence must identify the
-exact source, binaries, toolchain, feature set, commands, and matched-run
-method; do not replace measured history with unrepeatable claims.
+Dated benchmark summaries live in `docs/perf/`. New evidence must identify the
+exact source, toolchain, feature set, commands, and matched-run method.
 
 ## Upstream sync
 

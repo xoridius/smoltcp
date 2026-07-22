@@ -5,8 +5,7 @@
 > [`smoltcp-rs/smoltcp`](https://github.com/smoltcp-rs/smoltcp), based on
 > upstream `v0.13.1`. TCP recovery, dynamic buffer accounting, platform
 > hardening, and constrained-memory gates described here are fork-only unless
-> explicitly recorded otherwise. See [FORK.md](FORK.md) before updating and
-> [docs/apple.md](docs/apple.md) before Apple integration or profiling.
+> explicitly recorded otherwise. See [FORK.md](FORK.md) before updating.
 
 [![upstream docs.rs](https://docs.rs/smoltcp/badge.svg)](https://docs.rs/smoltcp)
 [![crates.io](https://img.shields.io/crates/v/smoltcp.svg)](https://crates.io/crates/smoltcp)
@@ -225,8 +224,9 @@ This feature is disabled by default.
 Enable `smoltcp::phy::RawSocket` and `smoltcp::phy::TunTapInterface`, respectively.
 
 `RawSocket` uses BPF on macOS. `TunTapInterface` is available on Linux and
-Android only. Apple Network Extensions should provide their packet flow through
-a custom `phy::Device`; see [docs/apple.md](docs/apple.md).
+Android only. Neither is the Network Extension data path. A packet-tunnel
+consumer owns packet-flow I/O and exposes IP packets through a custom
+`phy::Device` using `Medium::Ip`.
 
 These features are enabled by default.
 
@@ -329,9 +329,9 @@ The maximum amount of parsed options the IPv6 Hop-by-Hop header can hold. Defaul
 
 _smoltcp_, being a freestanding networking stack, needs to be able to transmit and receive
 raw frames. For testing purposes, we will use a regular OS, and run _smoltcp_ in
-a userspace process. The TUN/TAP examples below are Linux-only. Rootless macOS
-validation uses paired in-process devices and requires no elevated privileges;
-see [docs/apple.md](docs/apple.md).
+a userspace process. The TUN/TAP examples below are Linux-only. Repository
+validation on macOS uses paired in-process devices and requires no elevated
+privileges.
 
 On \*nix OSes, transmitting and receiving raw frames normally requires superuser privileges, but
 on Linux it is possible to create a _persistent tap interface_ that can be manipulated by

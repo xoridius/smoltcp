@@ -1,6 +1,5 @@
 on:
-  pull_request:
-  merge_group:
+  workflow_dispatch:
 
 name: Coverage
 
@@ -13,9 +12,3 @@ jobs:
         uses: taiki-e/install-action@cargo-llvm-cov
       - name: Run Coverage
         run: ./ci.sh coverage
-      - name: Upload coverage to Codecov
-        uses: codecov/codecov-action@v5
-        with:
-          token: ${{ secrets.CODECOV_TOKEN }}
-          files: lcov.info
-          fail_ci_if_error: false
